@@ -9,9 +9,9 @@
 | M2 Backup | DONE | M2 commit (SHA in completion report) |
 | M3 Configure/seed/inject | DONE | this commit |
 | M4 Build/flash wrappers | DONE | this commit |
-| M5 Verify/restore | NOT STARTED | - |
-| M6 Packages | NOT STARTED | - |
-| M7 Wizard/docs/tidy | NOT STARTED | - |
+| M5 Verify/restore | SYNTHETIC TESTS PASS (22/22); fake-disk restore and final full-hash checks pass; real EDL/hardware acceptance not performed | No commit: blocked by read-only Git metadata |
+| M6 Packages | Synthetic package checks and post-snapshot mutation regressions pass; real production inputs unavailable | No commit: blocked by read-only Git metadata |
+| M7 Wizard/docs/tidy | Final tests PASS (14/14), including synthetic fake-EDL byte-identical restore E2E; GPT-T install flash and hardware E2E remain blocked | Uncommitted; read-only Git metadata prevents local milestone commits |
 
 The clean source snapshot commit is `e4cf01b`; it is the root commit because no source history/baseline was included in the prepared workspace. The M1 implementation does not modify existing build, flash, initramfs, or rollback scripts. There is no `baseline..installer` range.
 
@@ -158,6 +158,22 @@ M3 suite: **11 PASS, 0 FAIL**. Full `tests/run-installer-tests.sh`: **22 top-lev
 
 Existing builder scripts modified: `scripts/20-rootfs.sh` only. It installs the seed apply utility and enables the optional service in the rootfs, the narrow image assembly hook required for M3. No flashing, rollback, firmware, kernel, initramfs, or proven networking template logic was changed. Image SHA-256 baseline remains unavailable because building requires excluded external inputs and root; no real or synthetic full OS build was run.
 
+## Current unattended session verification (2026-11-15)
+
+The workspace was **not clean at session launch**: it already contained uncommitted M4–M7 source, tests, documentation, status, and handoff files. The branch was `installer`; HEAD was exactly `da4f9c8a2770b11b181611fe5ff525cd2d1be197`, and that accepted M4 commit is an ancestor of HEAD. No history was rewritten. The Git metadata is read-only in this execution environment, so no milestone commits could be created; all M5–M7 work remains uncommitted and cannot be represented as accepted local milestone commits.
+
+Focused test evidence from this session and worker reviews:
+
+| Area | Result | Scope |
+|---|---|---|
+| M4 | **22/22 PASS**, exit 0 (`python3 tests/verify-installer-m4.py`) | Synthetic GPT-T mapping, exact artifact/hash checks, invalid format/layout and size refusal, symlink/race cases, and fail-closed GPT-T flash refusal. No physical flash validation. |
+| M5 | **22/22 PASS**, exit 0 | Synthetic verify/restore, identity mismatch, interrupted-phase reconciliation, full fake-disk readback/hash, and byte-identical restore. Independent review accepted. |
+| M6 | Synthetic focused suite PASS, exit 0; numeric count not captured in the coordinator's evidence | Package integrity/tamper and standalone fake-only checks. GPT-T install package integration remains blocked by the absent validated GPT-T flash path and unavailable real inputs. |
+| M7 | **14/14 PASS**, exit 0 | Wizard contract and synthetic restore workflow; B's independent cross-review accepted the corrected race-handling change. This does not establish the requested stock-to-install hardware cycle. |
+| Full permitted installer runner | **26 PASS, 0 FAIL, 0 SKIP**, exit 0 | Includes the installer regression suite; legacy tests retain their documented M0 exceptions. |
+
+Static checks reported after the final D fixes: Python project compile passed, `bash -n` and POSIX `sh -n` checks passed for applicable scripts, and `git diff --check` passed. ShellCheck was unavailable and therefore not run. No network, root, real EDL/fastboot/SSH, block device, owner backup, or physical device was accessed; no physical flash was attempted. The canonical `spec/INSTALLER-SPEC.md` and `spec/ACCEPTANCE.md` are absent, so G1–G9 cannot be mapped or claimed as canonically accepted. Overall status remains **PARTIAL_OFFLINE**. Do not mark `READY_OFFLINE` or claim milestone commits/acceptance.
+
 Needs real hardware before claiming device operation: validate systemd ordering on the assembled Bookworm image; confirm hostname/timezone behavior; confirm NetworkManager Wi-Fi and GSM profile acceptance and systemd-networkd USB settings; validate device Serial format; exercise remote SSH/sudo push against an intentionally provisioned test stick. These are not M3 offline-test claims.
 
 ## M4 build and flash wrappers
@@ -175,7 +191,7 @@ Generic builds use a clean `env -i` allowlist and a new private `HOME`. The narr
 | Failed build leaves no build registry/output | `test_build_failure_is_not_registered` |
 | Backup slice generation and SHA list for existing fastboot gate | `test_flash_backup_slice_materialization` |
 | Missing backup refusal and CLI exit 2 | `test_flash_refusals_and_input_hashes`, `test_missing_backup_cli_exit_code_2` |
-| Board gate and opt-in does not bypass backup | `test_flash_refusals_and_input_hashes` |
+| Untested boards are always refused; no override exists | `test_flash_refusals_and_input_hashes`, `test_new_cli_contracts_are_explicit_and_no_tested_board_bypass` |
 | Live identity mismatch refusal | `test_flash_identity_mismatch_refused` |
 | Missing/mismatched image or loader refusal | `test_flash_refusals_and_input_hashes` |
 | Dry-run then write ordering, all phase order, exact typed phrases, COMMIT and CONFIRM tokens | `test_flash_dry_confirmation_protocol_and_failure_stop`, `test_flash_full_phase_order_and_confirm_tokens` |
@@ -207,6 +223,86 @@ M4 files added: `tools/installer/build.py`, `tools/installer/flash.py`, `tests/v
 
 The four documented M0 baseline failures remain unchanged: missing generated images, fakeroot socket restriction, and prepared-copy execute-mode issue in the profile test. No M4 fix touched those failures.
 
-Remaining limitations: no Debian image was built because the prepared base and external pinned artifacts are absent and root/network use is forbidden. The M0 byte baseline cannot be compared. The existing first-install helper expects sparse `boot.bin/rootfs.bin`, while M4 build outputs `boot.img/rootfs.img`; flash requires a separately prepared image set with the helper's exact layout and never guesses a conversion. Supplied Path A blobs require complete SHA256SUMS, but their provenance beyond the pinned Firehose loader is not established in this sanitized workspace. Hardware checks remain real EDL identity output, partition fingerprint agreement, Path A and first-install readback, mode transition, firmware provenance review, and a manual boot observation. See [OPEN-QUESTIONS.md](OPEN-QUESTIONS.md).
+Remaining limitations: no Debian image was built because the prepared base and external pinned artifacts are absent and root/network use is forbidden. The M0 byte baseline cannot be compared. The GPT-T image-set adapter only checks and maps the production image formats; `flash` refuses that set until a safe write/readback engine is validated. Supplied Path A blobs require complete SHA256SUMS, but their provenance beyond the pinned Firehose loader is not established in this sanitized workspace. Hardware checks remain real EDL identity output, partition fingerprint agreement, Path A and first-install readback, mode transition, firmware provenance review, and a manual boot observation. See [OPEN-QUESTIONS.md](OPEN-QUESTIONS.md).
 
-M5 readiness: M4 leaves build manifests plus gated flash events and unresolved-state handling for later verify/restore work. M5 should resolve the image-set packaging mismatch and obtain hardware-only identity/readback evidence. This M4 implementation makes no claim that a target device boots.
+M5 readiness: M4 leaves build manifests plus gated flash events and unresolved-state handling for later verify/restore work. This M4 implementation makes no claim that a target device boots.
+
+## Autonomous completion update (offline evidence only)
+
+Branch is `installer`; current HEAD remains the accepted M4 SHA `da4f9c8a2770b11b181611fe5ff525cd2d1be197`. No new milestone commit has been created. The working tree contains uncommitted M5–M7 and integration work. Required `spec/INSTALLER-SPEC.md` and `spec/ACCEPTANCE.md` are absent, so canonical G1–G9 definitions and complete spec acceptance cannot be claimed.
+
+M4 compatibility has a tested synthetic preparation path. `openstick image-set prepare --build ID --layout DIR --output DIR` requires a registered UFI103S build and paired GPT-T primary/secondary tables. It checks source artifact hashes/sizes and build provenance, Android boot-v0 structure, ext4 superblock/size, supported GPT geometry and CRCs, then stages byte-identical `boot.img` and `rootfs.img` as payloads mapped to GPT-T `boot` and `userdata`. `image-set verify PATH` verifies the set read-only. Tests cover malformed or tampered images, wrong build/board/profile, changed GPT geometry, bad protective MBR, zero GUID, symlinks, post-scan symlink swaps, mixed/unknown layouts, and concurrent destination creation.
+
+This is not a flash engine. It does not prove device identity across EDL/fastboot transitions, the boot payload required by the live loader mode, or safe boot/userdata write and readback. `flash` verifies a GPT-T manifest and refuses with `HARDWARE_REQUIRED`. The legacy GPT-B first-install input is kept separate; no renaming or format conversion is performed. No physical device flash was attempted.
+
+| Milestone | Offline evidence | Remaining boundary |
+|---|---|---|
+| M5 verify/restore | Final focused suite PASS 22/22. Includes late GPT-secondary reconciliation/resume, byte-identical fake-disk restore, timeout and full-read mismatch exit 3, refusal of partial phase bytes, and mismatched/reordered saved-prefix cases with zero writes. Shim-backed call-order tests assert full `rf` and identity reads precede the first resumed write. | Real SSH, EDL behavior, loader semantics and hardware restoration remain untested. |
+| M6 packages | Final synthetic package suite PASS. Standalone runners verify and copy inputs through no-follow file descriptors into private snapshots, then use the snapshots. Restore and install tests mutate source payloads after snapshot and confirm the private snapshot remains unchanged. Fake fastboot PATH assertion passes. | No real EDL/fastboot invocation or production package creation from complete real build/backup inputs. The first-install GPT-T writer remains unavailable. |
+| M7 wizard/docs | Final focused suite `python3 tests/verify-installer-m7.py` PASS 14/14. Includes guarded wizard restore route through synthetic EDL, each typed phase confirmation, final full-disk SHA-256, and byte-identical fake disk. | No real board run. The synthetic install flow cannot exercise the GPT-T flash write path, which remains fail-closed. |
+
+Final D QA and coordinator review: `bash tests/run-installer-tests.sh` exited 0 with `TOTAL PASS=26 FAIL=0 SKIP=0` at the runner level. M4 passed 22/22, M5 passed 22/22, M6 synthetic package checks passed, and final M7 passed 14/14 after the corrective wizard changes. Nested optional skips: aarch64 gcc/objdump unavailable; rootfs tar/Docker optional tier unavailable; rollback real-data checks skipped with nonexistent temporary `REAL_BACKUP` and `REAL_GPT_DIR` paths. No owner data was inspected. This aggregate does not establish production package creation from unavailable external inputs or hardware execution.
+
+Final static checks: `bash -n` on 68 shell scripts passed; `sh -n` on 48 POSIX-shebang scripts passed; `python3 -m py_compile` on 17 installer/test Python files passed; `git diff --check` passed; ShellCheck was unavailable. An earlier whole-repository py_compile exited 1 only on two untouched Python-2-era sources, `src/lk2nd/platform/at91sam7/mkboard.py` and `src/lk2nd/scripts/aboot_test.py`. Earlier size and high-confidence secret-marker scans found no added or changed file exceeds 5 MiB; the tree-wide scan found only the pre-existing nested `src/linux-dts/.git/index` above that threshold or marker findings.
+
+No root, network, real build, USB/block-device access, real EDL or SSH, or real backup access occurred. The initial M6 harness omitted the fake fastboot shim from PATH; D traced the exercised code and confirmed it cannot call fastboot. C added an explicit fake-fastboot path assertion, the corrected synthetic suite passed, and no fastboot invocation occurred. The root-required Debian build, base/kernel/BusyBox inputs, production package assets, real Path A provenance, real image comparison and supervised hardware acceptance remain untested or unavailable. The four M0 baseline exceptions remain unchanged and are not passes. Their original baseline results were recorded earlier; the full installer runner does not rerun those failures. Root-required firewall/rootfs/sshd checks and optional artifact builds remain unrun.
+
+Local milestone commits were not created. Selective staging stopped before any index change because the workspace mounts `.git` read-only; Git reported it could not create `.git/index.lock`. `git diff --cached --stat` was empty after the failure. Branch and HEAD remain `installer` at the accepted M4 SHA. Do not treat the uncommitted tree as a release commit; retry the accepted M4/M5/M6 commit sequence only in an owner-provided writable Git metadata workspace.
+
+## Coordinator audit update (2026-11-15 UTC)
+
+The workspace was already dirty at session start: it contained edits to M4/shared CLI, tests and documentation, plus untracked M4-M7 modules and status/handoff files. HEAD was exactly the accepted M4 SHA on branch `installer`, and that SHA is an ancestor of HEAD. No pre-existing work was reset or discarded. Git metadata remains read-only, so no milestone commits can be made here; production work is uncommitted.
+
+The initial installer specification files `spec/INSTALLER-SPEC.md` and `spec/ACCEPTANCE.md` are absent. Therefore the canonical G1-G9 definitions and required mapping cannot be established from this copy. Do not claim full canonical G1-G9 acceptance.
+
+M4 audit traced the actual formats: `50-boot-img.sh` emits Android boot v0 `boot.img`, and `51-rootfs-img.sh` emits raw ext4 `rootfs.img` for GPT-T `userdata`. The legacy first-install consumer expects sparse `boot.bin`/`rootfs.bin` and a GPT-B layout, then calls `simg2img`. The synthetic image-set adapter validates GPT-T geometry and hashes, preserves byte-identical boot/ext4 payloads, and maps them to GPT-T `boot`/`userdata`. It explicitly rejects routing those artifacts through the GPT-B path. The M4 suite passed 22/22. No valid GPT-T device write/readback integration exists; `flash` returns `HARDWARE_REQUIRED` and remains fail-closed. This is an offline synthetic compatibility path, not hardware support.
+
+M5 cross-review: `_saved_completed_phases` requires matching device ID, backup ID and SHA-256, a strict prefix of the fixed phase order, and status/phase consistency. `_verify_completed_phase_bytes` hashes every skipped range in the preflight full live dump against the verified backup before a resumed write. `_known_rollback_state` constrains GPT/firmware state to the matching completed prefix. Negative tests cover wrong device, wrong backup/hash, reordered/inconsistent state and changed live bytes with no writes. Shim-backed call-order tests run the real `_live` helper and assert full `rf`, identity reads, dry-run gates and confirmations precede a resumed write. Late GPT-secondary reconciliation, partial-byte refusal, byte-identical restore and final-read timeout exit 3 are covered. Final focused suite passed 22/22.
+
+M7 restore E2E passed in the focused final 14/14 suite. It exercises wizard doctor/backup/restore stages with synthetic EDL, all exact phase confirmations, recorded wizard/engine completion state and byte-identical full-disk result. It does not validate physical EDL, real USB transitions, GPT-T install flashing, or real boot. It is a synthetic restore success path, not a full stock-to-install hardware E2E.
+
+M6 race repair/review: standalone restore and install runners traverse and open package members with no-follow descriptors, copy verified contents into a private snapshot, validate copied size/hash and metadata, and use the snapshot after validation. Synthetic regressions mutate source payloads after snapshot creation for both package types and confirm the private snapshot is unchanged. The final M6 suite passed. This is offline synthetic race evidence and does not establish behavior under every filesystem or physical workload.
+
+No network, root, hardware, real EDL/fastboot/SSH, block device, owner backup or real firmware was accessed. No physical device flash was attempted. Overall status remains `PARTIAL_OFFLINE`: canonical spec/G1-G9 mapping, a safe GPT-T first-install write/readback path, clean launch tree restoration/ownership, and writable Git metadata for milestone commits remain outstanding.
+
+## Coordinator continuation (2026-11-15, resumed M6)
+
+The recovered canonical inputs are present one directory above this builder checkout at `../spec/INSTALLER-SPEC.md` and `../spec/ACCEPTANCE.md`. Earlier entries in this report and OPEN-QUESTIONS.md saying the canonical files were absent describe the previous audit's view and are superseded by this section. The restored spec defines G1-G9 as follows; each row links the implementation area to a negative/refusal test that exercises the gate.
+
+| Gate | Source mapping | Refusal evidence |
+|---|---|---|
+| G1 verified backup and live identity before flash | `tools/installer/flash.py` backup and identity preflight | `tests/verify-installer-m4.py`: `test_missing_backup_cli_exit_code_2`, `test_flash_identity_mismatch_refused` |
+| G2 dry-run, typed confirmation, interactive only | `tools/installer/flash.py`, `tools/installer/verify_restore.py`, standalone restore/install runners in `tools/installer/packages.py` | M4: `test_flash_wrong_confirmation_and_noninteractive_dry_only`; M5: `test_wrong_typed_confirmation_and_fwlib_test_override_do_not_write`; M6: non-TTY and wrong-confirmation standalone restore cases |
+| G3 secrets absent from argv, logs, registry, events, and error text | `tools/installer/configure.py`, `tools/installer/seed.py`, `tools/installer/store.py`, `tools/installer/cli.py` | `tests/verify-installer-m3.py`: `secret-redaction-in-exceptions-registry-and-events`, `fake-root-apply-idempotency-and-secret-safe-logs`; M7: `test_destructive_exception_and_secret_text_not_written_to_state` |
+| G4 prod seed without SSH key needs explicit acknowledgement | `tools/installer/configure.py` | M3 G4 refusal case: declining the explicit unreachable-prod confirmation is refused |
+| G5 only tested board without override | `tools/installer/flash.py` and board validation helpers | M4: `test_flash_refusals_and_input_hashes`, including untested board refusal |
+| G6 external blobs require pinned hashes; mismatch stops | `tools/installer/flash.py`, `tools/installer/packages.py`, `tools/installer/imageset.py` | M4: `test_flash_refusals_and_input_hashes`, `test_gpt_t_image_set_tampering_is_detected_and_flash_stops_hardware_required`; M5: `test_restore_rejects_unpinned_loader_and_live_identity_mismatch`; M6 package tamper/integrity cases |
+| G7 stop at failure and do not retry uncertain writes | `tools/installer/flash.py`, `tools/installer/verify_restore.py`, portable restore/install scripts in `tools/installer/packages.py`, `tools/installer/wizard.py` | M4: `test_flash_dry_confirmation_protocol_and_failure_stop`, `test_interrupted_write_requires_reconciliation_and_is_not_retried`; M5: `test_partial_phase_bytes_block_reconciliation_without_retry`; M6: interrupted-write, alternate-state, completed-data-partition corruption, Git-worktree output refusal, and SENSITIVE README regressions |
+| G8 private store/package outside Git; private permissions | `tools/installer/store.py`, `tools/installer/packages.py` | Full runner: `store-refuses-git`, `store-permissions`; M6 package output Git-tree refusal case |
+| G9 never cache/store sudo; print exact privileged command first | `tools/installer/build.py` | M4: `test_build_generic_and_legacy_env_order_and_permissions` asserts command preview and sudo ordering; no sudo command was executed in this audit |
+
+### Resumed M6 repair and review
+
+The alternate state-path defense was already present. Standalone restore pins the canonical state path to the selected device and backup hash, rejects alternate `--state` paths before EDL calls, and the existing interrupted-write test proves only one actual fake write occurred. The partial-data gap was fixed in `tools/installer/packages.py`: before a later restore phase, every completed data partition (`userdata`, `cache`, `persist`, `boot`, `modemst1`, `modemst2`) is read in full and compared with the corresponding verified backup range. An added negative regression marks `userdata` complete, corrupts its fake live bytes, attempts `cache`, and confirms refusal before any actual write. Focused M6 passed after this change. Independent review accepted the final patch and confirmed that the regression reaches the full-range mismatch check before any actual write.
+
+### Latest offline validation
+
+M4 focused tests passed 23/23, M5 passed 22/22, M6 synthetic package checks passed including both M6 adversarial cases, and M7 passed 14/14. `bash tests/run-installer-tests.sh` exited 0 with 26 passes, 0 failures, and 0 runner-level skips. The runner's optional nested skips remain as described above. `git diff --check`, `bash -n` over every repository `.sh`, and `python3 -m py_compile` passed for all 16 installer and installer-test Python files. A whole-repository compile still fails on two untouched Python-2-era sources: `src/lk2nd/platform/at91sam7/mkboard.py` and `src/lk2nd/scripts/aboot_test.py`. ShellCheck availability was not rechecked in this continuation; prior audit recorded it unavailable.
+
+The restored specs make G1-G9 mappable, but acceptance remains `PARTIAL_OFFLINE`: GPT-T first-install still returns `HARDWARE_REQUIRED`, physical board behavior and production inputs are unavailable, and the worktree is uncommitted because `.git` is read-only. No M0-M4 work was restarted. No dashboard, Windows support, hardware access, sudo, or network operation was performed.
+
+### Commit boundary plan
+
+No index or Git metadata was modified. In an owner-provided writable Git metadata workspace, first inspect the existing `installer` branch and stage only the already-intended milestone deltas. Suggested boundaries from the current dirty tree: retain accepted baseline M4 SHA `da4f9c8a2770b11b181611fe5ff525cd2d1be197`; make separate M5, M6, and M7 commits, with the required README/FLASH-PLAN GPT-T documentation correction in its own `docs: GPT-B -> GPT-T` commit. M6 includes `tools/installer/packages.py`, `tests/verify-installer-m6.py`, and the relevant M6 report/status/open-question updates; do not mark any boundary committed until `git status`, staged diff, commit SHA, and tests are checked in that writable workspace. Existing shared M4/M5/M7 files need deliberate per-commit staging based on their actual diffs; do not stage the whole tree as a single milestone.
+
+### File-level staging boundaries for owner terminal
+
+The existing uncommitted shared CLI and runner contain several milestones, so stage their hunks separately after reviewing each staged diff. Intended file ownership is:
+
+- **M4 integration follow-up** (the dirty work already present atop accepted M4, not a restart): `tools/installer/cli.py`, `tools/installer/flash.py`, `tools/installer/imageset.py`, `tests/verify-installer-m4.py`, and only M4 hunks from `tests/run-installer-tests.sh`, plus M4-specific design notes. Preserve accepted M4 SHA as parent.
+- **M5**: `tools/installer/verify_restore.py`, `tests/verify-installer-m5.py`, and only M5 CLI/runner/report hunks.
+- **M6**: `tools/installer/packages.py`, `tests/verify-installer-m6.py`, and only M6 CLI/runner/report/status/open-question hunks.
+- **M7**: `tools/installer/wizard.py`, `tests/verify-installer-m7.py`, and only M7 CLI/runner/report/status/handoff hunks.
+- **Docs correction**: `README.md` and `FLASH-PLAN.md` GPT-T correction hunks, commit title exactly `docs: GPT-B -> GPT-T` as required by acceptance. If their quickstart edits share hunks, split by staging patch after reviewing the index.
+
+`DESIGN.md`, `OPEN-QUESTIONS.md`, `INSTALLER-REPORT.md`, `AUTONOMOUS-STATUS.json`, `FINAL-HANDOFF.md`, `OWNERSHIP-MAP.md`, and `docs/INSTALLER.md` contain cross-milestone material and need hunk-level placement with the milestone they document. Do not include generated caches or the nested `src/linux-dts/.git` metadata. Before each commit, inspect `git diff --cached --stat` and `git diff --cached`; after each, record the resulting SHA and rerun the affected focused suite. This is a proposed safe staging map, not evidence that any commit exists.

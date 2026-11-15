@@ -142,6 +142,22 @@ def flash_command(args, home, repo):
     if store._inside_git(image_input):
         raise store.RefusedError("flash image set must be outside every Git worktree")
     image_set = image_input.resolve()
+    gpt_t_manifest = image_set / "manifest.json"
+    if gpt_t_manifest.is_symlink():
+        raise store.RefusedError("image-set manifest is a symlink")
+    if gpt_t_manifest.is_file() and not gpt_t_manifest.is_symlink():
+        try:
+            manifest = json.loads(gpt_t_manifest.read_text(encoding="utf-8"))
+        except (OSError, ValueError, json.JSONDecodeError):
+            raise store.RefusedError("image-set manifest is invalid")
+        if manifest.get("format") == "openstick-gpt-t-image-set":
+            from . import imageset
+            imageset._verify_set(image_set)
+            raise store.RefusedError("HARDWARE_REQUIRED: GPT-T images are mapped and verified offline, but no safe live-identity-preserving boot/userdata write and read-back path is validated")
+        raise store.RefusedError("unsupported image-set manifest format")
+    if any((image_set / rel).exists() for rel in ("boot.img", "rootfs.img", "payload/boot.img", "payload/rootfs.img",
+                                                   "layout/gpt-T-primary.bin", "layout/gpt-T-secondary.bin")):
+        raise store.RefusedError("mixed or unknown image-set layout; GPT-T boot.img/rootfs.img cannot enter the legacy GPT-B sparse path")
     registry = store.load_registry(home)
     device = common._find_device(registry, args.flash_device)
     if not device:
@@ -156,8 +172,8 @@ def flash_command(args, home, repo):
     if profile_path.is_symlink() or not profile_path.is_file():
         raise store.RefusedError("board profile is missing")
     tested = board == "ufi103s"
-    if not tested and not args.i_accept_untested:
-        raise store.RefusedError("untested board refused; pass --i-accept-untested to acknowledge the board class")
+    if not tested:
+        raise store.RefusedError("untested board refused; this installer has no verified flash path for the selected board")
     backup_dir, backup_manifest = _verified_backup(home, device)
     checked = _checked_sum_file(image_set, require_all=True)
     image_manifest_hash = _hash(image_set / "SHA256SUMS")

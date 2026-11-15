@@ -6,8 +6,8 @@ Everything else (web UI, SMS forwarding, dashboards) is meant to be installed af
 
 Derived from [kinsamanka/OpenStick-Builder](https://github.com/kinsamanka/OpenStick-Builder) (MIT). See `NOTICE.md`.
 
-> **WARNING: flashing can brick your device.** This builder only produces files; it never writes to a device.
-> Before you flash anything: (1) back up every partition of YOUR stick, (2) verify the backup with sha256,
+> **WARNING: flashing can brick your device.** The installer includes a guarded write path; a build alone never writes to a device.
+> Before any hardware operation: (1) make and independently verify a full backup of YOUR stick, (2) confirm the live identity matches it,
 > (3) make sure you have a working EDL (9008) recovery path. `modemst1`, `modemst2`, `fsg`, `fsc`, `persist`
 > and `sec` are unique per device: never share them, never commit them, never flash another unit's copy.
 
@@ -16,6 +16,18 @@ Derived from [kinsamanka/OpenStick-Builder](https://github.com/kinsamanka/OpenSt
 Work in progress. First target: UFI103S (`BOARD=ufi103s`), kernel 6.6 (postmarketOS package, as in the original Builder).
 Per-board config (`boards/<BOARD>/board.env`) and a GPT generated from the eMMC size are implemented.
 Not yet implemented: `BOOT_MODE=stock-repack`. Kernel 6.12 is a future option (the board runs 6.6, pmOS 6.6-r5). Nothing here has been flashed or booted yet.
+
+The separate installer wrapper is documented in [docs/INSTALLER.md](docs/INSTALLER.md). Offline installer tests use synthetic fixtures and shims only. The M4 build output (`boot.img`, `rootfs.img`) is not the legacy first-install input (`boot.bin`, `rootfs.bin`). A GPT-T adapter validates and maps the build artifacts to `boot` and `userdata`; the current flash wrapper still refuses that image set because a safe hardware write/readback path is not validated. Do not bypass the refusal by renaming files.
+
+### Installer quickstart (offline inspection)
+
+```sh
+./openstick doctor
+./openstick device list
+./openstick wizard --id first-run --stage doctor
+```
+
+Each wizard stage is invoked separately with `--stage`; see the installer guide for backup, seed, build, flash and restore requirements. Do not run backup or write stages against a physical device without owner-supervised hardware acceptance. Passing `doctor` does not establish board, firmware, image or boot compatibility.
 
 ## Host requirements (Debian/Ubuntu names)
 
@@ -48,7 +60,11 @@ scripts/build_hyp_aboot.sh           # lk2nd + qhypstub -> out/fw/{aboot,hyp}.mb
 ```
 
 `sudo -E` is ignored on some hosts: pass variables via `config/local.env`, `boards/*/board.env` or `sudo env VAR=val scripts/...`. Scripts only touch `work/` and `out/`.
-## Images: formats, sizes, what goes where
+## Legacy GPT-B image notes (not the current GPT-T boot path)
+
+The following sparse `boot.bin`/`rootfs.bin` instructions document the retained legacy GPT-B flow. They are not the supported production boot path described below and must not be used to convert or substitute for M4's `boot.img`/`rootfs.img`. The current device path and rollback evidence are documented in [ROLLBACK.md](ROLLBACK.md) and [docs/INSTALLER.md](docs/INSTALLER.md).
+
+## Images: legacy GPT-B formats and sizes
 
 `out/files-<board>/boot.bin` and `rootfs.bin` are **Android sparse images** (`img2simg` of a raw ext2 / ext4 file),
 so they are small on disk (rootfs ~216 MB) but expand to the full partition size when flashed or converted.

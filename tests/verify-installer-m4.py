@@ -9,6 +9,9 @@ import subprocess
 import sys
 import tempfile
 import types
+import struct
+import uuid
+import zlib
 import unittest
 from unittest import mock
 
@@ -16,8 +19,12 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from tools.installer import build as build_module
 from tools.installer import flash as flash_module
+from tools.installer import imageset as imageset_module
+from tools.installer import packages as packages_module
 from tools.installer import store
-from tools.installer.cli import _hash_range, _parse_gpt
+from tools.installer import cli as cli_module
+from tools.installer import verify_restore as verify_restore_module
+from tools.installer.cli import _hash_range, _parse_gpt, parser
 
 
 def digest(path):
@@ -31,6 +38,54 @@ def build_args(board="ufi103s", profile="dev", legacy=False, dry=False):
 class FakeTTY(io.StringIO):
     def isatty(self):
         return True
+
+
+def synthetic_gpt_t(directory, boot_start=396384, protective_start=1, disk_guid=None):
+    import importlib.util
+    source = ROOT / "scripts/gptool.py"
+    spec = importlib.util.spec_from_file_location("test_gptool", source)
+    gptool = importlib.util.module_from_spec(spec); spec.loader.exec_module(gptool)
+    entries = [
+        gptool.mk_entry(gptool.BOOT_TYPE, str(uuid.uuid4()), boot_start, boot_start + 32767, 0, "boot"),
+        gptool.mk_entry(gptool.ROOT_TYPE, str(uuid.uuid4()), 429152, 2067551, 0, "system"),
+        gptool.mk_entry(gptool.ROOT_TYPE, str(uuid.uuid4()), 2428000, 7634910, 0, "userdata"),
+    ]
+    table = b"".join(entries).ljust(28 * 128, b"\0")
+    crc = zlib.crc32(table) & 0xffffffff
+    region = table.ljust(32 * 512, b"\0")
+    disk_guid = disk_guid if disk_guid is not None else uuid.uuid4().bytes_le
+    base = struct.pack(gptool.HDR, gptool.SIG, 0x10000, gptool.HDR_SZ, 0, 0, 1,
+                       imageset_module.EMMC_SECTORS - 1, 34, imageset_module.EMMC_SECTORS - 34,
+                       disk_guid, 2, 28, 128, crc).ljust(512, b"\0")
+    primary_header = gptool.make_hdr(base, 1, imageset_module.EMMC_SECTORS - 1, 2, crc)
+    secondary_header = gptool.make_hdr(base, imageset_module.EMMC_SECTORS - 1, 1,
+                                       imageset_module.EMMC_SECTORS - 33, crc)
+    mbr = bytearray(512); mbr[510:512] = b"\x55\xaa"; mbr[450] = 0xee
+    struct.pack_into("<II", mbr, 454, protective_start, imageset_module.EMMC_SECTORS - protective_start)
+    primary = bytes(mbr) + primary_header + region
+    secondary = region + secondary_header
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "gpt-T-primary.bin").write_bytes(primary)
+    (directory / "gpt-T-secondary.bin").write_bytes(secondary)
+
+
+def synthetic_boot_image():
+    page = 2048
+    kernel = b"K" * page
+    ramdisk = b"R" * page
+    header = struct.pack("<8s10I16s512s32s1024s", b"ANDROID!", len(kernel), 0x80080000,
+                         len(ramdisk), 0x82000000, 0, 0x80f00000, 0x81e00000,
+                         page, 0, 0, b"fixture", b"test", b"\0" * 32, b"")
+    return header.ljust(page, b"\0") + kernel + ramdisk
+
+
+def synthetic_ext4_image(size=65536):
+    image = bytearray(size)
+    sb = memoryview(image)[1024:2048]
+    struct.pack_into("<I", sb, 4, size // 4096)
+    struct.pack_into("<I", sb, 24, 2)
+    sb[56:58] = b"\x53\xef"
+    return bytes(image)
 
 
 class M4Tests(unittest.TestCase):
@@ -114,6 +169,205 @@ class M4Tests(unittest.TestCase):
         self.assertEqual(calls, ["20-rootfs.sh"])
         self.assertEqual(store.load_registry(self.home).get("builds", []), [])
         self.assertFalse(list((self.home / "builds").glob(".build-*")))
+
+    def test_new_cli_contracts_are_explicit_and_no_tested_board_bypass(self):
+        verify = parser().parse_args(["verify", "--host", "synthetic.invalid"])
+        self.assertEqual((verify.command, verify.host), ("verify", "synthetic.invalid"))
+        restore = parser().parse_args(["restore", "--device", "deadbeef", "--backup", "fixture-backup"])
+        self.assertEqual((restore.command, restore.restore_device, restore.restore_backup),
+                         ("restore", "deadbeef", "fixture-backup"))
+        install = parser().parse_args(["package", "install", "--output", "/tmp/openstick-test.ostpkg.tar",
+                                       "--device", "deadbeef", "--backup", "fixture-backup", "--image-set", "/tmp/images"])
+        self.assertEqual((install.package_command, install.package_type, install.package_device,
+                          install.package_backup, install.package_image_set),
+                         ("install", "install", "deadbeef", "fixture-backup", "/tmp/images"))
+        verify_package = parser().parse_args(["package", "verify", "/tmp/fixture.ostpkg.tar"])
+        self.assertEqual((verify_package.package_command, verify_package.path), ("verify", "/tmp/fixture.ostpkg.tar"))
+        wizard = parser().parse_args(["wizard", "--id", "fixture-run", "--stage", "build", "--resume",
+                                      "--board", "ufi103s", "--profile", "prod", "--package-type", "install",
+                                      "--package-output", "/tmp/fixture.ostpkg.tar"])
+        self.assertEqual((wizard.command, wizard.wizard_id, wizard.stage, wizard.resume,
+                          wizard.wizard_board, wizard.wizard_profile, wizard.package_type, wizard.package_output),
+                         ("wizard", "fixture-run", "build", True, "ufi103s", "prod", "install", "/tmp/fixture.ostpkg.tar"))
+        image_set = parser().parse_args(["image-set", "prepare", "--build", "build-1", "--layout", "/tmp/layout", "--output", "/tmp/set"])
+        self.assertEqual((image_set.image_set_command, image_set.build, image_set.layout, image_set.output),
+                         ("prepare", "build-1", "/tmp/layout", "/tmp/set"))
+        with self.assertRaises(SystemExit), mock.patch("sys.stderr", io.StringIO()):
+            parser().parse_args(["flash", "--device", "deadbeef", "--image-set", "/tmp/images", "--i-accept-untested"])
+        with self.assertRaises(SystemExit), mock.patch("sys.stderr", io.StringIO()):
+            parser().parse_args(["verify"])
+
+    def test_read_only_cli_commands_do_not_initialize_private_store(self):
+        store_path = self.tmp / "must-not-be-created"
+        with mock.patch.object(cli_module.store, "ensure_store", side_effect=AssertionError("read-only command mutated store")), \
+             mock.patch.object(verify_restore_module, "verify_command", return_value=0):
+            self.assertEqual(cli_module.main(["--home", str(store_path), "verify", "--host", "synthetic.invalid"]), 0)
+        self.assertFalse(store_path.exists())
+        with mock.patch.object(cli_module.store, "ensure_store", side_effect=AssertionError("read-only command mutated store")), \
+             mock.patch.object(packages_module, "verify_package", return_value={"package_type": "restore"}):
+            self.assertEqual(cli_module.main(["--home", str(store_path), "package", "verify", "/tmp/fake-package"]), 0)
+        self.assertFalse(store_path.exists())
+
+    def test_cli_interrupt_guides_reconciliation_for_flash_and_restore(self):
+        stderr = io.StringIO()
+        with mock.patch.object(verify_restore_module, "verify_command", side_effect=KeyboardInterrupt()), \
+             mock.patch("sys.stderr", stderr):
+            self.assertEqual(cli_module.main(["verify", "--host", "synthetic.invalid"]), cli_module.EXIT_ERROR)
+        message = stderr.getvalue()
+        self.assertIn("flash --reconcile-state", message)
+        self.assertIn("restore --reconcile-state", message)
+
+    def _registered_synthetic_build(self, build_id="fixture-build", board="ufi103s", profile="prod",
+                                    boot_bytes=None, rootfs_bytes=None):
+        build_dir = self.home / "builds" / build_id
+        build_dir.mkdir(mode=0o700)
+        boot_path, rootfs_path = build_dir / "boot.img", build_dir / "rootfs.img"
+        boot_path.write_bytes(synthetic_boot_image() if boot_bytes is None else boot_bytes)
+        rootfs_path.write_bytes(synthetic_ext4_image() if rootfs_bytes is None else rootfs_bytes)
+        manifest = {"schema_version": 1, "build_id": build_id, "board": board, "profile": profile,
+                    "artifacts": {"boot.img": {"sha256": digest(boot_path), "size": boot_path.stat().st_size},
+                                  "rootfs.img": {"sha256": digest(rootfs_path), "size": rootfs_path.stat().st_size}}}
+        manifest_path = build_dir / "build.json"
+        manifest_path.write_text(json.dumps(manifest))
+        registry = store.load_registry(self.home)
+        registry.setdefault("builds", []).append({"build_id": build_id, "path": str(build_dir), "board": board, "profile": profile})
+        store.save_registry(self.home, registry)
+        return build_dir, manifest
+
+    def test_gpt_t_image_set_maps_exact_artifacts_and_verifies(self):
+        self._registered_synthetic_build()
+        layout = self.tmp / "gpt-t"; synthetic_gpt_t(layout)
+        output = self.tmp / "prepared-image-set"
+        args = types.SimpleNamespace(build="fixture-build", layout=str(layout), output=str(output))
+        self.assertEqual(imageset_module.prepare_command(args, self.home, self.repo), 0)
+        manifest = json.loads((output / "manifest.json").read_text())
+        self.assertEqual(manifest["format"], "openstick-gpt-t-image-set")
+        self.assertEqual(manifest["layout_id"], imageset_module.LAYOUT_ID)
+        self.assertEqual(manifest["board"], "ufi103s")
+        self.assertEqual(manifest["build_id"], "fixture-build")
+        self.assertEqual(manifest["artifacts"]["boot.img"]["partition"], "boot")
+        self.assertEqual(manifest["artifacts"]["rootfs.img"]["partition"], "userdata")
+        self.assertEqual((output / "payload/boot.img").read_bytes(), (self.home / "builds/fixture-build/boot.img").read_bytes())
+        self.assertEqual((output / "payload/rootfs.img").read_bytes(), (self.home / "builds/fixture-build/rootfs.img").read_bytes())
+        self.assertEqual(imageset_module.verify_command(str(output)), 0)
+        with self.assertRaisesRegex(store.RefusedError, "HARDWARE_REQUIRED"):
+            flash_module.flash_command(types.SimpleNamespace(image_set=str(output)), self.home, self.repo)
+        manifest["format"] = "unknown-mixed-format"
+        (output / "manifest.json").chmod(0o600)
+        (output / "manifest.json").write_text(json.dumps(manifest))
+        with self.assertRaisesRegex(store.RefusedError, "unsupported image-set manifest format"):
+            flash_module.flash_command(types.SimpleNamespace(image_set=str(output)), self.home, self.repo)
+
+    def test_gpt_t_adapter_rejects_wrong_build_identity_and_unknown_layout(self):
+        self._registered_synthetic_build(board="other-board")
+        layout = self.tmp / "gpt-t"; synthetic_gpt_t(layout)
+        args = types.SimpleNamespace(build="fixture-build", layout=str(layout), output=str(self.tmp / "bad-board-set"))
+        with self.assertRaisesRegex(store.RefusedError, "board"):
+            imageset_module.prepare_command(args, self.home, self.repo)
+        # A GPT-B style rootfs partition or altered boot geometry is not inferred
+        # as the current GPT-T image destination.
+        self._registered_synthetic_build(build_id="valid-build")
+        bad_layout = self.tmp / "bad-gpt"; synthetic_gpt_t(bad_layout, boot_start=429152)
+        args = types.SimpleNamespace(build="valid-build", layout=str(bad_layout), output=str(self.tmp / "bad-layout-set"))
+        with self.assertRaisesRegex(store.RefusedError, "partitions overlap|not the supported GPT-T"):
+            imageset_module.prepare_command(args, self.home, self.repo)
+        self._registered_synthetic_build(build_id="bad-profile", profile="other")
+        args = types.SimpleNamespace(build="bad-profile", layout=str(layout), output=str(self.tmp / "bad-profile-set"))
+        with self.assertRaisesRegex(store.RefusedError, "profile"):
+            imageset_module.prepare_command(args, self.home, self.repo)
+
+    def test_gpt_t_adapter_rejects_invalid_protective_mbr_and_zero_disk_guid(self):
+        self._registered_synthetic_build()
+        for name, options, message in (("bad-mbr", {"protective_start": 0}, "protective MBR"),
+                                       ("zero-guid", {"disk_guid": b"\0" * 16}, "disk GUID")):
+            layout = self.tmp / name; synthetic_gpt_t(layout, **options)
+            args = types.SimpleNamespace(build="fixture-build", layout=str(layout), output=str(self.tmp / (name + "-set")))
+            with self.assertRaisesRegex(store.RefusedError, message):
+                imageset_module.prepare_command(args, self.home, self.repo)
+
+    def test_gpt_t_adapter_rejects_bad_build_hash_boot_format_and_oversize_ext4(self):
+        build, manifest = self._registered_synthetic_build(build_id="bad-hash")
+        (build / "boot.img").write_bytes(b"changed")
+        layout = self.tmp / "gpt-t"; synthetic_gpt_t(layout)
+        args = types.SimpleNamespace(build="bad-hash", layout=str(layout), output=str(self.tmp / "bad-hash-set"))
+        with self.assertRaisesRegex(store.RefusedError, "hash or size"):
+            imageset_module.prepare_command(args, self.home, self.repo)
+        self._registered_synthetic_build(build_id="bad-boot", boot_bytes=b"not-android")
+        args = types.SimpleNamespace(build="bad-boot", layout=str(layout), output=str(self.tmp / "bad-boot-set"))
+        with self.assertRaisesRegex(store.RefusedError, "not an Android boot image"):
+            imageset_module.prepare_command(args, self.home, self.repo)
+        oversized = bytearray(synthetic_ext4_image())
+        struct.pack_into("<I", memoryview(oversized)[1024:2048], 4, imageset_module.EMMC_SECTORS)
+        self._registered_synthetic_build(build_id="oversize", rootfs_bytes=bytes(oversized))
+        args = types.SimpleNamespace(build="oversize", layout=str(layout), output=str(self.tmp / "oversize-set"))
+        with self.assertRaisesRegex(store.RefusedError, "exceeds"):
+            imageset_module.prepare_command(args, self.home, self.repo)
+
+    def test_gpt_t_image_set_tampering_is_detected_and_flash_stops_hardware_required(self):
+        self._registered_synthetic_build()
+        layout = self.tmp / "gpt-t"; synthetic_gpt_t(layout)
+        output = self.tmp / "prepared-image-set"
+        args = types.SimpleNamespace(build="fixture-build", layout=str(layout), output=str(output))
+        imageset_module.prepare_command(args, self.home, self.repo)
+        (output / "payload/rootfs.img").chmod(0o600)
+        with (output / "payload/rootfs.img").open("ab") as stream: stream.write(b"X")
+        with self.assertRaisesRegex(store.RefusedError, "checksum mismatch"):
+            imageset_module._verify_set(output)
+
+    def test_gpt_t_image_set_rejects_file_replaced_by_symlink_after_tree_scan(self):
+        self._registered_synthetic_build()
+        layout = self.tmp / "gpt-t"; synthetic_gpt_t(layout)
+        output = self.tmp / "prepared-race-set"
+        args = types.SimpleNamespace(build="fixture-build", layout=str(layout), output=str(output))
+        imageset_module.prepare_command(args, self.home, self.repo)
+        real_scan = imageset_module._scan_tree_fd
+        swapped = []
+        def scan_then_swap(root_fd):
+            result = real_scan(root_fd)
+            if not swapped:
+                swapped.append(True)
+                payload_dir = output / "payload"
+                payload_dir.chmod(0o700)
+                (payload_dir / "rootfs.img").unlink()
+                (payload_dir / "rootfs.img").symlink_to("/etc/passwd")
+            return result
+        with mock.patch.object(imageset_module, "_scan_tree_fd", side_effect=scan_then_swap):
+            with self.assertRaisesRegex(store.RefusedError, "changed|symlink"):
+                imageset_module._verify_set(output)
+
+    def test_gpt_t_image_set_rejects_symlink_directory(self):
+        self._registered_synthetic_build()
+        layout = self.tmp / "gpt-t"; synthetic_gpt_t(layout)
+        output = self.tmp / "prepared-link-set"
+        args = types.SimpleNamespace(build="fixture-build", layout=str(layout), output=str(output))
+        imageset_module.prepare_command(args, self.home, self.repo)
+        output.chmod(0o700)
+        (output / "foreign").symlink_to(self.tmp, target_is_directory=True)
+        with self.assertRaisesRegex(store.RefusedError, "symlink"):
+            imageset_module._verify_set(output)
+
+    def test_gpt_t_image_set_publication_never_replaces_concurrent_empty_directory(self):
+        self._registered_synthetic_build()
+        layout = self.tmp / "gpt-t"; synthetic_gpt_t(layout)
+        output = self.tmp / "publication-race"
+        args = types.SimpleNamespace(build="fixture-build", layout=str(layout), output=str(output))
+        real_publish = imageset_module._rename_noreplace
+        def create_destination_before_publish(source, destination):
+            pathlib.Path(destination).mkdir(mode=0o700)
+            return real_publish(source, destination)
+        with mock.patch.object(imageset_module, "_rename_noreplace", side_effect=create_destination_before_publish):
+            with self.assertRaisesRegex(store.RefusedError, "appeared during preparation"):
+                imageset_module.prepare_command(args, self.home, self.repo)
+        self.assertTrue(output.is_dir())
+        self.assertEqual(list(output.iterdir()), [])
+        self.assertFalse(list(self.tmp.glob(".openstick-image-set-*")))
+
+    def test_legacy_flash_refuses_mixed_gpt_t_files_without_manifest(self):
+        image_set = self.tmp / "mixed-image-set"
+        image_set.mkdir()
+        (image_set / "boot.img").write_bytes(synthetic_boot_image())
+        with self.assertRaisesRegex(store.RefusedError, "mixed or unknown image-set layout"):
+            flash_module.flash_command(types.SimpleNamespace(image_set=str(image_set)), self.home, self.repo)
 
     def test_common_config_isolation_and_legacy_precedence(self):
         import shutil
@@ -208,8 +462,7 @@ class M4Tests(unittest.TestCase):
         args, dev, identity, env = self._flash_fixture(board="mf800", with_backup=False)
         with mock.patch.dict(os.environ, env, clear=True), self.assertRaisesRegex(store.RefusedError, "untested board"):
             flash_module.flash_command(args, self.home, self.repo)
-        args.i_accept_untested = True
-        with mock.patch.dict(os.environ, env, clear=True), self.assertRaisesRegex(store.RefusedError, "verified, hash-matching full backup"):
+        with mock.patch.dict(os.environ, env, clear=True), self.assertRaisesRegex(store.RefusedError, "untested board refused"):
             flash_module.flash_command(args, self.home, self.repo)
         args, dev, identity, env = self._flash_fixture()
         image = pathlib.Path(args.image_set) / "files-ufi103s/boot.bin"

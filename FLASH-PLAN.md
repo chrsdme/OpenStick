@@ -1,12 +1,14 @@
-# FLASH-PLAN: board #6 (White Stick ZX UFI103, UFI103S_V02), layout GPT-B
+# Historical FLASH-PLAN: board #6 GPT-B proposal (superseded)
 
-Status: DOCUMENTATION + GENERATED ARTIFACTS ONLY. Nothing was written to a device. No sudo, no edl write, no fastboot.
+> **Historical and superseded. Do not use this GPT-B plan for current install or restore.** `ROLLBACK.md` identifies the current documented rollback context as GPT-T and describes restoring the original stock layout. This file is retained as historical GPT-B design evidence only. It is not an install plan, not a restore plan and not hardware authorization.
+
+Status of this document's original work: DOCUMENTATION + GENERATED ARTIFACTS ONLY. It records no device write by that work. This workspace has not repeated its claimed owner hardware checks.
 Legend: [VERIFIED] = checked on files or on hardware (EDL read-only) , [ASSUMED] = not verified, check before use.
 Unique GUIDs, disk GUID and dumps are never written in this repo.
 
 ## 0. Verdict
 
-- Owner decision: **GPT-B** (keep every original entry except the Android-only ones; boot 64 MiB, rootfs 2.62 GiB).
+- Historical owner decision recorded here: **GPT-B** (keep every original entry except the Android-only ones; boot 64 MiB, rootfs 2.62 GiB). It is superseded for the documented GPT-T rollback path.
 - `scripts/gen-gpt.sh` is now template based (section 2). The old hardcoded "stock-like" layout (`gpt_both0.bin` from the
   first version) was a BLOCKER and is retired (`out/obsolete/`, never flash it).
 - `out/files-ufi103s/` is now the CANONICAL build (root-owned, built with `sudo scripts/40-images.sh` on the fixed sources, layout GPT-B).

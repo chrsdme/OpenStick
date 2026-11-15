@@ -90,8 +90,49 @@ def parser():
     flash = subs.add_parser("flash", help="run the gated Path A first-install sequence")
     flash.add_argument("--device", dest="flash_device", required=True, metavar="ID")
     flash.add_argument("--image-set", required=True, metavar="PATH")
-    flash.add_argument("--i-accept-untested", action="store_true", help="acknowledge an untested board class")
     flash.add_argument("--reconcile-state", action="store_true", help="record explicit interactive reconciliation of an interrupted phase; performs no writes")
+    verify = subs.add_parser("verify", help="verify a running stick through read-only SSH checks")
+    verify.add_argument("--host", required=True, metavar="HOST", help="SSH destination for read-only checks")
+    restore = subs.add_parser("restore", help="restore a verified full-device backup through EDL")
+    restore.add_argument("--device", dest="restore_device", required=True, metavar="ID")
+    restore.add_argument("--backup", dest="restore_backup", metavar="ID")
+    restore.add_argument("--reconcile-state", dest="restore_reconcile_state", action="store_true",
+                         help="record explicit interactive reconciliation of an interrupted restore; performs no writes")
+    package = subs.add_parser("package", help="create or verify a portable install or restore package")
+    ps = package.add_subparsers(dest="package_command", required=True)
+    for package_type in ("install", "restore"):
+        create = ps.add_parser(package_type, help="create a portable %s package" % package_type)
+        create.set_defaults(package_type=package_type)
+        create.add_argument("--device", dest="package_device", metavar="ID")
+        create.add_argument("--backup", dest="package_backup", metavar="ID")
+        create.add_argument("--image-set", dest="package_image_set", metavar="PATH")
+        create.add_argument("--output", dest="package_output", required=True, metavar="PATH")
+    package_verify = ps.add_parser("verify", help="verify package integrity without executing its contents")
+    package_verify.add_argument("path", metavar="PATH")
+    image_set = subs.add_parser("image-set", help="prepare or verify a hash-bound GPT-T build image set")
+    image_sub = image_set.add_subparsers(dest="image_set_command", required=True)
+    prepare = image_sub.add_parser("prepare", help="map a registered build to its validated GPT-T boot and userdata partitions")
+    prepare.add_argument("--build", required=True, metavar="ID")
+    prepare.add_argument("--layout", required=True, metavar="DIR", help="directory with gpt-T-primary.bin and gpt-T-secondary.bin")
+    prepare.add_argument("--output", required=True, metavar="DIR")
+    image_verify = image_sub.add_parser("verify", help="read-only verification of a prepared GPT-T image set")
+    image_verify.add_argument("path", metavar="DIR")
+    wizard = subs.add_parser("wizard", help="run or resume one explicit installer workflow stage")
+    wizard.add_argument("--id", dest="wizard_id", metavar="ID")
+    wizard.add_argument("--stage", choices=("doctor", "backup", "configure", "build", "inject", "flash", "verify", "restore", "package"))
+    wizard.add_argument("--resume", action="store_true", help="resume a saved workflow after reconciling its state")
+    wizard.add_argument("--reconcile-state", action="store_true", help="record a no-write reconciliation and stop")
+    wizard.add_argument("--device", dest="wizard_device")
+    wizard.add_argument("--backup", dest="wizard_backup")
+    wizard.add_argument("--build", dest="wizard_build")
+    wizard.add_argument("--seed", dest="wizard_seed")
+    wizard.add_argument("--image-set", dest="wizard_image_set")
+    wizard.add_argument("--board", dest="wizard_board")
+    wizard.add_argument("--profile", dest="wizard_profile", choices=("dev", "prod"))
+    wizard.add_argument("--host", dest="wizard_host")
+    wizard.add_argument("--package-type", dest="package_type", choices=("install", "restore"))
+    wizard.add_argument("--package-output", dest="package_output")
+    wizard.add_argument("--bake-user-env", action="store_true")
     return p
 
 
@@ -460,6 +501,18 @@ def main(argv=None):
     try:
         if args.command == "doctor":
             return doctor(args)
+        repo = Path(__file__).resolve().parents[2]
+        if args.command == "verify":
+            from . import verify_restore
+            return verify_restore.verify_command(args, Path(args.home), repo)
+        if args.command == "package" and args.package_command == "verify":
+            from . import packages
+            manifest = packages.verify_package(args.path)
+            print("PASS package integrity: type=%s" % manifest["package_type"])
+            return EXIT_OK
+        if args.command == "image-set" and args.image_set_command == "verify":
+            from . import imageset
+            return imageset.verify_command(args.path)
         root = store.ensure_store(args.home)
         if args.command == "backup": return backup_command(args,root)
         if args.command == "configure":
@@ -474,12 +527,25 @@ def main(argv=None):
         if args.command == "flash":
             from . import flash as flash_module
             return flash_module.flash_command(args, root, Path(__file__).resolve().parents[2])
+        if args.command == "restore":
+            from . import verify_restore
+            return verify_restore.restore_command(args, root, Path(__file__).resolve().parents[2])
+        if args.command == "package":
+            from . import packages
+            return packages.package_command(args, root, Path(__file__).resolve().parents[2])
+        if args.command == "image-set":
+            from . import imageset
+            if args.image_set_command == "prepare":
+                return imageset.prepare_command(args, root, Path(__file__).resolve().parents[2])
+        if args.command == "wizard":
+            from . import wizard
+            return wizard.run(args, root, Path(__file__).resolve().parents[2])
         return device_command(args, root)
     except store.RefusedError as exc:
         print("REFUSED: " + _redact(exc), file=sys.stderr)
         return EXIT_REFUSED
     except KeyboardInterrupt:
-        print("ERROR: operation interrupted; temporary staging removed. If a destructive flash phase had started, inspect device state and run flash --reconcile-state before any new write.", file=sys.stderr)
+        print("ERROR: operation interrupted; temporary staging removed. If a destructive flash or restore phase had started, inspect device state and run the matching flash --reconcile-state or restore --reconcile-state before any new write.", file=sys.stderr)
         return EXIT_ERROR
     except (store.StoreError, OSError, ValueError, json.JSONDecodeError) as exc:
         print("ERROR: " + _redact(exc), file=sys.stderr)

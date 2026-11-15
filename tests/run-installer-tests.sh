@@ -149,10 +149,17 @@ PY
 
 run m3-configure-seed-apply-injection-push python3 "$ROOT/tests/verify-installer-m3.py" "$ROOT"
 run m4-build-flash-wrappers python3 "$ROOT/tests/verify-installer-m4.py"
+run m5-verify-restore python3 "$ROOT/tests/verify-installer-m5.py"
+run m6-portable-packages python3 "$ROOT/tests/verify-installer-m6.py"
+run m7-wizard python3 "$ROOT/tests/verify-installer-m7.py"
 
 # Retain the M0 passing regression set. Known baseline failures remain documented and are not installer failures.
 for test in verify-fetch-firehose.sh verify-flash-board.sh verify-harden.sh verify-initramfs-fail.sh verify-nft-ruleset.sh verify-rollback-plan.sh verify-sshd-config.sh; do
-  run "legacy-$test" bash "$ROOT/tests/$test"
+  if [[ $test == verify-rollback-plan.sh ]]; then
+    run "legacy-$test" env REAL_BACKUP="$TMP/no-real-backup" REAL_GPT_DIR="$TMP/no-real-gpt" bash "$ROOT/tests/$test"
+  else
+    run "legacy-$test" bash "$ROOT/tests/$test"
+  fi
 done
 
 printf 'TOTAL PASS=%d FAIL=%d SKIP=%d\n' "$pass" "$fail" "$skip"
