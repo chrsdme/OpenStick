@@ -8,7 +8,7 @@
 | M1 Skeleton/store/doctor/shims | DONE | `32b411b03b67956a2e0187f30e4ace8560ab29bf` |
 | M2 Backup | DONE | M2 commit (SHA in completion report) |
 | M3 Configure/seed/inject | DONE | this commit |
-| M4 Build/flash wrappers | NOT STARTED | - |
+| M4 Build/flash wrappers | DONE | this commit |
 | M5 Verify/restore | NOT STARTED | - |
 | M6 Packages | NOT STARTED | - |
 | M7 Wizard/docs/tidy | NOT STARTED | - |
@@ -160,4 +160,53 @@ Existing builder scripts modified: `scripts/20-rootfs.sh` only. It installs the 
 
 Needs real hardware before claiming device operation: validate systemd ordering on the assembled Bookworm image; confirm hostname/timezone behavior; confirm NetworkManager Wi-Fi and GSM profile acceptance and systemd-networkd USB settings; validate device Serial format; exercise remote SSH/sudo push against an intentionally provisioned test stick. These are not M3 offline-test claims.
 
-Files added: `configs/apply-seed`, `configs/system/openstick-seed.service`, `tools/installer/configure.py`, `tools/installer/seed.py`, `tests/verify-installer-m3.py`. Files changed: `tools/installer/cli.py`, `tools/installer/store.py`, `scripts/20-rootfs.sh`, `tests/run-installer-tests.sh`, `DESIGN.md`, `OPEN-QUESTIONS.md`, and this report. M4 readiness: M3 provides the seed format, storage, rootfs hook, runtime service, injection, and SSH push interfaces for the build wrapper to use. M4 still needs to prove generic environment scrubbing and preserve `--bake-user-env`; no build or flash claim follows from M3.
+## M4 build and flash wrappers
+
+`build --profile dev|prod --board BOARD` wraps the inspected stage order `20-rootfs.sh`, `50-boot-img.sh`, `51-rootfs-img.sh`. It requires the prebuilt `out/base-bookworm-arm64.tar.gz` input from the existing `10-base.sh` flow and cached pinned kernel/BusyBox artifacts. It creates the working output and temporary home inside a private staging directory, records source revision and tree hash, input hashes, tool versions, timestamps, profile, board, artifact sizes and SHA-256 values, and registers only after both expected images exist and hash successfully. On stage or registry/event failure, it removes the staged/final output and does not leave a successful build registration. Read-only image permissions and directory permissions are applied before registration. Build manifests explicitly say that device boot is not verified and that M0 image comparison is unavailable in this sanitized copy.
+
+Generic builds use a clean `env -i` allowlist and a new private `HOME`. The narrow `scripts/common.sh` hook skips local/user config loading and inherited-environment reapplication. Defaults and selected board profile remain active. `--bake-user-env` explicitly restores the old environment and local/user configuration source order. The installer reserves output path variables to keep the generated artifacts in the private store; other legacy configuration precedence is retained. `20-rootfs.sh` is the only privileged stage. The wrapper prints the exact command first, uses the caller's interactive sudo only for that stage, and runs the two image stages without root. No build was run because the prepared base and external pinned artifacts are absent and root/network execution is forbidden.
+
+`flash --device ID --image-set PATH` requires the selected device's verified full backup and rehashes it before each phase. It hashes the live EDL full read to compare serial and fsg/sec/fsc with the backup before destructive phases. Every image-set file is required in the checksum manifest; the Firehose loader must match its pinned SHA-256; Path A firmware/GPT/rollback assets require their own SHA256SUMS. It extracts the six backup slices required by `flash-board.sh` into a private temporary directory. No default board or firmware path is selected. Phase order is `pre`, `gpt`, `tz`, `rpm`, `sbl1`, `hyp`, `aboot`, read-only `final` validation, then `first-install`. Every write has a dry-run followed by `flash <last8> <phase>` and the engine's own COMMIT/CONFIRM token. Path A tokens are `da-flashez-<phase>`; the first-install token is `flash-<board>-first-install`. The Path A final write sends reset, so the wrapper invokes final only in dry mode. It never resets, reboots or retries. A failed/interrupted phase leaves event, registry and state-file evidence and blocks writes until an interactive, no-write `--reconcile-state` acknowledgement.
+
+| M4 feature | Tested with shims / tests |
+|---|---|
+| Generic config isolation, synthetic user/local config exclusion, explicit legacy precedence | `test_build_generic_and_legacy_env_order_and_permissions`, `test_common_config_isolation_and_legacy_precedence` |
+| Build order, root/non-root boundary, artifact hashes and immutable modes | `test_build_generic_and_legacy_env_order_and_permissions` |
+| Failed build leaves no build registry/output | `test_build_failure_is_not_registered` |
+| Backup slice generation and SHA list for existing fastboot gate | `test_flash_backup_slice_materialization` |
+| Missing backup refusal and CLI exit 2 | `test_flash_refusals_and_input_hashes`, `test_missing_backup_cli_exit_code_2` |
+| Board gate and opt-in does not bypass backup | `test_flash_refusals_and_input_hashes` |
+| Live identity mismatch refusal | `test_flash_identity_mismatch_refused` |
+| Missing/mismatched image or loader refusal | `test_flash_refusals_and_input_hashes` |
+| Dry-run then write ordering, all phase order, exact typed phrases, COMMIT and CONFIRM tokens | `test_flash_dry_confirmation_protocol_and_failure_stop`, `test_flash_full_phase_order_and_confirm_tokens` |
+| Wrong confirmation, non-interactive and global dry-run cannot write | `test_flash_wrong_confirmation_and_noninteractive_dry_only` |
+| Phase failure blocks next phase and leaves consistent registry/event/state failure | `test_flash_dry_confirmation_protocol_and_failure_stop` |
+| Interrupted phase is not retried; explicit reconciliation only clears state without invoking a script | `test_interrupted_write_requires_reconciliation_and_is_not_retried` |
+| Existing M1-M3 and previously passing M0 regression suites | `tests/run-installer-tests.sh` |
+
+| M4 feature | Needs real hardware / not proven offline |
+|---|---|
+| Build artifacts and baseline | No base tar/kernel/BusyBox cache was present. No real build ran. Baseline image SHA-256 comparison remains unavailable. |
+| Path A and first-install | Tests intercept script invocations and use the fake EDL for identity. No write command, real EDL client, Firehose loader, fastboot, USB or block device ran. Real readback quality, device-state transitions and firmware provenance remain unverified. |
+| Boot outcome | No target boot was attempted. Successful build/flash engine exit is not evidence that a device boots. |
+
+M4 suite: **11 PASS, 0 FAIL, 0 SKIP**. Full `tests/run-installer-tests.sh`: **23 top-level PASS, 0 FAIL, 0 SKIP**. It retains M1-M3 and all seven previously passing M0 suites. Nested legacy checks report three optional skips: missing aarch64 cross compiler, no working container for nft tier 2, and no real backup files for rollback-plan real-data checks. No network, sudo, real build or physical hardware was used.
+
+M4 files added: `tools/installer/build.py`, `tools/installer/flash.py`, `tests/verify-installer-m4.py`. Files changed: `tools/installer/cli.py`, `scripts/common.sh`, `tests/run-installer-tests.sh`, `DESIGN.md`, `OPEN-QUESTIONS.md`, and this report. Existing flash engines were not modified. `scripts/common.sh` is the only existing script changed for M4, adding the narrow generic configuration branch. `scripts/20-rootfs.sh` remains the M3 seed installation hook.
+
+## M4 final static checks and limitations
+
+| Check | Result |
+|---|---|
+| `bash -n` all shell files | PASS, 68 files |
+| `python3 -m py_compile` all visible Python files | PASS, 14 files |
+| `git diff --check` | PASS |
+| `shellcheck` | SKIP, not installed |
+| Secret and added-file size scan | PASS; no private key block, no non-test personal PSK value, no added file over 5 MB |
+| Real build, sudo, network, hardware, USB or block device | NONE used |
+
+The four documented M0 baseline failures remain unchanged: missing generated images, fakeroot socket restriction, and prepared-copy execute-mode issue in the profile test. No M4 fix touched those failures.
+
+Remaining limitations: no Debian image was built because the prepared base and external pinned artifacts are absent and root/network use is forbidden. The M0 byte baseline cannot be compared. The existing first-install helper expects sparse `boot.bin/rootfs.bin`, while M4 build outputs `boot.img/rootfs.img`; flash requires a separately prepared image set with the helper's exact layout and never guesses a conversion. Supplied Path A blobs require complete SHA256SUMS, but their provenance beyond the pinned Firehose loader is not established in this sanitized workspace. Hardware checks remain real EDL identity output, partition fingerprint agreement, Path A and first-install readback, mode transition, firmware provenance review, and a manual boot observation. See [OPEN-QUESTIONS.md](OPEN-QUESTIONS.md).
+
+M5 readiness: M4 leaves build manifests plus gated flash events and unresolved-state handling for later verify/restore work. M5 should resolve the image-set packaging mismatch and obtain hardware-only identity/readback evidence. This M4 implementation makes no claim that a target device boots.

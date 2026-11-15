@@ -83,6 +83,15 @@ def parser():
     push = ss.add_parser("push", help="push a seed to a running, reachable stick")
     push.add_argument("--seed", required=True, metavar="NAME")
     push.add_argument("--host", metavar="USER@HOST")
+    build = subs.add_parser("build", help="build and register a generic Debian image set")
+    build.add_argument("--profile", choices=("dev", "prod"), required=True)
+    build.add_argument("--board", dest="build_board", required=True, metavar="BOARD")
+    build.add_argument("--bake-user-env", action="store_true", help="explicitly enable legacy local/user configuration")
+    flash = subs.add_parser("flash", help="run the gated Path A first-install sequence")
+    flash.add_argument("--device", dest="flash_device", required=True, metavar="ID")
+    flash.add_argument("--image-set", required=True, metavar="PATH")
+    flash.add_argument("--i-accept-untested", action="store_true", help="acknowledge an untested board class")
+    flash.add_argument("--reconcile-state", action="store_true", help="record explicit interactive reconciliation of an interrupted phase; performs no writes")
     return p
 
 
@@ -459,12 +468,18 @@ def main(argv=None):
         if args.command == "seed":
             if args.seed_command == "inject": return inject_seed(args, root)
             return push_seed(args, root)
+        if args.command == "build":
+            from . import build as build_module
+            return build_module.build_command(args, root, Path(__file__).resolve().parents[2])
+        if args.command == "flash":
+            from . import flash as flash_module
+            return flash_module.flash_command(args, root, Path(__file__).resolve().parents[2])
         return device_command(args, root)
     except store.RefusedError as exc:
         print("REFUSED: " + _redact(exc), file=sys.stderr)
         return EXIT_REFUSED
     except KeyboardInterrupt:
-        print("ERROR: operation interrupted; temporary staging removed.", file=sys.stderr)
+        print("ERROR: operation interrupted; temporary staging removed. If a destructive flash phase had started, inspect device state and run flash --reconcile-state before any new write.", file=sys.stderr)
         return EXIT_ERROR
     except (store.StoreError, OSError, ValueError, json.JSONDecodeError) as exc:
         print("ERROR: " + _redact(exc), file=sys.stderr)

@@ -148,6 +148,7 @@ assert p.returncode == 90 and b"injected failure" in p.stderr
 PY
 
 run m3-configure-seed-apply-injection-push python3 "$ROOT/tests/verify-installer-m3.py" "$ROOT"
+run m4-build-flash-wrappers python3 "$ROOT/tests/verify-installer-m4.py"
 
 # Retain the M0 passing regression set. Known baseline failures remain documented and are not installer failures.
 for test in verify-fetch-firehose.sh verify-flash-board.sh verify-harden.sh verify-initramfs-fail.sh verify-nft-ruleset.sh verify-rollback-plan.sh verify-sshd-config.sh; do

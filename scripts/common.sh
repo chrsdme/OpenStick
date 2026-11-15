@@ -8,17 +8,36 @@ ROOT=${OPENSTICK_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}   # tools/ scripts set
 _env=$(export -p)
 set -a
 . "$ROOT/config/defaults.env"
-[ -f "$ROOT/config/local.env" ] && . "$ROOT/config/local.env"
-# user config (ssh key file, WiFi, APN): secrets stay out of git. Default config/user.env (git-ignored) or OPENSTICK_USER_CONFIG.
-_uc=${OPENSTICK_USER_CONFIG:-$ROOT/config/user.env}
-if [ -f "$_uc" ]; then
-    case "$(stat -c %a "$_uc")" in
-        ?00) ;;
-        *) echo "ERROR: $_uc must not be group/world accessible (chmod 600)" >&2; exit 1;;
-    esac
-    . "$_uc"
+# Installer generic mode uses defaults plus the selected board only. It never
+# reads local/user config or re-applies an inherited environment. Legacy callers
+# retain the historical precedence exactly.
+if [ "${OPENSTICK_CONFIG_MODE:-legacy}" = generic ]; then
+    # Only installer-prefixed controls cross the clean-environment boundary.
+    BOARD=${OPENSTICK_BOARD:-$BOARD}
+    PROFILE=${OPENSTICK_PROFILE:-$PROFILE}
+    OUT=${OPENSTICK_OUT:-}
+    WORK=${OPENSTICK_WORK:-}
+    CHROOT=${OPENSTICK_CHROOT:-}
+    PROD_OUT=${OPENSTICK_PROD_OUT:-}
+    PRODROOT_OUT=${OPENSTICK_PRODROOT_OUT:-}
+    ROOTFS_TGZ=${OPENSTICK_ROOTFS_TGZ:-}
+    DTB_NAME=${OPENSTICK_DTB_NAME:-}
+    LK2ND_COMPATIBLE=${OPENSTICK_LK2ND_COMPATIBLE:-}
+    EMMC_SECTORS=${OPENSTICK_EMMC_SECTORS:-}
+elif [ "${OPENSTICK_CONFIG_MODE:-legacy}" = legacy ]; then
+    [ -f "$ROOT/config/local.env" ] && . "$ROOT/config/local.env"
+    _uc=${OPENSTICK_USER_CONFIG:-$ROOT/config/user.env}
+    if [ -f "$_uc" ]; then
+        case "$(stat -c %a "$_uc")" in
+            ?00) ;;
+            *) echo "ERROR: $_uc must not be group/world accessible (chmod 600)" >&2; exit 1;;
+        esac
+        . "$_uc"
+    fi
+    eval "$_env"   # re-apply the caller's environment over defaults/local.env
+else
+    echo "ERROR: invalid OPENSTICK_CONFIG_MODE" >&2; exit 1
 fi
-eval "$_env"   # re-apply the caller's environment over defaults/local.env
 [ -f "$ROOT/boards/$BOARD/board.env" ] || { echo "ERROR: unknown BOARD '$BOARD' (no boards/$BOARD/board.env)" >&2; exit 1; }
 . "$ROOT/boards/$BOARD/board.env"
 set +a
@@ -111,6 +130,7 @@ require_space() { # path, MB
 # prod refuses to build without a way in: a valid SSH public key file or a root password hash.
 # Pure checks (no root needed); 20-rootfs.sh calls it BEFORE need_root. tests/verify-profile.sh exercises it.
 validate_profile_credentials() {
+    [ "${OPENSTICK_CONFIG_MODE:-legacy}" = generic ] && return 0
     [ "$PROFILE" = prod ] || return 0
     _have=0
     if [ -n "${SSH_PUBKEY_FILE:-}" ]; then
