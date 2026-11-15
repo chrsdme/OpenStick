@@ -1,0 +1,15 @@
+[Unit]
+Description=Apply OpenStick first-boot seed
+Documentation=man:openstick(1)
+DefaultDependencies=no
+After=local-fs.target
+Before=network-pre.target NetworkManager.service systemd-networkd.service
+ConditionPathExists=/etc/openstick/seed.env
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/openstick/apply-seed
+RemainAfterExit=yes
+
+[Install]
+WantedBy=network-pre.target

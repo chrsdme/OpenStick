@@ -63,7 +63,7 @@ def ensure_store(path):
         if not stat.S_ISDIR(os.lstat(path).st_mode):
             raise RefusedError("private store is not a directory")
         os.chmod(path, 0o700)
-        for name in ("devices", "backups", "seeds", "images", "packages", "logs"):
+        for name in ("devices", "backups", "seeds", "builds", "images", "packages", "logs"):
             child = path / name
             child.mkdir(mode=0o700, exist_ok=True)
             if stat.S_ISLNK(os.lstat(child).st_mode) or not child.is_dir():

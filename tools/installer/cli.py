@@ -9,12 +9,16 @@ import time
 import tempfile
 import re
 import struct
+import stat
+import signal
 import zlib
 import subprocess
 import datetime
 from pathlib import Path
 
 from . import store
+from . import seed as seed_format
+from . import configure as configure_module
 
 EXIT_OK = 0
 EXIT_ERROR = 1
@@ -67,6 +71,18 @@ def parser():
     backup = subs.add_parser("backup", help="read and verify a complete EDL eMMC backup")
     backup.add_argument("--paranoid", action="store_true", help="read the eMMC twice and compare")
     backup.add_argument("--again", action="store_true", help="allow an additional verified backup")
+    conf = subs.add_parser("configure", help="create or display a private personalization seed")
+    conf.add_argument("--seed", default="default", metavar="NAME", help="seed name (default: default)")
+    conf.add_argument("--profile", choices=("dev", "prod"), default="dev", help="seed account policy")
+    conf.add_argument("--show", action="store_true", help="show a seed with secrets masked")
+    seed_cmd = subs.add_parser("seed", help="inject or push a personalization seed")
+    ss = seed_cmd.add_subparsers(dest="seed_command", required=True)
+    inject = ss.add_parser("inject", help="inject a seed into a copy of a generic rootfs image")
+    inject.add_argument("--build", required=True, metavar="ID")
+    inject.add_argument("--seed", required=True, metavar="NAME")
+    push = ss.add_parser("push", help="push a seed to a running, reachable stick")
+    push.add_argument("--seed", required=True, metavar="NAME")
+    push.add_argument("--host", metavar="USER@HOST")
     return p
 
 
@@ -196,6 +212,13 @@ def _sha_file(path):
     return h.hexdigest()
 
 
+def _debugfs_quote(path):
+    value = str(path)
+    if any(ord(char) < 32 or ord(char) == 127 for char in value):
+        raise ValueError("unsafe debugfs path")
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
 def backup_command(args, root):
     print("WARNING: this backup contains IMEI, calibration and persist data. Keep it private and make an independent offline recovery copy.")
     edl = shutil.which("edl")
@@ -304,6 +327,125 @@ def device_command(args, root):
     return EXIT_OK
 
 
+def _seed_path(root, name):
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", name):
+        raise store.RefusedError("invalid seed name")
+    path = root / "seeds" / (name + ".seed")
+    if path.is_symlink() or not path.is_file():
+        raise store.StoreError("seed not found")
+    if stat.S_IMODE(path.stat().st_mode) != 0o600:
+        raise store.RefusedError("seed permissions must be 600")
+    try:
+        content = path.read_text(encoding="utf-8")
+        seed_format.parse(content)
+    except (OSError, UnicodeError, seed_format.SeedError):
+        raise store.StoreError("seed is invalid")
+    return path, content
+
+
+def inject_seed(args, root):
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", args.build):
+        raise store.RefusedError("invalid build ID")
+    seed_path, content = _seed_path(root, args.seed)
+    build_dir = root / "builds" / args.build
+    original = build_dir / "rootfs.img"
+    if build_dir.is_symlink() or not original.is_file() or original.is_symlink():
+        raise store.StoreError("generic build rootfs.img not found")
+    debugfs, e2fsck = shutil.which("debugfs"), shutil.which("e2fsck")
+    if not debugfs or not e2fsck:
+        raise store.StoreError("debugfs and e2fsck are required")
+    original_sha = _sha_file(original)
+    check = subprocess.run([e2fsck, "-fn", str(original)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if check.returncode != 0:
+        raise ValueError("generic rootfs image failed read-only filesystem validation")
+    target_dir = build_dir / ("personal-" + args.seed)
+    if target_dir.exists() or target_dir.is_symlink():
+        raise store.RefusedError("personalized image destination already exists")
+    if args.dry_run:
+        print("DRY RUN: validated seed and generic image; would create a sensitive personalized copy.")
+        return EXIT_OK
+    staging = None
+    tempdir = None
+    previous_signals = {}
+    try:
+        staging = Path(tempfile.mkdtemp(prefix=".personal-" + args.seed + ".staging-", dir=str(build_dir)))
+        os.chmod(staging, 0o700)
+        target = staging / "rootfs.img"
+        tempdir = Path(tempfile.mkdtemp(prefix=".seed-inject-", dir=str(root / "images")))
+        os.chmod(tempdir, 0o700)
+        payload = tempdir / "seed.payload"
+        readback = tempdir / "seed.readback"
+        def interrupted(signum, frame):
+            raise KeyboardInterrupt()
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            previous_signals[signum] = signal.signal(signum, interrupted)
+        payload.write_text(content, encoding="utf-8")
+        os.chmod(payload, 0o600)
+        shutil.copyfile(original, target)
+        os.chmod(target, 0o600)
+        inject = subprocess.run([debugfs, "-w", "-R", "write %s /etc/openstick/seed.env" % _debugfs_quote(payload), str(target)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if inject.returncode:
+            raise ValueError("debugfs seed injection failed")
+        for field in ("uid", "gid"):
+            owner = subprocess.run([debugfs, "-w", "-R", "set_inode_field /etc/openstick/seed.env %s 0" % field, str(target)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            if owner.returncode:
+                raise ValueError("debugfs seed ownership update failed")
+        check = subprocess.run([e2fsck, "-fn", str(target)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if check.returncode != 0:
+            raise ValueError("personalized rootfs failed read-only filesystem validation")
+        dump = subprocess.run([debugfs, "-R", "dump -p /etc/openstick/seed.env %s" % _debugfs_quote(readback), str(target)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if dump.returncode or not readback.is_file() or _sha_file(readback) != _sha_file(seed_path):
+            raise ValueError("injected seed read-back SHA-256 mismatch")
+        if _sha_file(original) != original_sha:
+            raise ValueError("generic rootfs image changed during injection")
+        manifest = {"sensitive": True, "build_id": args.build, "seed_name": args.seed, "seed_sha256": _sha_file(seed_path), "rootfs_sha256": _sha_file(target), "verified_by": ["debugfs-injection", "e2fsck-read-only", "debugfs-readback-sha256"]}
+        out = staging / "personal.json"
+        out.write_text(json.dumps(manifest, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+        os.chmod(out, 0o600)
+        os.replace(staging, target_dir)
+        print("Sensitive personalized rootfs created and verified by SHA-256 read-back.")
+        return EXIT_OK
+    except BaseException:
+        if staging is not None:
+            shutil.rmtree(staging, ignore_errors=True)
+        raise
+    finally:
+        for signum, handler in previous_signals.items():
+            signal.signal(signum, handler)
+        if tempdir is not None:
+            shutil.rmtree(tempdir, ignore_errors=True)
+
+
+def push_seed(args, root):
+    seed_path, _ = _seed_path(root, args.seed)
+    if not args.host or not re.fullmatch(r"[A-Za-z0-9_.-]+@[A-Za-z0-9.-]+", args.host):
+        print("REFUSED: seed push requires an explicit USER@HOST with working SSH access. An unseeded production image without remote access must be recovered by flashing a seeded image.", file=sys.stderr)
+        return EXIT_REFUSED
+    ssh, scp = shutil.which("ssh"), shutil.which("scp")
+    if not ssh or not scp:
+        raise store.StoreError("ssh and scp are required")
+    if args.dry_run:
+        print("DRY RUN: would check SSH access, transfer a private seed, and start the seed service.")
+        return EXIT_OK
+    probe = subprocess.run([ssh, "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", args.host, "true"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=8)
+    if probe.returncode:
+        print("REFUSED: SSH access is unavailable. An unseeded production image cannot be provisioned remotely; recovery requires flashing a seeded image.", file=sys.stderr)
+        return EXIT_REFUSED
+    wanted_hash = _sha_file(seed_path)
+    remote_tmp = "/tmp/openstick-seed-%s.env" % wanted_hash[:16]
+    copied = subprocess.run([scp, "-q", str(seed_path), args.host + ":" + remote_tmp], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if copied.returncode:
+        raise store.StoreError("could not transfer seed over SSH")
+    privileged = "" if args.host.startswith("root@") else "sudo "
+    remote = "%sinstall -o root -g root -m 600 %s /etc/openstick/seed.env && %ssystemctl start openstick-seed.service && %sgrep -qx %s /etc/openstick/seed.applied; rc=$?; rm -f %s; exit $rc" % (privileged, remote_tmp, privileged, privileged, wanted_hash, remote_tmp)
+    ssh_args = [ssh, "-o", "BatchMode=yes", args.host, remote] if not privileged else [ssh, "-t", args.host, remote]
+    started = subprocess.run(ssh_args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if started.returncode:
+        raise store.StoreError("remote seed application failed")
+    print("Seed transferred to the reachable stick; application service completed.")
+    return EXIT_OK
+
+
 def main(argv=None):
     args = parser().parse_args(argv)
     try:
@@ -311,10 +453,19 @@ def main(argv=None):
             return doctor(args)
         root = store.ensure_store(args.home)
         if args.command == "backup": return backup_command(args,root)
+        if args.command == "configure":
+            if args.show: configure_module.show(root, args.seed); return EXIT_OK
+            configure_module.configure(root, args.seed, args.profile); return EXIT_OK
+        if args.command == "seed":
+            if args.seed_command == "inject": return inject_seed(args, root)
+            return push_seed(args, root)
         return device_command(args, root)
     except store.RefusedError as exc:
         print("REFUSED: " + _redact(exc), file=sys.stderr)
         return EXIT_REFUSED
+    except KeyboardInterrupt:
+        print("ERROR: operation interrupted; temporary staging removed.", file=sys.stderr)
+        return EXIT_ERROR
     except (store.StoreError, OSError, ValueError, json.JSONDecodeError) as exc:
         print("ERROR: " + _redact(exc), file=sys.stderr)
         return EXIT_VERIFY if isinstance(exc, ValueError) else EXIT_ERROR

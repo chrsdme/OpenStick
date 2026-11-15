@@ -7,7 +7,7 @@
 | M0 Baseline and design | DONE | `de86b3d` |
 | M1 Skeleton/store/doctor/shims | DONE | `32b411b03b67956a2e0187f30e4ace8560ab29bf` |
 | M2 Backup | DONE | M2 commit (SHA in completion report) |
-| M3 Configure/seed/inject | NOT STARTED | - |
+| M3 Configure/seed/inject | DONE | this commit |
 | M4 Build/flash wrappers | NOT STARTED | - |
 | M5 Verify/restore | NOT STARTED | - |
 | M6 Packages | NOT STARTED | - |
@@ -131,3 +131,33 @@ M2 acceptance suite: **PASS 21, FAIL 0, SKIP 0**. Existing generated-artifact an
 - The fake GPT contains one-sector placeholder partitions and is metadata for test isolation, not a realistic eMMC image.
 - The user-facing registry note field is plain text. Event history does not copy note or label content.
 - No claim is made about physical USB permissions, installed EDL compatibility, flashing, backup, restore or boot behavior.
+
+## M3 configure, seed application, injection and push
+
+Implemented `configure [--seed NAME]`, `configure --show`, `seed inject`, and `seed push`. The configurator supports every section 6.2 field: `SEED_VERSION`, `HOSTNAME`, `TIMEZONE`, `SSH_AUTHORIZED_KEYS`, `ROOT_PASSWORD_HASH`, `DEFAULT_USER`, `USER_PASSWORD_HASH`, `WIFI_SSID`, `WIFI_PSK`, `WIFI_COUNTRY`, `APN`, `APN_USER`, `APN_PASSWORD`, `USB_NET_ADDR`, and `NTP_SERVERS`. Reserved `LED_*` fields are reported as ignored by the device utility. Public SSH key input is imported from a file and validated; private-key files are refused. `SSH_AUTHORIZED_KEYS` stores base64-encoded, LF-separated public key lines so the seed remains strict one-line `KEY=VALUE` data. Passwords are collected with hidden prompts and converted using libcrypt SHA-512 crypt; plaintext passwords are never serialized. Configure output masks password hashes, Wi-Fi PSK, APN credentials, and public key payloads.
+
+The device-side `/usr/lib/openstick/apply-seed` reads `/etc/openstick/seed.env` as data, validates its allowlisted fields without `source` or `eval`, and applies hostname, timezone, SSH authorized keys, password hashes, a dev account, Wi-Fi and GSM NetworkManager profiles, systemd-networkd USB address, and timesyncd NTP servers. `{serial8}` uses the last eight hex characters of validated `/proc/cpuinfo` Serial. `openstick-seed.service` runs before `network-pre.target`, NetworkManager, and systemd-networkd. Failure logs contain fixed descriptions only, the oneshot does not block boot, and no success receipt is written on failure. On success, the active seed is unlinked and `/etc/openstick/seed.applied` contains only the seed SHA-256. Unlinking does not securely erase ext4 data.
+
+`seed inject` accepts only a valid stored seed and an existing generic `builds/<ID>/rootfs.img`. It runs read-only `e2fsck -fn`, copies the generic image into a hidden private staging directory, writes the seed with `debugfs`, checks the new image read-only, reads the seed back with `debugfs`, compares SHA-256, writes a sensitive manifest and atomically publishes `personal-<NAME>/`. Failed operations remove staging; the generic image is hash-checked unchanged by the fixture. `seed push` requires explicit `USER@HOST`, performs a batch SSH access check, transfers only after access succeeds, starts the service, and checks the receipt hash. An unreachable production image requires flashing a seeded image.
+
+| M3 acceptance check | Result |
+|---|---|
+| Strict parsing, all field validation, malformed/unknown/duplicate/newline and shell injection rejection | PASS |
+| Public-key import and private-key refusal | PASS |
+| Hidden-input path, password hashes only, masked configure show, private 700/600 modes | PASS |
+| G4 production seed warning, confirmation, and decline refusal | PASS |
+| Fake-root application, supported settings, secret-safe logs, LED notice, validated `{serial8}`, repeat application | PASS |
+| Invalid seed leaves generic state, keeps seed, writes no receipt, exits successfully for boot | PASS |
+| Service ordering and `scripts/20-rootfs.sh` installation hook | PASS (static and shell syntax checks) |
+| Debugfs injection, source image unchanged, seed SHA-256 read-back, sensitive marker | PASS |
+| Corrupt image rejection and interrupted debugfs staging cleanup | PASS |
+| `seed push` without host or usable SSH | PASS (SSH shim fails closed) |
+| Real EDL, fastboot, SSH, root, network or device operations | NONE performed |
+
+M3 suite: **11 PASS, 0 FAIL**. Full `tests/run-installer-tests.sh`: **22 top-level PASS, 0 FAIL, 0 top-level SKIP**. It includes all M1/M2 checks and the seven previously passing M0 regression suites. Nested legacy checks reported three optional skips (aarch64 cross-tool, container-backed nft check, and absent real backup data); the nft suite also did not run its rootfs cross-check because no built rootfs exists. No root-required build or artifact test was attempted. Static validation: Python compile PASS for 18 project-owned Python files; `bash -n` PASS for 68 shell files; `sh -n configs/apply-seed` PASS; `git diff --check` PASS; shellcheck SKIP because it is unavailable.
+
+Existing builder scripts modified: `scripts/20-rootfs.sh` only. It installs the seed apply utility and enables the optional service in the rootfs, the narrow image assembly hook required for M3. No flashing, rollback, firmware, kernel, initramfs, or proven networking template logic was changed. Image SHA-256 baseline remains unavailable because building requires excluded external inputs and root; no real or synthetic full OS build was run.
+
+Needs real hardware before claiming device operation: validate systemd ordering on the assembled Bookworm image; confirm hostname/timezone behavior; confirm NetworkManager Wi-Fi and GSM profile acceptance and systemd-networkd USB settings; validate device Serial format; exercise remote SSH/sudo push against an intentionally provisioned test stick. These are not M3 offline-test claims.
+
+Files added: `configs/apply-seed`, `configs/system/openstick-seed.service`, `tools/installer/configure.py`, `tools/installer/seed.py`, `tests/verify-installer-m3.py`. Files changed: `tools/installer/cli.py`, `tools/installer/store.py`, `scripts/20-rootfs.sh`, `tests/run-installer-tests.sh`, `DESIGN.md`, `OPEN-QUESTIONS.md`, and this report. M4 readiness: M3 provides the seed format, storage, rootfs hook, runtime service, injection, and SSH push interfaces for the build wrapper to use. M4 still needs to prove generic environment scrubbing and preserve `--bake-user-env`; no build or flash claim follows from M3.

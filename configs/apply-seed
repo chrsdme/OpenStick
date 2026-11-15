@@ -1,0 +1,190 @@
+#!/bin/sh
+# Apply a validated first-boot seed. Values are parsed as data and never sourced.
+set -eu
+ROOT=${OPENSTICK_ROOT:-}
+etc=${ROOT}/etc
+seed_file=$etc/openstick/seed.env
+log() { logger -t openstick-seed -- "$1" 2>/dev/null || :; }
+fail() { log "seed rejected: $1"; exit 0; }
+[ -f "$seed_file" ] || exit 0
+[ ! -L "$seed_file" ] || fail "unsafe seed path"
+[ "$(stat -c %a "$seed_file" 2>/dev/null || echo unsafe)" = 600 ] || fail "seed permissions are not private"
+umask 077
+tmp=$(mktemp "${ROOT}/tmp/openstick-seed.XXXXXX" 2>/dev/null) || tmp=$(mktemp)
+trap 'rm -f "$tmp"' EXIT HUP INT TERM
+cp -- "$seed_file" "$tmp" 2>/dev/null || fail "cannot read seed"
+chmod 600 "$tmp" 2>/dev/null || :
+sha=$(sha256sum "$tmp" | awk '{print $1}')
+case "$sha" in *[!0-9a-f]*|'') fail "invalid seed digest";; esac
+SEED_VERSION= HOSTNAME= TIMEZONE= SSH_AUTHORIZED_KEYS= ROOT_PASSWORD_HASH=
+DEFAULT_USER= USER_PASSWORD_HASH= WIFI_SSID= WIFI_PSK= WIFI_COUNTRY= APN= APN_USER=
+APN_PASSWORD= USB_NET_ADDR= NTP_SERVERS=
+seen=' '
+while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in '') continue;; esac
+    case "$line" in *=*) key=${line%%=*}; value=${line#*=};; *) fail "malformed line";; esac
+    case "$key" in *[!A-Z0-9_]*|'') fail "malformed field name";; esac
+    [ -n "$value" ] || fail "empty field value"
+    printf '%s' "$value" | LC_ALL=C grep -q '[[:cntrl:]]' && fail "invalid control character"
+    case "$value" in *'|'*|*'&'*|*'\'*|*'`'*|*'$('*|*';'*|*'<'*|*'>'*) fail "unsafe field value";; esac
+    case "$seen" in *" $key "*) fail "duplicate field";; esac
+    seen="$seen$key "
+    case "$key" in
+      SEED_VERSION) SEED_VERSION=$value;;
+      HOSTNAME) HOSTNAME=$value;; TIMEZONE) TIMEZONE=$value;;
+      SSH_AUTHORIZED_KEYS) SSH_AUTHORIZED_KEYS=$value;;
+      ROOT_PASSWORD_HASH) ROOT_PASSWORD_HASH=$value;; DEFAULT_USER) DEFAULT_USER=$value;;
+      USER_PASSWORD_HASH) USER_PASSWORD_HASH=$value;; WIFI_SSID) WIFI_SSID=$value;;
+      WIFI_PSK) WIFI_PSK=$value;; WIFI_COUNTRY) WIFI_COUNTRY=$value;; APN) APN=$value;;
+      APN_USER) APN_USER=$value;; APN_PASSWORD) APN_PASSWORD=$value;;
+      USB_NET_ADDR) USB_NET_ADDR=$value;; NTP_SERVERS) NTP_SERVERS=$value;;
+      LED_*) log "reserved LED field ignored" ;;
+      *) fail "unknown field";;
+    esac
+done < "$tmp"
+# Seed values were assigned explicitly from the allowlist above; the file was never sourced.
+[ "$SEED_VERSION" = 1 ] || fail "unsupported seed version"
+[ -z "$USER_PASSWORD_HASH" ] || [ -n "$DEFAULT_USER" ] || fail "USER_PASSWORD_HASH requires DEFAULT_USER"
+[ -z "$APN_USER$APN_PASSWORD" ] || [ -n "$APN" ] || fail "APN credentials require APN"
+[ -z "$WIFI_COUNTRY" ] || [ -n "$WIFI_SSID" ] || fail "WIFI_COUNTRY requires WIFI_SSID"
+for hash in "$ROOT_PASSWORD_HASH" "$USER_PASSWORD_HASH"; do
+    [ -z "$hash" ] || printf '%s\n' "$hash" | grep -Eq '^\$(6|5|y)\$[A-Za-z0-9./$=_-]{20,200}$' || fail "invalid password hash"
+done
+[ -z "$DEFAULT_USER" ] || printf '%s\n' "$DEFAULT_USER" | grep -Eq '^[a-z_][a-z0-9_-]{0,31}$' || fail "invalid username"
+[ "$DEFAULT_USER" != root ] || fail "DEFAULT_USER cannot be root"
+[ -z "$WIFI_COUNTRY" ] || printf '%s\n' "$WIFI_COUNTRY" | grep -Eq '^[A-Z]{2}$' || fail "invalid Wi-Fi country"
+if [ -n "$WIFI_PSK" ]; then [ -n "$WIFI_SSID" ] && [ "${#WIFI_PSK}" -ge 8 ] && [ "${#WIFI_PSK}" -le 63 ] || fail "invalid Wi-Fi settings"; fi
+[ -z "$WIFI_SSID" ] || [ "$(printf '%s' "$WIFI_SSID" | wc -c)" -le 32 ] || fail "invalid Wi-Fi SSID length"
+case "$WIFI_SSID$WIFI_PSK$APN$APN_USER$APN_PASSWORD" in *'|'*|*'&'*|*'\'*) fail "invalid network settings";; esac
+case "$USB_NET_ADDR" in '') :;; *) printf '%s\n' "$USB_NET_ADDR" | awk -F'[./]' 'NF!=5 {exit 1} {for(i=1;i<=4;i++) if($i!~/^[0-9]+$/||$i>255) exit 1; if($5!~/^[0-9]+$/||$5>32) exit 1}' || fail "invalid USB address";; esac
+case "$NTP_SERVERS" in *[!A-Za-z0-9.,-]*) fail "invalid NTP servers";; esac
+if [ -n "$HOSTNAME" ]; then
+    case "$HOSTNAME" in *'{serial8}'*) :;; *) printf '%s\n' "$HOSTNAME" | awk 'length($0)>253 {exit 1} {n=split($0,a,"."); for(i=1;i<=n;i++) if(length(a[i])<1||length(a[i])>63||a[i]!~/^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$/) exit 1}' || fail "invalid hostname";; esac
+fi
+if [ -n "$TIMEZONE" ]; then
+    case "$TIMEZONE" in /**|*..*|*[!A-Za-z0-9_+./-]*) fail "invalid timezone";; esac
+    [ -e "${ROOT}/usr/share/zoneinfo/$TIMEZONE" ] || fail "unknown timezone"
+fi
+if [ -n "$SSH_AUTHORIZED_KEYS" ]; then
+    printf '%s' "$SSH_AUTHORIZED_KEYS" | base64 -d > "$ROOT/tmp/seed-authorized-keys" 2>/dev/null || fail "invalid public keys"
+    [ -s "$ROOT/tmp/seed-authorized-keys" ] || fail "invalid public keys"
+    if grep -Ev '^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(256|384|521)) [A-Za-z0-9+/]+={0,3}( .*)?$' "$ROOT/tmp/seed-authorized-keys" | grep -q .; then fail "invalid public keys"; fi
+    while IFS= read -r keyline || [ -n "$keyline" ]; do
+        printf '%s\n' "$keyline" > "$ROOT/tmp/seed-key-line"
+        ssh-keygen -lf "$ROOT/tmp/seed-key-line" >/dev/null 2>&1 || fail "invalid public keys"
+    done < "$ROOT/tmp/seed-authorized-keys"
+    rm -f "$ROOT/tmp/seed-key-line"
+fi
+serial=$(awk '/^[[:space:]]*Serial[[:space:]]*:/ {if($2==":") print $3; else print $2; exit}' "${ROOT}/proc/cpuinfo" 2>/dev/null || :)
+case "$serial" in *[!0-9a-fA-F]*|'') serial=;; esac
+if [ -n "$serial" ] && [ "${#serial}" -ge 8 ]; then serial8=$(printf '%s' "$serial" | tr 'A-F' 'a-f' | sed 's/.*\(........\)$/\1/'); else serial8=; fi
+if [ -n "$HOSTNAME" ]; then
+    case "$HOSTNAME" in *'{serial8}'*) [ -n "$serial8" ] || fail "device identity unavailable"; HOSTNAME=$(printf '%s' "$HOSTNAME" | sed "s/{serial8}/$serial8/g");; esac
+    printf '%s\n' "$HOSTNAME" | awk 'length($0)>253 {exit 1} {n=split($0,a,"."); for(i=1;i<=n;i++) if(length(a[i])<1||length(a[i])>63||a[i]!~/^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$/) exit 1}' || fail "invalid hostname"
+    printf '%s\n' "$HOSTNAME" > "$etc/hostname"
+    cat > "$etc/hosts" <<EOF
+127.0.0.1 localhost
+::1 localhost ip6-localhost ip6-loopback
+127.0.1.1 $HOSTNAME
+EOF
+    if [ -n "$ROOT" ]; then hostnamectl --root "$ROOT" set-hostname "$HOSTNAME" >/dev/null 2>&1 || fail "hostname update failed"
+    else hostnamectl set-hostname "$HOSTNAME" >/dev/null 2>&1 || fail "hostname update failed"; fi
+fi
+if [ -n "$TIMEZONE" ]; then
+    case "$TIMEZONE" in /**|*..*|*[!A-Za-z0-9_+./-]*) fail "invalid timezone";; esac
+    [ -e "${ROOT}/usr/share/zoneinfo/$TIMEZONE" ] || fail "unknown timezone"
+    ln -sfn "/usr/share/zoneinfo/$TIMEZONE" "$etc/localtime"
+    printf '%s\n' "$TIMEZONE" > "$etc/timezone"
+    if [ -n "$ROOT" ]; then timedatectl --root "$ROOT" set-timezone "$TIMEZONE" >/dev/null 2>&1 || fail "timezone update failed"
+    else timedatectl set-timezone "$TIMEZONE" >/dev/null 2>&1 || fail "timezone update failed"; fi
+fi
+if [ -n "$SSH_AUTHORIZED_KEYS" ]; then
+    target_user=${DEFAULT_USER:-root}
+    case "$target_user" in
+        root) home=$ROOT/root ;;
+        *)
+            if ! id "$target_user" >/dev/null 2>&1; then useradd -m -s /bin/bash "$target_user" || fail "user creation failed"; fi
+            home=$ROOT/home/$target_user
+            chown -R "$target_user:$target_user" "$home" 2>/dev/null || :
+            ;;
+    esac
+    install -d -m 700 "$home/.ssh"
+    cat "$ROOT/tmp/seed-authorized-keys" > "$home/.ssh/authorized_keys"
+    chmod 600 "$home/.ssh/authorized_keys"
+    [ "$target_user" = root ] || chown -R "$target_user:$target_user" "$home/.ssh" 2>/dev/null || :
+    rm -f "$ROOT/tmp/seed-authorized-keys"
+fi
+if [ -n "$ROOT_PASSWORD_HASH" ]; then
+    case "$ROOT_PASSWORD_HASH" in '$6$'*|'$5$'*|'$y$'*) printf 'root:%s\n' "$ROOT_PASSWORD_HASH" | chpasswd -e || fail "root password update failed";; *) fail "invalid root password hash";; esac
+fi
+if [ -n "$DEFAULT_USER" ]; then
+    printf '%s\n' "$DEFAULT_USER" | grep -Eq '^[a-z_][a-z0-9_-]{0,31}$' || fail "invalid username"
+    if ! id "$DEFAULT_USER" >/dev/null 2>&1; then useradd -m -s /bin/bash "$DEFAULT_USER" || fail "user creation failed"; fi
+    if [ -n "$USER_PASSWORD_HASH" ]; then
+        case "$USER_PASSWORD_HASH" in '$6$'*|'$5$'*|'$y$'*) printf '%s:%s\n' "$DEFAULT_USER" "$USER_PASSWORD_HASH" | chpasswd -e || fail "user password update failed";; *) fail "invalid user password hash";; esac
+    fi
+fi
+if [ -n "$WIFI_SSID" ] || [ -n "$WIFI_PSK" ]; then
+    [ -n "$WIFI_SSID" ] && [ "${#WIFI_PSK}" -ge 8 ] && [ "${#WIFI_PSK}" -le 63 ] || fail "invalid Wi-Fi settings"
+    uuid=$(printf 'openstick-wifi-client:%s' "$WIFI_SSID" | sha256sum | cut -c1-32 | sed 's/\(........\)\(....\)\(....\)\(....\)\(............\)/\1-\2-\3-\4-\5/')
+    mkdir -p "$etc/NetworkManager/system-connections"
+    cat > "$etc/NetworkManager/system-connections/wifi-client.nmconnection" <<EOF
+[connection]
+id=$WIFI_SSID
+uuid=$uuid
+type=wifi
+interface-name=wlan0
+[wifi]
+mode=infrastructure
+ssid=$WIFI_SSID
+[wifi-security]
+auth-alg=open
+key-mgmt=wpa-psk
+psk=$WIFI_PSK
+[ipv4]
+method=auto
+[ipv6]
+addr-gen-mode=default
+method=auto
+EOF
+    [ -z "$WIFI_COUNTRY" ] || sed -i "/^ssid=/a country=$WIFI_COUNTRY" "$etc/NetworkManager/system-connections/wifi-client.nmconnection"
+    chmod 600 "$etc/NetworkManager/system-connections/wifi-client.nmconnection"
+fi
+if [ -n "$APN" ]; then
+    case "$APN$APN_USER$APN_PASSWORD" in *'|'*|*'&'*|*'\'*) fail "invalid APN settings";; esac
+    mkdir -p "$etc/NetworkManager/system-connections"
+    cat > "$etc/NetworkManager/system-connections/lte.nmconnection" <<EOF
+[connection]
+id=lte
+uuid=1a84c1e6-6688-4be5-b05a-4ceee414f8ed
+type=gsm
+interface-name=wwan0qmi0
+[gsm]
+apn=$APN
+username=$APN_USER
+password=$APN_PASSWORD
+[ipv4]
+method=auto
+[ipv6]
+addr-gen-mode=default
+method=auto
+EOF
+    chmod 600 "$etc/NetworkManager/system-connections/lte.nmconnection"
+fi
+if [ -n "$USB_NET_ADDR" ]; then
+    case "$USB_NET_ADDR" in *[!0-9./]*|*.*.*.*/*) :;; *) fail "invalid USB address";; esac
+    printf '[Match]\nName=usb0\n\n[Network]\nAddress=%s\nDHCPServer=yes\n' "$USB_NET_ADDR" > "$etc/systemd/network/10-usb0.network"
+fi
+if [ -n "$NTP_SERVERS" ]; then
+    case "$NTP_SERVERS" in *[!A-Za-z0-9.,-]*) fail "invalid NTP servers";; esac
+    mkdir -p "$etc/systemd/timesyncd.conf.d"
+    printf '[Time]\nNTP=%s\n' "$(printf '%s' "$NTP_SERVERS" | tr ',' ' ')" > "$etc/systemd/timesyncd.conf.d/20-openstick.conf"
+fi
+if [ -z "$ROOT" ] && systemctl is-active --quiet NetworkManager; then
+    nmcli connection reload >/dev/null 2>&1 || fail "NetworkManager reload failed"
+fi
+sha256sum "$tmp" | awk '{print $1}' > "$etc/openstick/seed.applied"
+chmod 600 "$etc/openstick/seed.applied"
+rm -f "$seed_file" "$tmp"
+log "seed applied successfully; receipt recorded"
+exit 0

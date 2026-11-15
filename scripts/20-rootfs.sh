@@ -83,12 +83,14 @@ enable_unit() { # $1 target, $2 unit, $3 unit path inside the image
     mkdir -p "$CHROOT/etc/systemd/system/$1.wants"
     ln -sfn "$3" "$CHROOT/etc/systemd/system/$1.wants/$2"
 }
-for u in msm-firmware-loader.service openstick-growfs.service openstick-gadget.service; do
+for u in msm-firmware-loader.service openstick-growfs.service openstick-gadget.service openstick-seed.service; do
     [ -f "$CHROOT/etc/systemd/system/$u" ] || die "missing unit $u (configs/system)"
 done
 enable_unit sysinit.target msm-firmware-loader.service /etc/systemd/system/msm-firmware-loader.service
 enable_unit multi-user.target openstick-growfs.service /etc/systemd/system/openstick-growfs.service
 enable_unit multi-user.target openstick-gadget.service /etc/systemd/system/openstick-gadget.service
+# Optional first-boot personalization, before either network manager starts.
+enable_unit network-pre.target openstick-seed.service /etc/systemd/system/openstick-seed.service
 # usb0 by systemd-networkd (units ship in the systemd package on bookworm)
 enable_unit multi-user.target systemd-networkd.service /lib/systemd/system/systemd-networkd.service
 enable_unit sockets.target systemd-networkd.socket /lib/systemd/system/systemd-networkd.socket
@@ -96,6 +98,8 @@ enable_unit sockets.target systemd-networkd.socket /lib/systemd/system/systemd-n
 # the console would block on systemd-firstboot questions (machine-id is empty on purpose)
 ln -sfn /dev/null "$CHROOT/etc/systemd/system/systemd-firstboot.service"
 install -m 755 -o root -g root "$ROOT/configs/openstick-growfs" "$ROOT/configs/openstick-gadget" "$CHROOT/usr/sbin/"
+install -d -m 755 -o root -g root "$CHROOT/usr/lib/openstick"
+install -m 755 -o root -g root "$ROOT/configs/apply-seed" "$CHROOT/usr/lib/openstick/apply-seed"
 install -d -m 755 -o root -g root "$CHROOT/etc/openstick" "$CHROOT/etc/systemd/network"
 sed "s|@GADGET_MODE@|$GADGET_MODE|" "$ROOT/configs/gadget.conf.in" > "$CHROOT/etc/openstick/gadget.conf"
 chmod 644 "$CHROOT/etc/openstick/gadget.conf"
