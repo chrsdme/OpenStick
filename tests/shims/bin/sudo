@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+echo 'FAKE SUDO REFUSED: sudo is never available in installer tests' >&2
+exit 97

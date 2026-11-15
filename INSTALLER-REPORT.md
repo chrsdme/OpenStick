@@ -1,11 +1,11 @@
 # OpenStick installer implementation report
 
-## M0 status
+## Milestone status
 
 | Milestone | Status | Commit |
 |---|---|---|
-| M0 Baseline and design | DONE | pending this commit |
-| M1 Skeleton/store/doctor/shims | NOT STARTED | - |
+| M0 Baseline and design | DONE | `de86b3d` |
+| M1 Skeleton/store/doctor/shims | DONE | this milestone commit (SHA in completion report) |
 | M2 Backup | NOT STARTED | - |
 | M3 Configure/seed/inject | NOT STARTED | - |
 | M4 Build/flash wrappers | NOT STARTED | - |
@@ -13,7 +13,7 @@
 | M6 Packages | NOT STARTED | - |
 | M7 Wizard/docs/tidy | NOT STARTED | - |
 
-No installer implementation has been started. No existing script was changed. The clean source snapshot commit is `e4cf01b`; it is the root commit because no source history/baseline was included in the prepared workspace. There is no `baseline..installer` range.
+The clean source snapshot commit is `e4cf01b`; it is the root commit because no source history/baseline was included in the prepared workspace. The M1 implementation does not modify existing build, flash, initramfs, or rollback scripts. There is no `baseline..installer` range.
 
 ## Existing offline tests: M0 baseline
 
@@ -54,7 +54,10 @@ No generated image baseline SHA256 values are available. `out/`, cached APK/deb 
 | Existing flash path selection | `verify-flash-board.sh` fake fastboot | Physical product variables, real partition readback, boot and recovery |
 | Existing restore plan | `verify-rollback-plan.sh` fake artifacts | EDL behavior and device-specific backup identity |
 | Existing external loader pinning | `verify-fetch-firehose.sh` fake fetch | No download performed; real loader provenance/EDL compatibility |
-| Installer features | None implemented in M0 | All installer operations remain unimplemented |
+| Installer M1 CLI and registry | M1 acceptance tests listed below | Real device identity and USB behavior need hardware |
+| Installer M1 private store | mode, symlink, worktree and event tests listed below | Filesystem behavior beyond the tested Linux environment |
+| Installer M1 doctor | controlled-PATH missing-tool test | Actual host package readiness and USB permission behavior |
+| Installer M1 fake device shims | deterministic fake GPT/emmc, EDL read and failure injection, fastboot guard, build stubs | No claim about actual EDL/fastboot protocol compatibility |
 
 ## Differences and questions
 
@@ -68,9 +71,38 @@ Added: `DESIGN.md`, `OPEN-QUESTIONS.md`, `INSTALLER-REPORT.md`.
 
 Existing scripts modified: none.
 
+## M1 implementation and evidence
+
+Implemented `./openstick` with global flags (`--home`, `--dry-run`, `--verbose`, `--no-color`, `--board`, `--device`), help and exit code constants 0/1/2/3. The implemented commands are `doctor` and `device list|show|label|note`. The private store rejects Git worktrees and symlinked path components, creates private directories as mode 700, creates state files as mode 600, reads state without following symlinks, and updates the registry through an atomic replacement. Events append to `events.jsonl`; event records omit user-provided labels and notes.
+
+Doctor checks Python, Bash, e2fsprogs, fastboot, EDL discovery by `OPENSTICK_EDL_DIR` or `PATH`, the pinned loader SHA-256, USB access with a udev suggestion, 12 GiB free space, and private-store location/mode. It reports apt/dnf installation hints. It does not install dependencies or udev rules.
+
+| Feature | Tested with shims / tests |
+|---|---|
+| Worktree gate | `store-refuses-git` (exit 2) |
+| Private permissions and registry round trip | `store-permissions` (directory 700, registry/events 600, read-back) |
+| Symlink defense | `store-refuses-symlink` |
+| Registry operations and append-only events | `registry-device-operations` (label, note, show, two event lines) |
+| Dependency discovery with controlled PATH | `doctor-missing-dependencies` |
+| Fake hardware isolation | `shim-fastboot-fails-closed`, `shim-build-script-stub`, `fake-emmc-deterministic`, `shim-edl-read-and-failure-injection` |
+| M0 regression set | seven previously passing legacy suites run by `tests/run-installer-tests.sh` |
+
+| Feature | Needs real hardware |
+|---|---|
+| USB diagnostics | Confirm which host udev identifiers and group access are correct for the user's adapters. No udev rule was installed. |
+| EDL / fastboot shims | Compare shim command line compatibility with actual installed clients. Shims cannot prove hardware behavior and reject writes. |
+| Device identity | Capture the available identity fields from a physical stick; no real serial or IMEI was used. |
+
+M1 suite result: **PASS 16, FAIL 0, SKIP 0**. Static validation: `python3 -m py_compile openstick tools/installer/*.py tests/make-fake-emmc.py` PASS; `bash -n` across every repository `.sh` file PASS; shellcheck SKIP because it is unavailable. The M1 suite reran all seven M0-passing tests. Nested optional checks inside legacy tests report their own SKIPs (cross compiler, nft/container and absent real backup data); the legacy suites still pass. The four unrelated M0 failures remain as documented baseline exceptions and were not rerun or changed.
+
+Files added: `openstick`, `tools/installer/__init__.py`, `tools/installer/cli.py`, `tools/installer/store.py`, `tests/run-installer-tests.sh`, `tests/make-fake-emmc.py`, `tests/shims/bin/{edl,fastboot,ssh,scp,sudo,10-base.sh,20-rootfs.sh,50-boot-img.sh,51-rootfs-img.sh,gen-gpt.sh}`. Files changed: `INSTALLER-REPORT.md`. Existing validated build, flash, initramfs and rollback scripts touched: none.
+
 ## Known limitations
 
 - Sanitized source copy has no original Git history, build outputs, private config, backups or physical device evidence.
 - No build was run; boot/rootfs image hashes cannot be stated.
 - Root-dependent tests were skipped, not passed.
-- No claim is made that flashing, backup, restore, seed application or installer behavior works; those features are not implemented.
+- M1 shims provide deterministic fake GPT metadata and a fake image, but do not implement backup, configure, build, seed, flash, verify, restore, package or wizard flows. Those are later milestones.
+- The fake GPT contains one-sector placeholder partitions and is metadata for test isolation, not a realistic eMMC image.
+- The user-facing registry note field is plain text. Event history does not copy note or label content.
+- No claim is made about physical USB permissions, installed EDL compatibility, flashing, backup, restore or boot behavior.

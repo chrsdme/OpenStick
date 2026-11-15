@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+set -eu
+if [[ -z ${OPENSTICK_FAKE_EMMC:-} || ! -f ${OPENSTICK_FAKE_EMMC:-} ]]; then
+  echo 'FAKE EDL REFUSED: OPENSTICK_FAKE_EMMC must name a test image' >&2
+  exit 97
+fi
+printf 'FAKE EDL serial=DEADBEEF command=%q\n' "$*" >&2
+if [[ -n ${OPENSTICK_EDL_CALL_FILE:-} ]]; then
+  calls=0; [[ ! -f $OPENSTICK_EDL_CALL_FILE ]] || read -r calls < "$OPENSTICK_EDL_CALL_FILE"
+  calls=$((calls + 1)); printf '%s\n' "$calls" > "$OPENSTICK_EDL_CALL_FILE"
+  if [[ ${OPENSTICK_EDL_FAIL_AT:-0} == "$calls" ]]; then echo "FAKE EDL injected failure at call $calls" >&2; exit 90; fi
+fi
+case "${1:-}" in
+  rf)
+    [[ $# -ge 2 ]] || exit 2
+    out=${!#}
+    cp -- "$OPENSTICK_FAKE_EMMC" "$out"
+    ;;
+  rs)
+    [[ $# -ge 4 ]] || exit 2
+    start=$(( $2 * ${EDL_SECTOR_SIZE:-512} )); count=$(( $3 * ${EDL_SECTOR_SIZE:-512} )); out=$4
+    if [[ ${OPENSTICK_EDL_SHORT_READ:-0} == 1 ]]; then count=$((count / 2)); fi
+    dd if="$OPENSTICK_FAKE_EMMC" of="$out" iflag=skip_bytes,count_bytes skip="$start" count="$count" status=none
+    if [[ ${OPENSTICK_EDL_CORRUPT_BYTE:-0} == 1 ]]; then printf '\377' | dd of="$out" bs=1 seek=0 conv=notrunc status=none; fi
+    ;;
+  ws)
+    [[ $# -ge 3 ]] || exit 2
+    if [[ " $* " == *' --skipwrite '* ]]; then echo 'FAKE EDL dry run'; exit 0; fi
+    echo 'FAKE EDL refuses writes in M1'; exit 98
+    ;;
+  getsha256|getstorageinfo|gpt)
+    echo 'FAKE EDL serial=DEADBEEF storage=TEST-ONLY'
+    ;;
+  *) echo "FAKE EDL unsupported command: $1" >&2; exit 2 ;;
+esac

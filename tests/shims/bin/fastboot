@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -eu
+[[ ${OPENSTICK_FAKE_DEVICE:-} == 1 ]] || { echo 'FAKE FASTBOOT REFUSED: set OPENSTICK_FAKE_DEVICE=1' >&2; exit 97; }
+printf 'FAKE FASTBOOT command=%q\n' "$*" >&2
+case "${1:-}" in devices|getvar) echo 'DEADBEEF fastboot';; *) echo 'FAKE FASTBOOT refuses writes in M1' >&2; exit 98;; esac

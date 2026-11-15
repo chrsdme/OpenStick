@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+set -eu
+[[ ${OPENSTICK_FAKE_DEVICE:-} == 1 ]] || { echo 'FAKE SSH REFUSED: set OPENSTICK_FAKE_DEVICE=1' >&2; exit 97; }
+printf 'FAKE SSH command=%q\n' "$*" >&2
