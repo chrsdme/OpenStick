@@ -1,0 +1,96 @@
+#!/bin/busybox sh
+# SPDX-License-Identifier: MIT
+# Production initramfs for board #6 (lk2nd, `fastboot flash boot`). busybox sh, no modules, no network, no gadget.
+# Derived from the PROVEN configs/testboot/init2 + rootfs-stage.sh (same mechanisms: sysfs PARTNAME lookup with a poll
+# loop, ro probe mount, per-device watchdog feeder, move proc/sys/dev, switch_root). Removed: telnetd, udhcpd, static IP,
+# ACM shell, insmod, gadget creation (the rootfs creates the gadget), noroot switch, LED table, devmem probes.
+#
+# FAILURE PATH: no userdata / no marker / bad rootfs for INITRAMFS_WAIT_SECS (20) => log to /dev/kmsg and run
+# /sbin/reboot-bootloader (reboot(2) RESTART2 "bootloader"). Only if that binary is missing or fails: keep the watchdog
+# feeders running and drop to a shell on /dev/console (ttyMSM0).
+
+/bin/busybox --install -s /bin
+export PATH=/bin:/sbin
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev 2>/dev/null || mdev -s
+mkdir -p /dev/pts /tmp /run
+
+LOG=/tmp/init.log
+up() { cut -d' ' -f1 /proc/uptime; }
+log() { echo "openstick-init [$(up)] $*" | tee -a $LOG > /dev/kmsg; }
+
+log "initramfs started, kernel $(uname -r)"
+log "cmdline: $(cat /proc/cmdline)"
+
+# ---- watchdog: one foreground feeder per device (no -T: timeout is not reprogrammed; feed every 3 s) ----
+WDS=$(ls /dev/watchdog[0-9]* 2>/dev/null)
+[ -z "$WDS" ] && [ -e /dev/watchdog ] && WDS=/dev/watchdog
+log "watchdog nodes: ${WDS:-none}"
+for w in $WDS; do
+    watchdog -F -t 3 $w 2>>$LOG &
+    WP=$!; sleep 0.2
+    if kill -0 $WP 2>/dev/null; then echo $WP > /tmp/wd.$(basename $w); log "feeder started on $w pid $WP"; else log "feeder FAILED on $w"; fi
+done
+
+# >>> rootfs-stage (extracted by tests/verify-initramfs-fail.sh; the env defaults are the production values)
+# ---- locate the root partition by GPT name (NOT by number), probe mount (ro) + sanity check, retried for WAIT_SECS ----
+NEWROOT=${NEWROOT:-/newroot}
+SYSBLK=${SYSBLK:-/sys/class/block}
+WAIT_SECS=${INITRAMFS_WAIT_SECS:-20}          # give up after this many seconds and reboot to the bootloader
+POLL_SLEEP=${INITRAMFS_POLL_SLEEP:-0.25}
+REBOOT_BL=${REBOOT_BL:-/sbin/reboot-bootloader}
+RP=""
+SWOK=no
+mkdir -p $NEWROOT
+i=0; MAXPOLLS=$((WAIT_SECS*4))
+while [ $SWOK = no ] && [ $i -lt $MAXPOLLS ]; do
+    RP=""
+    for u in $SYSBLK/mmcblk0p*/uevent; do
+        [ -e "$u" ] || continue
+        grep -qx 'PARTNAME=userdata' "$u" && RP=/dev/$(basename "$(dirname "$u")")
+    done
+    if [ -n "$RP" ]; then
+        if mount -t ext4 -o ro $RP $NEWROOT 2>>$LOG; then
+            if [ -e $NEWROOT/etc/openstick-rootfs ] && [ -x $NEWROOT/usr/lib/systemd/systemd ] \
+                && [ "$(readlink $NEWROOT/sbin/init)" = /lib/systemd/systemd ]; then
+                SWOK=yes
+                log "rootfs: marker found: $(cat $NEWROOT/etc/openstick-rootfs)"
+                break
+            fi
+            [ $i -eq 0 ] && log "rootfs: $RP mounts but has no /etc/openstick-rootfs marker or systemd or /sbin/init link: NOT switching, unmounting"
+            umount $NEWROOT 2>>$LOG
+        else
+            [ $i -eq 0 ] && log "rootfs: ro mount of $RP failed: $(tail -n1 $LOG)"
+        fi
+    fi
+    i=$((i+1)); sleep $POLL_SLEEP
+done
+log "rootfs: userdata=${RP:-NOT FOUND} SWOK=$SWOK after $i polls (limit $MAXPOLLS, WAIT_SECS=$WAIT_SECS)"
+
+if [ $SWOK = yes ]; then
+    mount -o remount,rw $NEWROOT 2>>$LOG || log "rootfs: remount rw FAILED, continuing read-only (systemd-remount-fs will retry)"
+    mkdir -p $NEWROOT/var/log
+    cp $LOG $NEWROOT/var/log/initramfs-init.log 2>/dev/null
+    dmesg > $NEWROOT/var/log/initramfs-dmesg.log 2>/dev/null
+    sync
+    log "rootfs: switch_root"
+    # hand /dev/watchdog0 to systemd (RuntimeWatchdogSec in the rootfs): stop only its feeder, other feeders keep running
+    if [ -f /tmp/wd.watchdog0 ]; then kill $(cat /tmp/wd.watchdog0) 2>/dev/null; sleep 1; fi
+    for m in proc sys dev; do mount -n -o move /$m $NEWROOT/$m 2>/dev/null || log "rootfs: move /$m failed"; done
+    exec switch_root $NEWROOT /sbin/init
+    # only reached if exec itself failed
+    log "rootfs: switch_root exec FAILED"
+fi
+
+# ---- failure path: no usable rootfs after WAIT_SECS => reboot to the bootloader (lk2nd fastboot) so the board stays recoverable ----
+log "rootfs: FAILED (SWOK=$SWOK): rebooting to the bootloader"
+sync
+if [ -x "$REBOOT_BL" ]; then "$REBOOT_BL" 2>>$LOG; log "rootfs: $REBOOT_BL returned rc=$? (reboot did not happen)"; else log "rootfs: $REBOOT_BL missing"; fi
+# <<< rootfs-stage failure
+# Fallback only if the reboot did not happen: stay alive, feeders keep running, shell on the serial console
+log "rootfs: staying in a shell on /dev/console, watchdog feeders stay up"
+while :; do
+    setsid cttyhack sh < /dev/console > /dev/console 2>&1
+    sleep 2
+done

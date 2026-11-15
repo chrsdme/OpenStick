@@ -1,0 +1,14 @@
+[Unit]
+Description=Expose modem/WiFi firmware blobs from the modem and persist partitions
+DefaultDependencies=no
+Before=systemd-udevd.service sysinit.target
+Conflicts=shutdown.target
+ConditionPathExists=/usr/sbin/msm-firmware-loader.sh
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/msm-firmware-loader.sh
+
+[Install]
+WantedBy=sysinit.target

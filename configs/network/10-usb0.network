@@ -1,0 +1,15 @@
+[Match]
+Name=usb0
+
+[Network]
+Address=172.16.42.1/24
+ConfigureWithoutCarrier=yes
+DHCPServer=yes
+
+# one lease for the host: 172.16.42.2; no router, DNS or NTP is advertised (the stick does not route usb0 traffic)
+[DHCPServer]
+PoolOffset=2
+PoolSize=1
+EmitRouter=no
+EmitDNS=no
+EmitNTP=no

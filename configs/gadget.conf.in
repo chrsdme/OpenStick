@@ -1,0 +1,14 @@
+# USB gadget configuration (read by /usr/sbin/openstick-gadget, a shell script using configfs; no gt needed).
+# GADGET_MODE: ecm       = Ethernet (usb0) only
+#              ecm+acm   = Ethernet (usb0) + serial (ttyGS0 on the stick, /dev/ttyACM* on the host)
+#              rndis     = RNDIS Ethernet (usb0) for Windows hosts
+# Change it, then: systemctl restart openstick-gadget
+# A login on ttyGS0 is only set up at build time for PROFILE=dev with an acm mode
+# (on the device: systemctl enable serial-getty@ttyGS0; prod images keep it masked).
+GADGET_MODE=@GADGET_MODE@
+GADGET_VID=0x1d6b
+GADGET_PID=0x0104
+GADGET_MANUFACTURER=openstick
+GADGET_PRODUCT=openstick
+GADGET_HOST_ADDR=02:11:22:33:44:55
+GADGET_DEV_ADDR=02:11:22:33:44:66

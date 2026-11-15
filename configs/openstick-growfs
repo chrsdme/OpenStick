@@ -1,0 +1,6 @@
+#!/bin/sh
+# Grow the mounted root ext4 to the size of its partition, once (called by openstick-growfs.service).
+set -u
+DEV=$(findmnt -n -o SOURCE /) || exit 1
+case "$DEV" in /dev/mmcblk0p*) ;; *) echo "refusing: root device is '$DEV'"; exit 1;; esac
+resize2fs "$DEV" && mkdir -p /var/lib/openstick && : > /var/lib/openstick/growfs.done

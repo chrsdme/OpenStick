@@ -1,0 +1,11 @@
+[Unit]
+Description=Grow root filesystem to the partition size (once)
+ConditionPathExists=!/var/lib/openstick/growfs.done
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/openstick-growfs
+
+[Install]
+WantedBy=multi-user.target

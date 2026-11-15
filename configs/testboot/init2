@@ -1,0 +1,224 @@
+#!/bin/busybox sh
+# Test initramfs v2 for `fastboot boot` (board #6, lk2nd). Diagnostic image: NEVER exits, NEVER reboots, NEVER writes to storage.
+# Differences vs v1: watchdog feeders, short waits (all codes latched < ~12 s), LED code table, USB role forcing + diagnostics.
+#
+# ============================== LED CODE TABLE (single source of truth, copied into the report) ==============================
+# The red LED carries the code (only red is assumed visible). Green/blue (if wired) mirror it. All LEDs are dark between pulses.
+# Pulse shapes (red):  YES = one LONG pulse (0.6 s) + green on;   NO = two short pulses (0.12 s);
+#                      NA  = ONE short pulse (0.12 s);            ALT = three short pulses + blue on.
+# Sequence (repeats forever, ~7-8 s per pass):
+#   MARKER = 8 very fast red flickers (0.05 s), then 0.5 s dark.  "/init is running". Heartbeat/solid red cannot produce it.
+#   then 8 slots, in this order (priority order, if the board resets mid-pass you still got the first slots):
+#   slot 1  /dev/watchdog* exists (watchdog core device)        YES / NO          (YES = a busybox feeder was started per device)
+#   slot 2  UDC present in /sys/class/udc                       YES / NO
+#   slot 3  gadget bound to the UDC                             YES / NO / NA(no UDC)
+#   slot 4  UDC state (host side enumeration)                   YES = "configured" / ALT = attached/powered/default/addressed/
+#                                                               suspended (VBUS seen, not configured) / NO = "not attached" / NA = no UDC
+#   slot 5  usb0 up with 172.16.42.1                            YES / NO
+#   slot 6  forced USB role (usb_role sysfs, else debugfs)      YES = readback shows device/gadget / NO = write failed / NA = no knob
+#   slot 7  extcon USB (vbus detect, pm8941-misc)               YES = USB=1 / NO = USB=0 or no USB cable entry / NA = no extcon class
+#   slot 8  APSS wdt probe by devmem read of 0x0b017000 (RO)    ALT = bit0 of reg 0x04 or 0x08 is SET (armed by an earlier stage,
+#                                                               ASSUMED register meaning) / YES = readable, both bit0 clear /
+#                                                               NO = devmem read failed / NA = devmem skipped (cmdline testboot.nomem)
+# Before the first MARKER: red off for 0.4 s (v1 left red solid / heartbeat). Raw values of everything go to /tmp/init.log (ACM/telnet).
+# ===============================================================================================================================
+
+#BEGIN-LIB
+LEDS=${LEDS:-/sys/class/leds}
+ledw() { # $1 name prefix, $2 0|1
+    for d in $LEDS/$1*; do
+        [ -d "$d" ] || continue
+        echo $2 > $d/brightness 2>/dev/null
+    done
+}
+ledinit() {
+    for d in $LEDS/*; do
+        [ -d "$d" ] || continue
+        echo none > $d/trigger 2>/dev/null
+        echo 0 > $d/brightness 2>/dev/null
+    done
+}
+rpulse() { ledw red 1; sleep $1; ledw red 0; }
+marker() {
+    i=0
+    while [ $i -lt 8 ]; do rpulse 0.05; sleep 0.05; i=$((i+1)); done
+    sleep 0.5
+}
+slot() { # $1 yes|no|na|alt
+    case $1 in
+        yes) ledw green 1; rpulse 0.6; ledw green 0;;
+        no)  rpulse 0.12; sleep 0.12; rpulse 0.12;;
+        na)  rpulse 0.12;;
+        alt) ledw blue 1; rpulse 0.12; sleep 0.12; rpulse 0.12; sleep 0.12; rpulse 0.12; ledw blue 0;;
+        *)   rpulse 0.12; sleep 0.12; rpulse 0.12; sleep 0.12; rpulse 0.12; sleep 0.12; rpulse 0.12; sleep 0.12; rpulse 0.12;;
+    esac
+    sleep 0.35
+}
+#END-LIB
+
+/bin/busybox --install -s /bin
+export PATH=/bin:/sbin
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev 2>/dev/null || mdev -s
+mkdir -p /dev/pts /tmp /run
+mount -t devpts devpts /dev/pts
+mount -t configfs configfs /sys/kernel/config
+
+LOG=/tmp/init.log
+up() { cut -d' ' -f1 /proc/uptime; }
+log() { echo "testboot2 [$(up)] $*" | tee -a $LOG > /dev/kmsg; }
+
+ledinit
+sleep 0.4
+marker
+log "init2 started, kernel $(uname -r), leds: $(ls /sys/class/leds 2>&1 | tr '\n' ' ')"
+log "cmdline: $(cat /proc/cmdline)"
+
+# ---- slot 1: watchdog devices + feeders (no -T: the timeout is not reprogrammed; feed every 3 s) ----
+R1=no
+WDS=$(ls /dev/watchdog[0-9]* 2>/dev/null)
+[ -z "$WDS" ] && [ -e /dev/watchdog ] && WDS=/dev/watchdog
+log "watchdog class: $(ls /sys/class/watchdog 2>&1 | tr '\n' ' ') nodes: ${WDS:-none}"
+for w in $WDS; do
+    if watchdog -t 3 $w 2>>$LOG; then R1=yes; log "feeder started on $w"; else log "feeder FAILED on $w"; fi
+done
+for w in /sys/class/watchdog/*; do [ -d "$w" ] && log "$(basename $w): $(cat $w/identity 2>&1) state=$(cat $w/state 2>&1) timeout=$(cat $w/timeout 2>&1)"; done
+
+# ---- slot 6: force USB role (before the gadget is created) ----
+R6=na
+for r in /sys/class/usb_role/*/role; do
+    [ -e "$r" ] || continue
+    R6=no; log "usb_role $r before: $(cat $r 2>&1)"
+    echo device > $r 2>>$LOG
+    [ "$(cat $r 2>/dev/null)" = device ] && R6=yes
+    log "usb_role $r after: $(cat $r 2>&1)"
+done
+if [ $R6 = na ]; then
+    mount -t debugfs debugfs /sys/kernel/debug 2>/dev/null
+    for r in /sys/kernel/debug/*/role; do
+        [ -e "$r" ] || continue
+        R6=no; log "debugfs $r before: $(cat $r 2>&1)"
+        echo gadget > $r 2>>$LOG
+        case "$(cat $r 2>/dev/null)" in gadget|device) R6=yes;; esac
+        log "debugfs $r after: $(cat $r 2>&1)"
+    done
+fi
+log "role forcing result: $R6"
+
+# ---- modules + gadget ----
+M=/lib/modules/$(uname -r)/kernel/drivers/usb/gadget
+for m in libcomposite function/u_ether function/usb_f_ecm function/u_serial function/usb_f_acm; do
+    insmod $M/$m.ko 2>>$LOG || log "insmod $m failed: $(tail -n1 $LOG)"
+done
+G=/sys/kernel/config/usb_gadget/g1
+mkdir $G
+echo 0x1d6b > $G/idVendor; echo 0x0104 > $G/idProduct
+mkdir $G/strings/0x409
+echo openstick-test2 > $G/strings/0x409/serialnumber
+echo openstick > $G/strings/0x409/manufacturer
+echo "openstick test boot 2" > $G/strings/0x409/product
+mkdir $G/configs/c.1; mkdir $G/configs/c.1/strings/0x409
+echo "ecm+acm" > $G/configs/c.1/strings/0x409/configuration
+echo 250 > $G/configs/c.1/MaxPower
+mkdir $G/functions/ecm.usb0
+echo 02:11:22:33:44:55 > $G/functions/ecm.usb0/host_addr
+echo 02:11:22:33:44:66 > $G/functions/ecm.usb0/dev_addr
+mkdir $G/functions/acm.GS0
+ln -s $G/functions/ecm.usb0 $G/configs/c.1/
+ln -s $G/functions/acm.GS0 $G/configs/c.1/
+
+# ---- slots 2/3: UDC (wait at most ~2 s, v1's 60 s wait hid every later code behind the ~15 s reset) ----
+i=0
+while [ -z "$(ls /sys/class/udc 2>/dev/null)" ] && [ $i -lt 8 ]; do i=$((i+1)); sleep 0.25; done
+UDC=$(ls /sys/class/udc 2>/dev/null | head -n1)
+R2=no; R3=na
+if [ -n "$UDC" ]; then
+    R2=yes; R3=no
+    echo $UDC > $G/UDC 2>>$LOG && R3=yes
+    log "UDC=$UDC bind=$R3 state=$(cat /sys/class/udc/$UDC/state 2>&1)"
+else
+    log "NO UDC; /sys/class/udc: $(ls /sys/class/udc 2>&1)"
+fi
+
+# ---- slot 5: usb0 ----
+IF=
+i=0
+while [ -z "$IF" ] && [ $i -lt 6 ]; do
+    for n in /sys/class/net/usb*; do [ -e "$n" ] && IF=$(basename $n); done
+    [ -n "$IF" ] || { i=$((i+1)); sleep 0.25; }
+done
+if [ -n "$IF" ]; then
+    ifconfig $IF 172.16.42.1 netmask 255.255.255.0 up 2>>$LOG
+    cat > /tmp/udhcpd.conf <<C
+start 172.16.42.2
+end 172.16.42.2
+interface $IF
+lease_file /tmp/udhcpd.leases
+option subnet 255.255.255.0
+option lease 3600
+C
+    : > /tmp/udhcpd.leases
+    udhcpd /tmp/udhcpd.conf
+    telnetd -l /bin/sh    # TEST ONLY, no password, USB link only
+fi
+
+# ---- dynamic checks (slots 4, 5, 7), re-evaluated on every pass ----
+evaldyn() {
+    R4=na
+    if [ -n "$UDC" ]; then
+        UST=$(cat /sys/class/udc/$UDC/state 2>/dev/null)
+        case "$UST" in
+            configured) R4=yes;;
+            "not attached"|"") R4=no;;
+            *) R4=alt;;
+        esac
+    fi
+    R5=no
+    [ -n "$IF" ] && ifconfig $IF 2>/dev/null | grep -q 172.16.42.1 && R5=yes
+    R7=na
+    for e in /sys/class/extcon/*; do
+        [ -d "$e" ] || continue
+        R7=no
+        for s in $e/state; do [ -e "$s" ] && cat $s 2>/dev/null | grep -q 'USB=1' && R7=yes; done
+    done
+}
+evaldyn
+log "extcon: $(for e in /sys/class/extcon/*; do echo "$(basename $e)=$(cat $e/name 2>&1) [$(cat $e/state 2>&1 | tr '\n' ' ')]"; done 2>&1)"
+log "udc state: ${UST:-none}; net: $(ifconfig $IF 2>&1 | head -n2 | tr '\n' ' ')"
+
+# ---- slot 8: APSS wdt read-only probe, last of the work (a faulting read cannot hide the other results) ----
+R8=na
+case "$(cat /proc/cmdline)" in
+    *testboot.nomem*) log "devmem probe skipped (testboot.nomem)";;
+    *)
+        R8=no
+        if command -v devmem >/dev/null; then
+            V4=$(devmem 0x0b017004 32 2>>$LOG) && V8=$(devmem 0x0b017008 32 2>>$LOG) && VC=$(devmem 0x0b01700c 32 2>>$LOG) \
+                && V10=$(devmem 0x0b017010 32 2>>$LOG) && V14=$(devmem 0x0b017014 32 2>>$LOG) && {
+                R8=yes
+                log "APSS wdt 0x0b017000: +04=$V4 +08=$V8 +0c=$VC bark(+10)=$V10 bite(+14)=$V14"
+                [ $(( V4 & 1 )) -ne 0 ] || [ $(( V8 & 1 )) -ne 0 ] && R8=alt
+            }
+        fi
+        log "devmem probe result: $R8"
+        ;;
+esac
+
+log "codes: wd=$R1 udc=$R2 bind=$R3 enum=$R4(${UST:-}) net=$R5 role=$R6 extcon=$R7 apsswdt=$R8"
+
+# ---- serial shell on the ACM gadget (host: /dev/ttyACM0) ----
+(
+    while :; do
+        [ -c /dev/ttyGS0 ] && setsid cttyhack sh < /dev/ttyGS0 > /dev/ttyGS0 2>&1
+        sleep 2
+    done
+) &
+
+# ---- LED report loop: never exits, never reboots ----
+while :; do
+    marker
+    slot $R1; slot $R2; slot $R3; slot $R4; slot $R5; slot $R6; slot $R7; slot $R8
+    sleep 1
+    evaldyn
+done

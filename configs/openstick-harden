@@ -1,0 +1,93 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# openstick-harden: turn a DEV image into a hardened (prod-like) one, on the device.
+#   removes serial autologin, locks root and the test user passwords, forces key-only sshd,
+#   masks the ttyGS0 console getty. REFUSES to run (changes nothing) unless an SSH public key is
+#   installed for root or a user, so the device cannot be locked out (serial may be the only recovery).
+# usage: openstick-harden [--dry-run]
+# env:   ROOT_PREFIX  operate on a directory tree instead of / (tests; no systemctl/passwd calls, shadow edited directly)
+set -eu
+P=${ROOT_PREFIX:-}
+DRY=0
+case "${1:-}" in
+    "") ;;
+    --dry-run) DRY=1;;
+    -h|--help) sed -n 2,8p "$0"; exit 0;;
+    *) echo "usage: openstick-harden [--dry-run]" >&2; exit 2;;
+esac
+die() { echo "openstick-harden: $*" >&2; exit 1; }
+[ "$DRY" = 1 ] || [ -n "$P" ] || [ "$(id -u)" -eq 0 ] || die "run as root"
+
+has_key() { # file: non-empty and holds at least one public key line
+    [ -s "$1" ] && grep -Eq '^(ssh-|ecdsa-|sk-)[A-Za-z0-9@.-]* [A-Za-z0-9+/=]{20,}' "$1"
+}
+ROOT_KEY=0; ANY_KEY=0; KEY_USERS=""
+if has_key "$P/root/.ssh/authorized_keys"; then ROOT_KEY=1; ANY_KEY=1; KEY_USERS="root"; fi
+for _f in "$P"/home/*/.ssh/authorized_keys; do
+    [ -e "$_f" ] || continue
+    if has_key "$_f"; then ANY_KEY=1; _u=${_f#"$P"/home/}; KEY_USERS="$KEY_USERS ${_u%%/*}"; fi
+done
+[ "$ANY_KEY" = 1 ] || die "ABORT: no non-empty authorized_keys (with a public key) for root or any user under $P/root and $P/home. Install a key first (ssh-copy-id), test that you can log in, then re-run. Nothing was changed."
+echo "keys found for:$KEY_USERS"
+
+TEST_USER=openstick
+if [ -f "$P/etc/openstick/profile" ]; then
+    _t=$(sed -n 's/^TEST_USER=//p' "$P/etc/openstick/profile" | head -1)
+    [ -z "$_t" ] || TEST_USER=$_t
+fi
+
+shadow_edit() { # user mode: lock = prefix '!' unless locked; lockexp = lock + account expiry day 0
+    awk -F: -v OFS=: -v u="$1" -v m="$2" '
+        $1==u { if ($2 !~ /^!/) $2="!" $2; if (m=="lockexp") $8="0" }
+        { print }' "$P/etc/shadow" > "$P/etc/shadow.new.$$"
+    cat "$P/etc/shadow.new.$$" > "$P/etc/shadow"   # keep owner/mode of the original file
+    rm -f "$P/etc/shadow.new.$$"
+}
+lock_root() { if [ -n "$P" ]; then shadow_edit root lock; else passwd -l root; fi; }
+lock_user() { # $1 user, $2 lock|lockexp
+    if [ -n "$P" ]; then shadow_edit "$1" "$2"
+    else usermod -L "$1"; [ "$2" != lockexp ] || chage -E0 "$1"; fi
+}
+rm_autologin() {
+    rm -rf --one-file-system -- "${P:?}/etc/systemd/system/serial-getty@ttyMSM0.service.d" "${P:?}/etc/systemd/system/serial-getty@ttyGS0.service.d"
+}
+mask_gs0() {
+    mkdir -p "$P/etc/systemd/system/getty.target.wants"
+    rm -f "$P/etc/systemd/system/getty.target.wants/serial-getty@ttyGS0.service" "$P/etc/systemd/system/serial-getty@ttyGS0.service"
+    ln -s /dev/null "$P/etc/systemd/system/serial-getty@ttyGS0.service"
+}
+sshd_dropin() {
+    mkdir -p "$P/etc/ssh/sshd_config.d"
+    rm -f "$P/etc/ssh/sshd_config.d/10-openstick-hardening.conf"   # dev drop-in: its Match User block re-enables passwords
+    printf 'PasswordAuthentication no\nKbdInteractiveAuthentication no\nPermitRootLogin prohibit-password\n' \
+        > "$P/etc/ssh/sshd_config.d/05-openstick-hardened.conf"
+}
+write_motd() { printf 'Hardened image: password logins and serial autologin are disabled. SSH key login only.\n' > "$P/etc/motd"; }
+write_profile() { mkdir -p "$P/etc/openstick"; printf 'PROFILE=prod-hardened\n' > "$P/etc/openstick/profile"; }
+reload_services() {
+    [ -z "$P" ] || return 0
+    systemctl daemon-reload || true
+    systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || true
+}
+
+step() { # description, function [args]
+    _d=$1; shift
+    if [ "$DRY" = 1 ]; then echo "[dry-run] would: $_d"; else echo "$_d"; "$@"; fi
+}
+
+step "remove serial autologin drop-ins (ttyMSM0, ttyGS0)" rm_autologin
+step "lock root password (passwd -l root)" lock_root
+if grep -q "^$TEST_USER:" "$P/etc/shadow" 2>/dev/null; then
+    if [ "$ROOT_KEY" = 1 ]; then
+        step "lock user $TEST_USER (password lock + account expiry; root keeps key access)" lock_user "$TEST_USER" lockexp
+    else
+        step "lock user $TEST_USER password only (no account expiry: its key is the only way in)" lock_user "$TEST_USER" lock
+    fi
+fi
+step "write sshd drop-in 05-openstick-hardened.conf (key-only), remove the dev 10-openstick-hardening.conf" sshd_dropin
+step "mask serial-getty@ttyGS0" mask_gs0
+step "replace /etc/motd with the hardened notice" write_motd
+step "set /etc/openstick/profile to PROFILE=prod-hardened" write_profile
+step "reload systemd and sshd" reload_services
+[ "$DRY" = 1 ] && echo "dry run: nothing changed" || echo "done: log in with your key; serial console now needs a password (root is locked)."
+exit 0

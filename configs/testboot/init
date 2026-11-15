@@ -1,0 +1,101 @@
+#!/bin/busybox sh
+# Test initramfs for `fastboot boot`: USB gadget (ECM + ACM), static IP, DHCP for the host, telnetd (NO PASSWORD), LED signals.
+# Temporary test only: never ship this in a real image.
+/bin/busybox --install -s /bin
+export PATH=/bin:/sbin
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev 2>/dev/null || mdev -s
+mkdir -p /dev/pts /tmp /run
+mount -t devpts devpts /dev/pts
+mount -t configfs configfs /sys/kernel/config
+
+LOG=/tmp/init.log
+log() { echo "testboot: $*" | tee -a $LOG > /dev/kmsg; }
+
+# LED signals (names come from the DTB: red:power green:wlan blue:wan; matched by prefix, any missing LED is skipped)
+led() { # $1 prefix, $2 mode: off|on|slow|fast|heartbeat
+    for d in /sys/class/leds/$1*; do
+        [ -d "$d" ] || continue
+        case $2 in
+            off) echo none > $d/trigger; echo 0 > $d/brightness;;
+            on) echo none > $d/trigger; echo 1 > $d/brightness;;
+            slow) echo timer > $d/trigger; echo 800 > $d/delay_on; echo 800 > $d/delay_off;;
+            fast) echo timer > $d/trigger; echo 120 > $d/delay_on; echo 120 > $d/delay_off;;
+            heartbeat) echo heartbeat > $d/trigger;;
+        esac
+    done
+}
+led red heartbeat     # kernel and /init are running
+led green off; led blue off
+log "init started, kernel $(uname -r), leds: $(ls /sys/class/leds 2>&1 | tr '\n' ' ')"
+
+M=/lib/modules/$(uname -r)/kernel/drivers/usb/gadget
+for m in libcomposite function/u_ether function/usb_f_ecm function/u_serial function/usb_f_acm; do
+    insmod $M/$m.ko 2>>$LOG || log "insmod $m failed: $(tail -n1 $LOG)"
+done
+
+# USB role: the DT uses usb-role-switch + extcon; force device if a role switch is exposed
+for r in /sys/class/usb_role/*/role; do [ -e "$r" ] && echo device > $r 2>/dev/null; done
+
+G=/sys/kernel/config/usb_gadget/g1
+mkdir $G
+echo 0x1d6b > $G/idVendor; echo 0x0104 > $G/idProduct
+mkdir $G/strings/0x409
+echo openstick-test > $G/strings/0x409/serialnumber
+echo openstick > $G/strings/0x409/manufacturer
+echo "openstick test boot" > $G/strings/0x409/product
+mkdir $G/configs/c.1; mkdir $G/configs/c.1/strings/0x409
+echo "ecm+acm" > $G/configs/c.1/strings/0x409/configuration
+echo 250 > $G/configs/c.1/MaxPower
+mkdir $G/functions/ecm.usb0
+echo 02:11:22:33:44:55 > $G/functions/ecm.usb0/host_addr
+echo 02:11:22:33:44:66 > $G/functions/ecm.usb0/dev_addr
+mkdir $G/functions/acm.GS0
+ln -s $G/functions/ecm.usb0 $G/configs/c.1/
+ln -s $G/functions/acm.GS0 $G/configs/c.1/
+
+# UDC may appear late (probe order)
+i=0
+while [ ! -e /sys/class/udc ] || [ -z "$(ls /sys/class/udc 2>/dev/null)" ]; do
+    i=$((i+1)); [ $i -gt 60 ] && break; sleep 1
+done
+UDC=$(ls /sys/class/udc 2>/dev/null | head -n1)
+if [ -z "$UDC" ]; then log "NO UDC found"; led blue fast; else
+    echo $UDC > $G/UDC && log "gadget bound to $UDC" || log "binding to $UDC failed"
+    led green slow
+fi
+
+IF=
+for i in 1 2 3 4 5 6 7 8 9 10; do
+    for n in /sys/class/net/usb*; do [ -e "$n" ] && IF=$(basename $n); done
+    [ -n "$IF" ] && break; sleep 1
+done
+if [ -n "$IF" ]; then
+    ifconfig $IF 172.16.42.1 netmask 255.255.255.0 up
+    log "$IF is 172.16.42.1/24 (host: 172.16.42.2, also offered by DHCP)"
+    cat > /tmp/udhcpd.conf <<C
+start 172.16.42.2
+end 172.16.42.2
+interface $IF
+lease_file /tmp/udhcpd.leases
+option subnet 255.255.255.0
+option lease 3600
+C
+    : > /tmp/udhcpd.leases
+    udhcpd /tmp/udhcpd.conf
+    telnetd -l /bin/sh && log "telnetd on 172.16.42.1:23 (no password)"
+    led green on; led blue slow
+else
+    log "no usb network interface"
+fi
+
+# serial shell on the ACM gadget (host: /dev/ttyACM0), restarted when it exits
+(
+    while :; do
+        [ -c /dev/ttyGS0 ] && setsid cttyhack sh < /dev/ttyGS0 > /dev/ttyGS0 2>&1
+        sleep 2
+    done
+) &
+
+while :; do sleep 3600; done

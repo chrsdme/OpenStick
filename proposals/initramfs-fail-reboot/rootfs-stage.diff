@@ -1,0 +1,74 @@
+--- configs/testboot/rootfs-stage.sh	2026-11-14 08:46:59.067016811 +0000
++++ configs/testboot/rootfs-stage.sh	2026-11-14 08:46:59.092997825 +0000
+@@ -1,34 +1,40 @@
+ # ---- rootfs stage (test-boot5, injected by scripts/49-rootfs-test.sh before the ACM shell) ----
+ # Looks for the partition named "userdata" (by GPT name, NOT by a fixed number), probe-mounts it read-only and only
+ # switches root if it carries the test rootfs marker. Anything else: unmount, log, fall through to the init2 shell + LED loop.
+-NEWROOT=/newroot
++NEWROOT=${NEWROOT:-/newroot}
++SYSBLK=${SYSBLK:-/sys/class/block}
++CMDLINE_FILE=${CMDLINE_FILE:-/proc/cmdline}
++WAIT_SECS=${INITRAMFS_WAIT_SECS:-20}          # give up (and reboot to the bootloader) after this many seconds
++POLL_SLEEP=${INITRAMFS_POLL_SLEEP:-0.25}
++REBOOT_BL=${REBOOT_BL:-/sbin/reboot-bootloader}
+ RP=""
++SWOK=no
+ mkdir -p $NEWROOT
+-i=0
+-case "$(cat /proc/cmdline)" in *testboot.noroot*) i=99; log "rootfs: testboot.noroot on the cmdline, stage skipped";; esac
+-while [ -z "$RP" ] && [ $i -lt 40 ]; do
+-    for u in /sys/class/block/mmcblk0p*/uevent; do
++i=0; MAXPOLLS=$((WAIT_SECS*4)); NOROOT=no
++case "$(cat $CMDLINE_FILE)" in *testboot.noroot*) NOROOT=yes; MAXPOLLS=0; log "rootfs: testboot.noroot on the cmdline, stage skipped";; esac
++# Poll until userdata exists AND carries the marker; transient failures (partition not enumerated yet) are retried.
++while [ $SWOK = no ] && [ $i -lt $MAXPOLLS ]; do
++    RP=""
++    for u in $SYSBLK/mmcblk0p*/uevent; do
+         [ -e "$u" ] || continue
+         grep -qx 'PARTNAME=userdata' "$u" && RP=/dev/$(basename "$(dirname "$u")")
+     done
+-    [ -n "$RP" ] || { i=$((i+1)); sleep 0.25; }
+-done
+-log "rootfs: userdata resolved to ${RP:-NOT FOUND} after $i polls (the task text said /dev/mmcblk0p26)"
+-log "rootfs: partitions: $(for u in /sys/class/block/mmcblk0p*/uevent; do [ -e "$u" ] && echo "$(basename "$(dirname "$u")")=$(sed -n 's/^PARTNAME=//p' "$u")/$(cat "$(dirname "$u")/size")s"; done | tr '\n' ' ')"
+-SWOK=no
+-if [ -n "$RP" ]; then
+-    if mount -t ext4 -o ro $RP $NEWROOT 2>>$LOG; then
+-        if [ -e $NEWROOT/etc/openstick-test-rootfs ] && [ -x $NEWROOT/usr/lib/systemd/systemd ] && [ "$(readlink $NEWROOT/usr/sbin/init)" = /lib/systemd/systemd ]; then
+-            SWOK=yes
+-            log "rootfs: marker found: $(cat $NEWROOT/etc/openstick-test-rootfs)"
+-        else
+-            log "rootfs: $RP mounts as ext4 but has no test-rootfs marker / systemd: NOT touching it, unmounting"
++    if [ -n "$RP" ]; then
++        if mount -t ext4 -o ro $RP $NEWROOT 2>>$LOG; then
++            if [ -e $NEWROOT/etc/openstick-test-rootfs ] && [ -x $NEWROOT/usr/lib/systemd/systemd ] && [ "$(readlink $NEWROOT/usr/sbin/init)" = /lib/systemd/systemd ]; then
++                SWOK=yes
++                log "rootfs: marker found: $(cat $NEWROOT/etc/openstick-test-rootfs)"
++                break
++            fi
++            [ $i -eq 0 ] && log "rootfs: $RP mounts as ext4 but has no test-rootfs marker / systemd: NOT touching it, unmounting"
+             umount $NEWROOT 2>>$LOG
++        else
++            [ $i -eq 0 ] && log "rootfs: ro mount of $RP failed: $(tail -n1 $LOG)"
+         fi
+-    else
+-        log "rootfs: ro mount of $RP failed (expected for an untouched Android userdata that needs journal recovery): $(tail -n1 $LOG)"
+     fi
+-fi
++    i=$((i+1)); sleep $POLL_SLEEP
++done
++log "rootfs: userdata=${RP:-NOT FOUND} SWOK=$SWOK after $i polls (limit $MAXPOLLS, WAIT_SECS=$WAIT_SECS)"
+ if [ $SWOK = yes ]; then
+     mount -o remount,rw $NEWROOT 2>>$LOG || log "rootfs: remount rw FAILED, continuing read-only (systemd-remount-fs will retry)"
+     mkdir -p $NEWROOT/var/log
+@@ -43,5 +49,10 @@
+     exec switch_root $NEWROOT /sbin/init
+     # only reached if exec itself failed
+ fi
++if [ $NOROOT = no ]; then
++    log "rootfs: no usable rootfs after ${WAIT_SECS}s: rebooting to the bootloader"
++    sync
++    if [ -x "$REBOOT_BL" ]; then "$REBOOT_BL" 2>>$LOG; log "rootfs: $REBOOT_BL returned rc=$? (reboot did not happen)"; else log "rootfs: $REBOOT_BL missing"; fi
++fi
+ log "rootfs: staying in the initramfs shell (SWOK=$SWOK)"
+ # ---- end rootfs stage ----

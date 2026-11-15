@@ -1,0 +1,3 @@
+linux /vmlinuz
+fdt /dtbs/qcom/@DTB_NAME@
+append earlycon root=PARTUUID=@ROOT_PARTUUID@ console=ttyMSM0,115200 no_framebuffer=true rw rootwait

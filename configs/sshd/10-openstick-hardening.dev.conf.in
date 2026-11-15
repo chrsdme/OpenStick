@@ -1,0 +1,7 @@
+# OpenStick dev: key-only SSH, except password login for the test user @TEST_USER@ (documented password, DEV image).
+PermitEmptyPasswords no
+PermitRootLogin prohibit-password
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+Match User @TEST_USER@
+    PasswordAuthentication yes

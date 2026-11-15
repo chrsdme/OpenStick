@@ -1,0 +1,40 @@
+# build products and work dirs
+out/
+work/
+config/local.env
+# device data: never commit
+boards/*/backup*/
+boards/*/dump*/
+**/modemst1*
+**/modemst2*
+**/fsg*
+**/fsc*
+**/persist*
+**/sec.bin
+**/sec.img
+*.img
+*.bin
+*.raw
+*.mbn
+*.tgz
+*.tar.gz
+*.apk
+# external sources are fetched at pinned commits (scripts/fetch-src.sh)
+src/*/
+!src/.gitkeep
+config/user.env
+# secrets, device backups, local-only material
+*.cpio.gz
+fwbak*/
+stock-*
+*-emmc-*
+rollback/
+*.log
+.env
+*.pub.local
+config/precommit-deny.txt
+# agent state, python caches, download logs
+.ai/
+__pycache__/
+*.pyc
+wget-log*

@@ -1,0 +1,33 @@
+#!/bin/sh
+# Refuses commits containing device dumps, calibration partitions or IMEI-like data.
+# Install: ln -sf ../../tools/pre-commit .git/hooks/pre-commit
+fail=0
+top=$(git rev-parse --show-toplevel)
+deny=$top/config/precommit-deny.txt   # git-ignored: device serial / disk GUID patterns, one ERE per line
+[ -f "$deny" ] || echo "WARN: $deny missing, device-identifier check skipped"
+files=$(git diff --cached --name-only --diff-filter=ACM)
+for f in $files; do
+    case "$f" in
+        *modemst1*|*modemst2*|*/fsg*|*/fsc*|*persist*|*/sec.bin|*/sec.img|*backup*|*dump*|*.mbn|*.img|*.raw|*.bin|*.apk|*.tgz|*.tar.gz)
+            echo "BLOCKED file: $f"; fail=1;;
+    esac
+    [ -f "$f" ] || continue
+    sz=$(wc -c < "$f")
+    if [ "$sz" -gt 5242880 ]; then echo "BLOCKED large file (>5 MB): $f"; fail=1; fi
+    case "$f" in tools/pre-commit|config/precommit-deny.txt) continue;; esac   # carries the patterns itself
+    if git show ":$f" 2>/dev/null | grep -aqF -e 'BEGIN OPENSSH PRIVATE KEY' -e '10.10.10.' -e '172.16.42.'; then
+        echo "BLOCKED private key / internal address (10.10.10. 172.16.42.) in: $f"; fail=1
+    fi
+    if [ -f "$deny" ] && git show ":$f" 2>/dev/null | grep -aqiEf "$deny"; then
+        echo "BLOCKED device identifier (config/precommit-deny.txt) in: $f"; fail=1
+    fi
+    if grep -Iq . "$f" 2>/dev/null; then
+        if grep -nE '(IMEI|imei|MEID)[^A-Za-z0-9]{0,6}[0-9]{14,16}\b|\b(35|86|99)[0-9]{13}\b' "$f" >/dev/null 2>&1; then
+            echo "BLOCKED IMEI-like pattern in: $f"; fail=1
+        fi
+        if grep -nE '^(psk|PSK|HOTSPOT_PSK|DEFAULT_PASS)=.+' "$f" | grep -vE 'config/defaults.env|\.in:|@' >/dev/null 2>&1; then
+            echo "BLOCKED possible credential in: $f"; fail=1
+        fi
+    fi
+done
+[ "$fail" -eq 0 ] || { echo "commit refused (see tools/pre-commit)"; exit 1; }

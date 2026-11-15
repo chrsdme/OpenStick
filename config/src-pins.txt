@@ -1,0 +1,6 @@
+# repo url, commit (from kinsamanka/OpenStick-Builder @ 57244976 submodule status)
+https://github.com/linux-usb-gadgets/gt                a2aa973640dcfde4de1ebc4bc4906195ba5826f9
+https://github.com/linux-usb-gadgets/libusbgx          89d3f448b9285e8834b2e3ee208cd02b8aeccb87
+https://github.com/msm8916-mainline/lk2nd              99297666a4b0a5b0ceb67d42b2a2ee6e0c3963ff
+https://github.com/msm8916-mainline/qhypstub           fca3c513b6fb5e5b8fabae21dac1f4a5c0b51bc6
+https://github.com/msm8916-mainline/qtestsign          ce6ba20f4ead008e5b522a81179c98dd48ccf06e

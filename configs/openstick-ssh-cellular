@@ -1,0 +1,67 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# OpenStick firewall + SSH-on-cellular switch. Own nftables table (inet openstick_fw); nothing else is touched,
+# no "flush ruleset" is ever used, so NetworkManager's shared-mode tables are preserved.
+# Input policy: DROP. Accepted: loopback, established/related, ICMP/ICMPv6, DHCP client (v4/v6),
+#   SSH (tcp/22) on usb0 and wlan0 only, DHCP+DNS served on usb0 (systemd-networkd DHCP server) and on wlan0 when the hotspot profile is installed.
+#   SSH on wwan* is accepted ONLY when switched on: openstick-ssh-cellular on
+# The ruleset is loaded in ONE atomic nft transaction (no window without rules, never a half-applied set).
+#   openstick-ssh-cellular status | on | off | apply | print
+CONF=/etc/openstick/ssh-cellular.conf
+NM_DIR=${NM_DIR:-/etc/NetworkManager/system-connections}
+SSH_ON_CELLULAR=0
+[ -r "$CONF" ] && . "$CONF"
+
+ruleset() {
+    echo "add table inet openstick_fw"
+    echo "flush table inet openstick_fw"
+    echo "add chain inet openstick_fw input { type filter hook input priority filter; policy drop; }"
+    echo 'add rule inet openstick_fw input ct state invalid counter drop'
+    echo 'add rule inet openstick_fw input ct state established,related accept'
+    echo 'add rule inet openstick_fw input iifname "lo" accept'
+    echo 'add rule inet openstick_fw input meta l4proto icmp accept'
+    echo 'add rule inet openstick_fw input meta l4proto icmpv6 accept'
+    echo 'add rule inet openstick_fw input udp sport 67 udp dport 68 accept comment "dhcp client"'
+    echo 'add rule inet openstick_fw input udp sport 547 udp dport 546 accept comment "dhcpv6 client"'
+    echo 'add rule inet openstick_fw input iifname { "usb0", "wlan0" } tcp dport 22 accept comment "ssh"'
+    echo 'add rule inet openstick_fw input iifname "usb0" udp dport { 53, 67 } accept comment "usb0: dhcp (systemd-networkd server), dns"'
+    echo 'add rule inet openstick_fw input iifname "usb0" tcp dport 53 accept comment "usb0: dns"'
+    if [ -e "$NM_DIR/hotspot.nmconnection" ]; then
+        echo 'add rule inet openstick_fw input iifname "wlan0" udp dport { 53, 67 } accept comment "hotspot: dns, dhcp"'
+        echo 'add rule inet openstick_fw input iifname "wlan0" tcp dport 53 accept comment "hotspot: dns"'
+    fi
+    if [ "$SSH_ON_CELLULAR" = 1 ]; then
+        echo 'add rule inet openstick_fw input iifname "wwan*" tcp dport 22 accept comment "ssh on cellular (switched on by the user)"'
+    fi
+}
+
+apply() { ruleset | nft -f -; }
+
+save() {
+    mkdir -p /etc/openstick
+    printf '# managed by openstick-ssh-cellular\nSSH_ON_CELLULAR=%s\n' "$1" > "$CONF"
+}
+
+need_root() { [ "$(id -u)" -eq 0 ] || { echo "run as root: sudo $0 $*" >&2; exit 1; }; }
+
+case "${1:-status}" in
+    status)
+        if [ "$SSH_ON_CELLULAR" = 1 ]; then echo "ssh on cellular: ALLOWED"; else echo "ssh on cellular: blocked (default)"; fi;;
+    print) ruleset;;
+    apply) need_root "$@"; apply;;
+    off) need_root "$@"; save 0; SSH_ON_CELLULAR=0; apply && echo "ssh on cellular: blocked";;
+    on)
+        need_root "$@"
+        cat >&2 <<'EOT'
+WARNING: this exposes the SSH server of this device to the INTERNET through the cellular
+connection. Bots scan the public IPv4/IPv6 space for port 22 continuously. If the default
+password was never changed (it is public), anyone can log in. Use key-only authentication
+(PasswordAuthentication no) and a strong password before continuing.
+EOT
+        [ -t 0 ] || { echo "refusing: confirmation needs an interactive terminal" >&2; exit 1; }
+        printf 'Type "allow ssh on cellular" to confirm: ' >&2
+        read -r ans
+        [ "$ans" = "allow ssh on cellular" ] || { echo "aborted, nothing changed" >&2; exit 1; }
+        save 1; SSH_ON_CELLULAR=1; apply && echo "ssh on cellular: ALLOWED";;
+    *) echo "usage: $0 status|on|off|apply|print" >&2; exit 2;;
+esac

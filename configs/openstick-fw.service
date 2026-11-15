@@ -1,0 +1,15 @@
+[Unit]
+Description=OpenStick firewall (input policy drop, SSH on usb0/wlan0, cellular switch)
+Documentation=file:///usr/sbin/openstick-ssh-cellular
+DefaultDependencies=no
+After=local-fs.target
+Before=network-pre.target ssh.service
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/openstick-ssh-cellular apply
+
+[Install]
+WantedBy=sysinit.target

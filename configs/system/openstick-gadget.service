@@ -1,0 +1,14 @@
+[Unit]
+Description=USB gadget (configfs, mode from /etc/openstick/gadget.conf)
+Requires=sys-kernel-config.mount
+After=sys-kernel-config.mount
+Before=systemd-networkd.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/openstick-gadget start
+ExecStop=/usr/sbin/openstick-gadget stop
+
+[Install]
+WantedBy=multi-user.target

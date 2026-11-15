@@ -1,0 +1,57 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# USB gadget through configfs. usage: openstick-gadget start|stop
+# Config: /etc/openstick/gadget.conf. OPENSTICK_GADGET_DRYRUN=1 skips modprobe and the UDC wait (tests on a fake configfs dir).
+set -eu
+CONF=${OPENSTICK_GADGET_CONF:-/etc/openstick/gadget.conf}
+CFS=${OPENSTICK_CONFIGFS:-/sys/kernel/config}
+UDCDIR=${OPENSTICK_UDC_DIR:-/sys/class/udc}
+DRY=${OPENSTICK_GADGET_DRYRUN:-0}
+GADGET_MODE=ecm GADGET_VID=0x1d6b GADGET_PID=0x0104 GADGET_MANUFACTURER=openstick GADGET_PRODUCT=openstick
+GADGET_HOST_ADDR=02:11:22:33:44:55 GADGET_DEV_ADDR=02:11:22:33:44:66
+# shellcheck disable=SC1090
+[ ! -r "$CONF" ] || . "$CONF"
+G=$CFS/usb_gadget/openstick
+
+stop() {
+    [ -d "$G" ] || return 0
+    [ "$DRY" = 1 ] || echo "" > "$G/UDC" 2>/dev/null || true
+    rm -f "$G"/configs/c.1/*.* 2>/dev/null || true      # function symlinks (names contain a dot)
+    rmdir "$G"/configs/c.1/strings/0x409 "$G"/configs/c.1 2>/dev/null || true
+    rmdir "$G"/functions/* 2>/dev/null || true
+    rmdir "$G"/strings/0x409 "$G" 2>/dev/null || true
+}
+
+start() {
+    case "$GADGET_MODE" in ecm) MODS="usb_f_ecm"; FUNCS="ecm.usb0";; ecm+acm) MODS="usb_f_ecm usb_f_acm"; FUNCS="ecm.usb0 acm.GS0";;
+        rndis) MODS="usb_f_rndis"; FUNCS="rndis.usb0";; *) echo "openstick-gadget: bad GADGET_MODE '$GADGET_MODE' (ecm|ecm+acm|rndis)" >&2; exit 1;; esac
+    if [ "$DRY" != 1 ]; then
+        modprobe libcomposite
+        for m in $MODS; do modprobe "$m"; done
+    fi
+    stop
+    mkdir -p "$G"
+    echo "$GADGET_VID" > "$G/idVendor"; echo "$GADGET_PID" > "$G/idProduct"
+    if [ "$GADGET_MODE" = rndis ]; then echo 0xEF > "$G/bDeviceClass"; echo 0x02 > "$G/bDeviceSubClass"; echo 0x01 > "$G/bDeviceProtocol"; fi
+    mkdir -p "$G/strings/0x409"
+    echo "$GADGET_MANUFACTURER" > "$G/strings/0x409/manufacturer"; echo "$GADGET_PRODUCT" > "$G/strings/0x409/product"
+    mkdir -p "$G/configs/c.1/strings/0x409"
+    echo "$GADGET_MODE" > "$G/configs/c.1/strings/0x409/configuration"; echo 250 > "$G/configs/c.1/MaxPower"
+    for f in $FUNCS; do
+        mkdir -p "$G/functions/$f"
+        case "$f" in ecm.*|rndis.*) echo "$GADGET_HOST_ADDR" > "$G/functions/$f/host_addr"; echo "$GADGET_DEV_ADDR" > "$G/functions/$f/dev_addr";; esac
+        ln -s "$G/functions/$f" "$G/configs/c.1/$f"
+    done
+    UDC=
+    i=0
+    while [ "$i" -lt 50 ]; do
+        UDC=$(ls "$UDCDIR" 2>/dev/null | head -1 || true)
+        [ -z "$UDC" ] || break
+        [ "$DRY" != 1 ] || { UDC=dryrun-udc; break; }
+        i=$((i + 1)); sleep 0.2
+    done
+    [ -n "$UDC" ] || { echo "openstick-gadget: no UDC in $UDCDIR" >&2; exit 1; }
+    echo "$UDC" > "$G/UDC"
+}
+
+case "${1:-}" in start) start;; stop) stop;; *) echo "usage: $0 start|stop" >&2; exit 2;; esac
