@@ -27,6 +27,8 @@ M0 defaults are recorded as recommendations, not verified device behavior. Hardw
 5. **Seed APN application:** The existing build installs LTE profile templates, but the exact runtime-safe APN mutation interface is not documented in this snapshot. Recommended: use NetworkManager profile editing if validated in a fake root; do not invoke modem writes.
 6. **Feature scope conflict:** Installer specs require flashing/restore, while global rules prohibit real hardware. Recommended: implement only wrappers tested against fake EDL/fastboot shims; report actual board operation as hardware-only.
 
+7. **M2 EDL identity fields:** The fake client exposes `serial`, `hwid`, `msm_id` and `pk_hash` as simple key/value text. The installed real EDL client may report these through different output or flags. Recommended: keep serial as the stable registry key and record only fields the client reports; confirm output parsing on hardware before relying on optional identifiers.
+
 ## M0 legacy test failures
 
 See INSTALLER-REPORT.md for exact assertion, exit code, confirmed cause and classification. No legacy script was changed to make these tests pass. They are baseline exceptions only when demonstrably unrelated; an installer regression must still block its milestone.

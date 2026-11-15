@@ -11,10 +11,15 @@ if [[ -n ${OPENSTICK_EDL_CALL_FILE:-} ]]; then
   if [[ ${OPENSTICK_EDL_FAIL_AT:-0} == "$calls" ]]; then echo "FAKE EDL injected failure at call $calls" >&2; exit 90; fi
 fi
 case "${1:-}" in
+  getstorageinfo)
+    echo 'serial=DEADBEEF hwid=1234 msm_id=8916 pk_hash=abcd'
+    ;;
   rf)
     [[ $# -ge 2 ]] || exit 2
     out=${!#}
     cp -- "$OPENSTICK_FAKE_EMMC" "$out"
+    if [[ ${OPENSTICK_EDL_SHORT_READ:-0} == 1 ]]; then truncate -s $(( $(stat -c %s "$out") / 2 )) "$out"; fi
+    if [[ -n ${OPENSTICK_EDL_CORRUPT_OFFSET:-} && ( -z ${OPENSTICK_EDL_CORRUPT_AT_CALL:-} || ${OPENSTICK_EDL_CORRUPT_AT_CALL} == "${calls:-0}" ) ]]; then printf '\377' | dd of="$out" bs=1 seek="$OPENSTICK_EDL_CORRUPT_OFFSET" conv=notrunc status=none; fi
     ;;
   rs)
     [[ $# -ge 4 ]] || exit 2
@@ -28,7 +33,7 @@ case "${1:-}" in
     if [[ " $* " == *' --skipwrite '* ]]; then echo 'FAKE EDL dry run'; exit 0; fi
     echo 'FAKE EDL refuses writes in M1'; exit 98
     ;;
-  getsha256|getstorageinfo|gpt)
+  getsha256|gpt)
     echo 'FAKE EDL serial=DEADBEEF storage=TEST-ONLY'
     ;;
   *) echo "FAKE EDL unsupported command: $1" >&2; exit 2 ;;

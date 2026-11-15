@@ -5,8 +5,8 @@
 | Milestone | Status | Commit |
 |---|---|---|
 | M0 Baseline and design | DONE | `de86b3d` |
-| M1 Skeleton/store/doctor/shims | DONE | this milestone commit (SHA in completion report) |
-| M2 Backup | NOT STARTED | - |
+| M1 Skeleton/store/doctor/shims | DONE | `32b411b03b67956a2e0187f30e4ace8560ab29bf` |
+| M2 Backup | DONE | M2 commit (SHA in completion report) |
 | M3 Configure/seed/inject | NOT STARTED | - |
 | M4 Build/flash wrappers | NOT STARTED | - |
 | M5 Verify/restore | NOT STARTED | - |
@@ -97,12 +97,37 @@ M1 suite result: **PASS 16, FAIL 0, SKIP 0**. Static validation: `python3 -m py_
 
 Files added: `openstick`, `tools/installer/__init__.py`, `tools/installer/cli.py`, `tools/installer/store.py`, `tests/run-installer-tests.sh`, `tests/make-fake-emmc.py`, `tests/shims/bin/{edl,fastboot,ssh,scp,sudo,10-base.sh,20-rootfs.sh,50-boot-img.sh,51-rootfs-img.sh,gen-gpt.sh}`. Files changed: `INSTALLER-REPORT.md`. Existing validated build, flash, initramfs and rollback scripts touched: none.
 
+## M2 backup implementation and evidence
+
+`./openstick backup` discovers the EDL serial and optional numeric hardware ID fields from the client output, normalizes serial to lowercase for registry matching, and reads the entire eMMC with `edl rf`. It verifies exact whole-sector image geometry against the GPT alternate LBA, validates both GPT headers and entry arrays including CRCs, checks table agreement and partition bounds/overlap, and requires `fsg`, `sec` and `fsc`. It writes a full image SHA-256, those three partition fingerprints, `manifest.json` and `SHA256SUMS` into mode-700 staging with mode-600 files. Registration and a redacted event happen only after validation. `--paranoid` performs and hashes a second full read; `--again` permits additional backups. A verified backup is never overwritten. The command warns about IMEI, calibration and persist contents and recommends an independent offline copy.
+
+| Feature | Tested with shims |
+|---|---|
+| Complete read, image hash, GPT geometry and manifest | `backup-success-and-integrity` |
+| Primary and backup GPT header CRC corruption refusal | `backup-gpt-corruption-and-paranoid-mismatch` |
+| Truncated read returns exit 3 | `backup-failures-cleanup` |
+| Known fsg/sec/fsc fixture fingerprints | `backup-success-and-integrity` |
+| Duplicate refusal exit 2 and additional backup | `backup-duplicate-and-again` |
+| Paranoid successful comparison and mismatch refusal | `backup-paranoid-success`, `backup-gpt-corruption-and-paranoid-mismatch` |
+| Mid-read EDL failure and no partial registry/manifest | `backup-failures-cleanup` |
+| Registry/event consistency and private modes | `backup-success-and-integrity` |
+| Store worktree and symlink path safety | `store-refuses-git`, `store-refuses-symlink` |
+| Previous M1 and M0 passing regression suites | `tests/run-installer-tests.sh` (all retained suites) |
+
+| Feature | Needs real hardware |
+|---|---|
+| EDL output parsing and complete `rf` compatibility | Confirm installed client output, Firehose loader behavior and full read completion on the supported board. No hardware command was run. |
+| Identity data availability | Confirm real serial/HWID/MSM ID/public-key hash fields. Optional fields remain nullable; device identity gate is backed by dump fingerprints. |
+| eMMC geometry and offline recovery | Confirm against a physical board and retain the resulting sensitive backup offline. |
+
+M2 acceptance suite: **PASS 21, FAIL 0, SKIP 0**. Existing generated-artifact and privileged M0 baseline failures remain documented above and were not run as part of the M1/M2 runner. Runtime tests used fake EDL only. Static checks are recorded in the completion response. Existing validated build, flash, initramfs and rollback logic was not modified.
+
 ## Known limitations
 
 - Sanitized source copy has no original Git history, build outputs, private config, backups or physical device evidence.
 - No build was run; boot/rootfs image hashes cannot be stated.
 - Root-dependent tests were skipped, not passed.
-- M1 shims provide deterministic fake GPT metadata and a fake image, but do not implement backup, configure, build, seed, flash, verify, restore, package or wizard flows. Those are later milestones.
+- M1/M2 shims provide deterministic fake GPT metadata and eMMC reads. They do not prove real EDL behavior. Configure, build, seed, flash, verify, restore, package and wizard flows are later milestones.
 - The fake GPT contains one-sector placeholder partitions and is metadata for test isolation, not a realistic eMMC image.
 - The user-facing registry note field is plain text. Event history does not copy note or label content.
 - No claim is made about physical USB permissions, installed EDL compatibility, flashing, backup, restore or boot behavior.

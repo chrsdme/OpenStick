@@ -6,6 +6,12 @@ import os
 import shutil
 import sys
 import time
+import tempfile
+import re
+import struct
+import zlib
+import subprocess
+import datetime
 from pathlib import Path
 
 from . import store
@@ -58,6 +64,9 @@ def parser():
     note = ds.add_parser("note", help="set a device note")
     note.add_argument("id")
     note.add_argument("note")
+    backup = subs.add_parser("backup", help="read and verify a complete EDL eMMC backup")
+    backup.add_argument("--paranoid", action="store_true", help="read the eMMC twice and compare")
+    backup.add_argument("--again", action="store_true", help="allow an additional verified backup")
     return p
 
 
@@ -120,9 +129,152 @@ def doctor(args):
 
 def _find_device(registry, ident):
     for entry in registry["devices"]:
-        if entry.get("id") == ident:
+        if str(entry.get("id", "")).lower() == ident.lower():
             return entry
     return None
+
+
+def _parse_gpt(path):
+    size = path.stat().st_size
+    if size % 512 or size < 1024:
+        raise ValueError("image size is not a whole number of sectors")
+    sectors = size // 512
+    def hdr(lba):
+        with path.open("rb") as f:
+            f.seek(lba * 512); raw = f.read(512)
+        if len(raw) != 512 or raw[:8] != b"EFI PART": raise ValueError("GPT header signature is invalid")
+        rev, hsize, crc, reserved = struct.unpack_from("<IIII", raw, 8)
+        cur, alt, first, last = struct.unpack_from("<QQQQ", raw, 24)
+        elba, count, esize, ecrc = struct.unpack_from("<QIII", raw, 72)
+        if hsize < 92 or hsize > 512 or reserved or cur != lba or alt >= sectors or first > last or last >= sectors:
+            raise ValueError("GPT header geometry is invalid")
+        check = bytearray(raw[:hsize]); struct.pack_into("<I", check, 16, 0)
+        if zlib.crc32(check) & 0xffffffff != crc: raise ValueError("GPT header CRC mismatch")
+        if count < 1 or esize < 128 or esize % 8 or count * esize > size:
+            raise ValueError("GPT entry geometry is invalid")
+        with path.open("rb") as f:
+            f.seek(elba * 512); entries = f.read(count * esize)
+        if len(entries) != count * esize or zlib.crc32(entries) & 0xffffffff != ecrc:
+            raise ValueError("GPT partition table CRC mismatch")
+        rows=[]
+        for i in range(count):
+            e=entries[i*esize:(i+1)*esize]
+            if e[:16] == b"\0"*16: continue
+            start,end=struct.unpack_from("<QQ",e,32)
+            name=e[56: min(128,esize)].decode("utf-16le", "strict").rstrip("\0")
+            if not name or start < first or end < start or end > last: raise ValueError("GPT partition boundary is invalid")
+            rows.append((name,start,end))
+        return alt, first, last, rows
+    p=hdr(1)
+    if p[0] != sectors-1: raise ValueError("primary GPT does not point to the final disk sector")
+    b=hdr(sectors-1)
+    if b[0] != 1 or p[1:3] != b[1:3] or p[3] != b[3]: raise ValueError("primary and backup GPT disagree")
+    ordered=sorted(p[3], key=lambda row: row[1]); prior=p[1]-1
+    for _, start, end in ordered:
+        if start <= prior: raise ValueError("GPT partitions overlap")
+        prior=end
+    by={n:(s,e) for n,s,e in ordered}
+    if not all(n in by for n in ("fsg","sec","fsc")): raise ValueError("GPT lacks required identity partitions")
+    return by
+
+
+def _hash_range(path, start, end):
+    h=hashlib.sha256()
+    with path.open("rb") as f:
+        f.seek(start*512); left=(end-start+1)*512
+        while left:
+            data=f.read(min(left, 8*1024*1024))
+            if not data: raise ValueError("partition data is truncated")
+            h.update(data); left-=len(data)
+    return h.hexdigest()
+
+
+def _sha_file(path):
+    h=hashlib.sha256()
+    with path.open("rb") as f:
+        for block in iter(lambda:f.read(8*1024*1024),b""): h.update(block)
+    return h.hexdigest()
+
+
+def backup_command(args, root):
+    print("WARNING: this backup contains IMEI, calibration and persist data. Keep it private and make an independent offline recovery copy.")
+    edl = shutil.which("edl")
+    if not edl: raise store.StoreError("EDL client is missing")
+    env=os.environ.copy()
+    # The shim's identity response is metadata only; real clients report Sahara serial on stderr.
+    try:
+        ident_run=subprocess.run([edl,"getstorageinfo"],stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,env=env,timeout=30)
+    except (OSError,subprocess.TimeoutExpired): raise store.StoreError("could not read EDL identity")
+    text=ident_run.stdout+"\n"+ident_run.stderr
+    match=re.search(r"serial\s*=\s*([0-9a-fA-F]+)",text)
+    if not match: raise store.StoreError("EDL client did not report a device serial")
+    device_id=match.group(1).lower()
+    hwid_match=re.search(r"(?:hwid|msm_id|pk_hash)\s*[=:]\s*([0-9a-fA-Fx]+)",text,re.I)
+    existing=store.load_registry(root); device=_find_device(existing,device_id)
+    if args.device and args.device.lower()!=device_id: raise store.RefusedError("connected EDL identity does not match --device")
+    if device and device.get("edl",{}).get("serial",device_id).lower()!=device_id: raise store.RefusedError("EDL identity conflicts with registry")
+    if device and device.get("backups") and not args.again: raise store.RefusedError("a verified backup already exists; use --again for another")
+    if args.dry_run:
+        print("DRY RUN: would read and verify eMMC for device %s."%device_id); return EXIT_OK
+    backup_id=datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    parent=root/"backups"/device_id; parent.mkdir(mode=0o700,parents=True,exist_ok=True); os.chmod(parent,0o700)
+    final=parent/backup_id
+    if final.exists(): raise store.RefusedError("backup destination already exists")
+    staging=Path(tempfile.mkdtemp(prefix=".staging-",dir=str(parent))); os.chmod(staging,0o700)
+    try:
+        dump=staging/"emmc-full.bin"
+        def read_to(dest):
+            p=subprocess.run([edl,"rf",str(dest)],stdout=subprocess.PIPE,stderr=subprocess.PIPE,env=env)
+            if p.returncode: raise store.StoreError("EDL full read failed")
+        read_to(dump)
+        if args.paranoid:
+            second=staging/"comparison.bin"; read_to(second)
+            if dump.stat().st_size != second.stat().st_size or _sha_file(dump)!=_sha_file(second):
+                raise ValueError("paranoid full read comparison failed")
+            second.unlink()
+        parts=_parse_gpt(dump)
+        image_hash=hashlib.sha256()
+        with dump.open("rb") as f:
+            for block in iter(lambda:f.read(8*1024*1024),b""): image_hash.update(block)
+        fingerprints={n:_hash_range(dump,*parts[n]) for n in ("fsg","sec","fsc")}
+        old=device.get("identity",{}) if device else {}
+        if old and old != fingerprints:
+            raise store.RefusedError("EDL identity fingerprints conflict with registered device")
+        manifest={"schema_version":1,"id":backup_id,"device_id":device_id,"edl":{"serial":device_id,"hwid":hwid_match.group(1) if hwid_match else None},"size":dump.stat().st_size,"sectors":dump.stat().st_size//512,"sha256":image_hash.hexdigest(),"identity":fingerprints,"partitions":{n:{"start_lba":s,"end_lba":e} for n,(s,e) in parts.items()},"verified_by":["full-read-size","gpt-primary-and-backup-crc","sha256"]+( ["paranoid-second-read"] if args.paranoid else []),"created":backup_id}
+        (staging/"manifest.json").write_text(json.dumps(manifest,sort_keys=True,indent=2)+"\n")
+        (staging/"SHA256SUMS").write_text("%s  emmc-full.bin\n"%manifest["sha256"])
+        for f in staging.iterdir(): os.chmod(f,0o600)
+        os.replace(staging,final); os.chmod(final,0o700)
+        if device is None:
+            device={"id":device_id,"label":"","board":args.board or "ufi103s","pcb_label":"","notes":"","edl":{"serial":device_id,"hwid":manifest["edl"]["hwid"]},"usb_aliases":[],"identity":fingerprints,"backups":[],"builds":[],"flashes":[],"seeds_applied":[],"packages":[],"created":backup_id}
+            existing["devices"].append(device)
+        else:
+            device["identity"]=fingerprints
+        device.setdefault("backups",[]).append({"id":backup_id,"path":str(final),"size":manifest["size"],"sha256":manifest["sha256"],"verified_by":manifest["verified_by"],"created":backup_id})
+        device["updated_at"]=int(time.time())
+        registry_saved=False
+        try:
+            store.save_registry(root,existing); registry_saved=True
+            store.append_event(root,{"at":int(time.time()),"type":"backup.verified","device_id":device_id,"backup_id":backup_id,"sha256":manifest["sha256"],"size":manifest["size"]})
+        except Exception:
+            if registry_saved:
+                # Restore the pre-operation registry if event persistence fails.
+                original=store.load_registry(root)
+                original_device=_find_device(original,device_id)
+                if original_device:
+                    original_device["backups"]=[b for b in original_device.get("backups",[]) if b.get("id")!=backup_id]
+                    if not original_device["backups"]:
+                        original_device["identity"]={}
+                else:
+                    original["devices"]=[d for d in original["devices"] if d.get("id","").lower()!=device_id]
+                store.save_registry(root,original)
+            shutil.rmtree(final,ignore_errors=True)
+            raise
+        print("Verified backup %s for device %s (%d bytes)."%(backup_id,device_id,manifest["size"]))
+        return EXIT_OK
+    except Exception:
+        shutil.rmtree(staging,ignore_errors=True)
+        raise
 
 
 def device_command(args, root):
@@ -158,13 +310,14 @@ def main(argv=None):
         if args.command == "doctor":
             return doctor(args)
         root = store.ensure_store(args.home)
+        if args.command == "backup": return backup_command(args,root)
         return device_command(args, root)
     except store.RefusedError as exc:
         print("REFUSED: " + _redact(exc), file=sys.stderr)
         return EXIT_REFUSED
     except (store.StoreError, OSError, ValueError, json.JSONDecodeError) as exc:
         print("ERROR: " + _redact(exc), file=sys.stderr)
-        return EXIT_ERROR
+        return EXIT_VERIFY if isinstance(exc, ValueError) else EXIT_ERROR
 
 
 if __name__ == "__main__":
