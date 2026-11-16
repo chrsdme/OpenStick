@@ -4,41 +4,115 @@ if [[ -z ${OPENSTICK_FAKE_EMMC:-} || ! -f ${OPENSTICK_FAKE_EMMC:-} ]]; then
   echo 'FAKE EDL REFUSED: OPENSTICK_FAKE_EMMC must name a test image' >&2
   exit 97
 fi
-printf 'FAKE EDL serial=DEADBEEF command=%q\n' "$*" >&2
+
+operation=${1:-}
+[[ -n $operation ]] || { echo 'FAKE EDL REFUSED: missing operation' >&2; exit 2; }
+shift
+positional=()
+loader=
+memory=
+while (($#)); do
+  case "$1" in
+    --loader=*) loader=${1#--loader=} ;;
+    --loader) shift; (($#)) || { echo 'FAKE EDL REFUSED: --loader needs a path' >&2; exit 91; }; loader=$1 ;;
+    --memory=*) memory=${1#--memory=} ;;
+    --memory) shift; (($#)) || { echo 'FAKE EDL REFUSED: --memory needs a value' >&2; exit 91; }; memory=$1 ;;
+    *) positional+=("$1") ;;
+  esac
+  shift
+done
+
+calls=0
 if [[ -n ${OPENSTICK_EDL_CALL_FILE:-} ]]; then
-  calls=0; [[ ! -f $OPENSTICK_EDL_CALL_FILE ]] || read -r calls < "$OPENSTICK_EDL_CALL_FILE"
+  [[ ! -f $OPENSTICK_EDL_CALL_FILE ]] || read -r calls < "$OPENSTICK_EDL_CALL_FILE"
   calls=$((calls + 1)); printf '%s\n' "$calls" > "$OPENSTICK_EDL_CALL_FILE"
-  if [[ ${OPENSTICK_EDL_FAIL_AT:-0} == "$calls" ]]; then echo "FAKE EDL injected failure at call $calls" >&2; exit 90; fi
 fi
-case "${1:-}" in
+if [[ -n ${OPENSTICK_EDL_COMMAND_FILE:-} ]]; then
+  printf '%q ' "$operation" "${positional[@]}" "--loader=$loader" "--memory=$memory" >> "$OPENSTICK_EDL_COMMAND_FILE"
+  printf '\n' >> "$OPENSTICK_EDL_COMMAND_FILE"
+fi
+
+if [[ -z $loader || $memory != emmc ]]; then
+  if [[ ${OPENSTICK_EDL_NO_LOADER_SIM:-0} != 1 ]]; then
+    echo 'FAKE EDL ASSERTION FAILED: every call must include --loader=<absolute path> and --memory=emmc' >&2
+    exit 91
+  fi
+  printf 'Qualcomm Sahara / Firehose Client V3.62 (c) B.Kerler 2018-2025.\n'
+  printf 'main - Trying with no loader given ...\nmain - Waiting for the device\n......\nmain - Device detected :)\n'
+  printf 'sahara - Protocol version: 2, Version supported: 1\nmain - Mode detected: sahara\nsahara -\n\nVersion 0x2\n------------------------\n'
+  printf 'HWID:              0x007050e100000000 (MSM_ID:0x007050e1,OEM_ID:0x0000,MODEL_ID:0x0000)\n'
+  printf 'CPU detected:      "MSM8916"\nPK_HASH:           0x0000000000000000000000000000000000000000000000000000000000000000\nSerial:            0xdeadbeef\n\nsahara\n'
+  printf "sahara - [LIB]: Couldn't find a loader for given hwid and pkhash (...) :(\n"
+  handle_interrupt() {
+    [[ -z ${OPENSTICK_EDL_SIGNAL_FILE:-} ]] || printf 'SIGINT\n' > "$OPENSTICK_EDL_SIGNAL_FILE"
+    printf '[!] Exiting cleanly…\n'
+    exit 130
+  }
+  trap handle_interrupt INT
+  while :; do sleep 0.1 & wait "$!" || true; done
+fi
+
+if [[ $loader != /* || ! -f $loader ]]; then
+  echo 'FAKE EDL ASSERTION FAILED: loader path must be absolute and name a file' >&2
+  exit 91
+fi
+
+printf 'Qualcomm Sahara / Firehose Client V3.62 (c) B.Kerler 2018-2025.\n'
+printf 'main - Trying with loader given ...\nmain - Waiting for the device\n......\nmain - Device detected :)\n'
+printf 'sahara - Protocol version: 2, Version supported: 1\nmain - Mode detected: sahara\nsahara -\n\nVersion 0x2\n------------------------\n'
+printf 'HWID:              0x007050e100000000 (MSM_ID:0x007050e1,OEM_ID:0x0000,MODEL_ID:0x0000)\n'
+printf 'CPU detected:      "MSM8916"\nPK_HASH:           0x0000000000000000000000000000000000000000000000000000000000000000\nSerial:            0xdeadbeef\n\n'
+printf 'sahara - Uploading loader ...\nfirehose - MemoryName=emmc\nfirehose - Running configure...\nfirehose\n'
+
+if [[ ${OPENSTICK_EDL_HANG:-0} == 1 ]]; then
+  handle_interrupt() {
+    [[ -z ${OPENSTICK_EDL_SIGNAL_FILE:-} ]] || printf 'SIGINT\n' > "$OPENSTICK_EDL_SIGNAL_FILE"
+    printf '[!] Exiting cleanly…\n'
+    exit 130
+  }
+  trap handle_interrupt INT
+  while :; do sleep 0.1 & wait "$!" || true; done
+fi
+
+if [[ ${OPENSTICK_EDL_FAIL_AT:-0} != 0 && ${OPENSTICK_EDL_FAIL_AT:-0} == "$calls" ]]; then
+  echo "FAKE EDL injected failure at call $calls" >&2
+  exit 90
+fi
+
+case "$operation" in
   getstorageinfo)
-    echo 'serial=DEADBEEF hwid=1234 msm_id=8916 pk_hash=abcd'
-    if [[ -n ${OPENSTICK_EDL_BYTES_FILE:-} ]]; then printf 'getstorageinfo 0 0 0\n' >> "$OPENSTICK_EDL_BYTES_FILE"; fi
+    echo "GetStorageInfo command isn't supported."
     ;;
   rf)
-    [[ $# -ge 2 ]] || exit 2
-    out=${!#}
+    ((${#positional[@]} >= 1)) || exit 2
+    out=${positional[0]}
     cp -- "$OPENSTICK_FAKE_EMMC" "$out"
     if [[ -n ${OPENSTICK_EDL_BYTES_FILE:-} ]]; then printf 'rf 0 0 %s\n' "$(stat -c %s "$out")" >> "$OPENSTICK_EDL_BYTES_FILE"; fi
     if [[ ${OPENSTICK_EDL_SHORT_READ:-0} == 1 ]]; then truncate -s $(( $(stat -c %s "$out") / 2 )) "$out"; fi
-    if [[ -n ${OPENSTICK_EDL_CORRUPT_OFFSET:-} && ( -z ${OPENSTICK_EDL_CORRUPT_AT_CALL:-} || ${OPENSTICK_EDL_CORRUPT_AT_CALL} == "${calls:-0}" ) ]]; then printf '\377' | dd of="$out" bs=1 seek="$OPENSTICK_EDL_CORRUPT_OFFSET" conv=notrunc status=none; fi
+    if [[ -n ${OPENSTICK_EDL_CORRUPT_OFFSET:-} && ( -z ${OPENSTICK_EDL_CORRUPT_AT_CALL:-} || ${OPENSTICK_EDL_CORRUPT_AT_CALL} == "$calls" ) ]]; then printf '\377' | dd of="$out" bs=1 seek="$OPENSTICK_EDL_CORRUPT_OFFSET" conv=notrunc status=none; fi
+    echo "Reading from physical partition 0, sector 0, sectors $(($(stat -c %s "$out") / ${EDL_SECTOR_SIZE:-512}))"
+    echo 'Progress: |██████████| 100.0% Read (Sector 0x1 of 0x1, ) 0.64 MB/s'
+    echo "Dumped sector 0 with sector count 1 as $out."
     ;;
   rs)
-    [[ $# -ge 4 ]] || exit 2
-    start=$(( $2 * ${EDL_SECTOR_SIZE:-512} )); count=$(( $3 * ${EDL_SECTOR_SIZE:-512} )); out=$4
-    if [[ ${OPENSTICK_EDL_SHORT_READ:-0} == 1 ]]; then count=$((count / 2)); fi
+    ((${#positional[@]} >= 3)) || exit 2
+    start=$(( positional[0] * ${EDL_SECTOR_SIZE:-512} )); count=$(( positional[1] * ${EDL_SECTOR_SIZE:-512} )); out=${positional[2]}
+    if [[ ${OPENSTICK_EDL_SHORT_READ:-0} == 1 && $calls -gt 1 ]]; then count=$((count / 2)); fi
     dd if="$OPENSTICK_FAKE_EMMC" of="$out" iflag=skip_bytes,count_bytes skip="$start" count="$count" status=none
-    if [[ -n ${OPENSTICK_EDL_BYTES_FILE:-} ]]; then printf 'rs %s %s %s\n' "$2" "$3" "$(stat -c %s "$out")" >> "$OPENSTICK_EDL_BYTES_FILE"; fi
+    if [[ -n ${OPENSTICK_EDL_BYTES_FILE:-} ]]; then printf 'rs %s %s %s\n' "${positional[0]}" "${positional[1]}" "$(stat -c %s "$out")" >> "$OPENSTICK_EDL_BYTES_FILE"; fi
     if [[ ${OPENSTICK_EDL_CORRUPT_BYTE:-0} == 1 ]]; then printf '\377' | dd of="$out" bs=1 seek=0 conv=notrunc status=none; fi
+    echo "Reading from physical partition 0, sector ${positional[0]}, sectors ${positional[1]}"
+    echo 'Progress: |██████████| 100.0% Read (Sector 0x1 of 0x1, ) 0.64 MB/s'
+    echo "Dumped sector ${positional[0]} with sector count ${positional[1]} as $out."
     ;;
   ws)
-    [[ $# -ge 3 ]] || exit 2
-    if [[ -n ${OPENSTICK_EDL_BYTES_FILE:-} ]]; then printf 'ws %s 0 0\n' "$2" >> "$OPENSTICK_EDL_BYTES_FILE"; fi
-    if [[ " $* " == *' --skipwrite '* ]]; then echo 'FAKE EDL dry run'; exit 0; fi
+    ((${#positional[@]} >= 2)) || exit 2
+    if [[ -n ${OPENSTICK_EDL_BYTES_FILE:-} ]]; then printf 'ws %s 0 0\n' "${positional[0]}" >> "$OPENSTICK_EDL_BYTES_FILE"; fi
+    if [[ " ${positional[*]} " == *' --skipwrite '* ]]; then echo 'FAKE EDL dry run'; exit 0; fi
     echo 'FAKE EDL refuses writes in M1'; exit 98
     ;;
   getsha256|gpt)
-    echo 'FAKE EDL serial=DEADBEEF storage=TEST-ONLY'
+    echo 'FAKE EDL storage=TEST-ONLY'
     ;;
-  *) echo "FAKE EDL unsupported command: $1" >&2; exit 2 ;;
+  *) echo "FAKE EDL unsupported command: $operation" >&2; exit 2 ;;
 esac
