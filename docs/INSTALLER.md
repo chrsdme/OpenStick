@@ -37,7 +37,7 @@ Backup performs actual EDL reads and writes sensitive backup files; never run it
 
 After reviewing the device and completing reconciliation, a later explicit stage call requests fresh gates. The reconciliation call itself never proceeds to a write. An uncertain backup or package stage has no automatic retry path; preserve its state and inspect the store before starting a new run.
 
-The required base tarball and pinned build artifacts are not included in this sanitized workspace. M4 produces `boot.img` and `rootfs.img`; the historical GPT-B first-install wrapper consumes `boot.bin` and `rootfs.bin`. The GPT-T image-set adapter validates the Android boot image header, ext4 bounds, and paired GPT CRC/geometry, then maps boot to `boot` and rootfs to `userdata`. The current flash wrapper still refuses a GPT-T set because no safe live-identity-preserving hardware write and read-back path is validated. Do not rename or concatenate files to bypass this refusal. Install package creation and a complete first-install run remain blocked until their matching image, backup, firmware and write-path requirements are satisfied.
+The required base tarball and pinned build artifacts are not included in this sanitized workspace. M4 produces `boot.img` and `rootfs.img`; the historical legacy GPT-B first-install wrapper consumes `boot.bin` and `rootfs.bin`. The [current GPT-T image-set adapter](#build-install-and-verify) validates the Android boot image header, ext4 bounds, and paired GPT CRC/geometry, then maps boot to `boot` and rootfs to `userdata`. The current flash wrapper still refuses a GPT-T set because no safe live-identity-preserving hardware write and read-back path is validated. Do not rename or concatenate files to bypass this refusal. Install package creation and a complete first-install run remain blocked until their matching image, backup, firmware and write-path requirements are satisfied.
 
 The synthetic M7 wizard run exercises the preparation stages, SSH evidence parsing, package fixture creation, and fake-disk restore. Its first-install path stops at flash with `HARDWARE_REQUIRED`; it does not demonstrate a successful stock-to-Debian E2E or a real boot. No physical device flash was attempted.
 
@@ -61,7 +61,7 @@ The generic build command is:
 ./openstick build --profile prod --board ufi103s
 ```
 
-Build runs the existing rootfs and production image stages. Only the rootfs configuration stage requests elevation through the existing wrapper; do not run the launcher itself as root. This unattended offline session did not perform a real build because the base image and pinned external inputs are missing and root/network access is outside its operating boundary.
+Build runs the existing rootfs and production image stages. Only the rootfs configuration stage requests elevation through the existing wrapper; do not run the launcher itself as root. Generic builds exclude personal `local.env` and `user.env` values. The generic dev image still uses the public `DEFAULT_USER=openstick` and `DEFAULT_PASS=openstick` values from `config/defaults.env`; the password expires at first login. `build --dry-run` prints this fact. This unattended offline session did not perform a real build because the base image and pinned external inputs are missing and root/network access is outside its operating boundary.
 
 For the supported UFI103S GPT-T geometry, a registered build can be adapted into a self-contained image set when the owner has supplied the matching paired GPT-T layout files:
 
@@ -74,7 +74,7 @@ For the supported UFI103S GPT-T geometry, a registered build can be adapted into
 
 The intended install sequence is: verify a full backup, select a matching board and image set, inject or select a verified seed, review dry-runs, then confirm each flash phase explicitly. `flash` validates the image checksums, board, backup, live identity, pinned loader and Path A assets before each write. A successful command sequence is not proof that the device booted. `verify` reports subsystem checks individually as pass, fail or skip based on direct SSH evidence; missing evidence must not be treated as a pass.
 
-Package commands should be used only after inspecting package manifests and checksums. `package verify` is read-only and never executes package content. Packages contain sensitive recovery material where applicable; store and transfer them as private files. A restore package is not a substitute for a separate offline copy of the verified full backup.
+Package commands should be used only after inspecting package manifests and checksums. `package verify` is read-only and never executes package content. Packaged install and restore scripts are **UNVALIDATED on hardware**. Their help and package README state this, and any destructive operation still requires the normal typed flash or restore confirmation. These packages contain sensitive recovery material; store and transfer them as private files. A restore package is not a substitute for a separate offline copy of the verified full backup.
 
 ## Separate build and flash machines
 

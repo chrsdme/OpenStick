@@ -18,10 +18,89 @@ import select
 import time
 import fcntl
 from unittest import mock
+from contextlib import redirect_stdout
+import io
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from tools.installer import packages, store
+from tools.installer import build as build_module
+
+
+def verify_build_safety(root):
+    home = store.ensure_store(root / "build-safety-home")
+    repo = root / "build-safety-repo"
+    (repo / "boards/ufi103s").mkdir(parents=True)
+    (repo / "boards/ufi103s/board.env").write_text("BOARD_DESC=synthetic\n")
+    (repo / "scripts").mkdir()
+    for name in ("20-rootfs.sh", "50-boot-img.sh", "51-rootfs-img.sh"):
+        (repo / "scripts" / name).write_text("#!/bin/sh\nexit 0\n")
+    (repo / "out").mkdir()
+    (repo / "out/base-bookworm-arm64.tar.gz").write_bytes(b"synthetic base")
+    args = type("Args", (), {"profile": "prod", "build_board": "ufi103s",
+                              "bake_user_env": False, "dry_run": False})()
+    captured = []
+
+    def fake_run(command, env=None, **kwargs):
+        if command[0] == "git":
+            return type("Result", (), {"returncode": 128, "stdout": ""})()
+        captured.append((list(command), dict(env or {})))
+        if "50-boot-img.sh" in command[-1]:
+            out = pathlib.Path(env["PROD_OUT"]); out.mkdir(parents=True, exist_ok=True)
+            (out / "boot.img").write_bytes(b"synthetic boot")
+        if "51-rootfs-img.sh" in command[-1]:
+            out = pathlib.Path(env["PRODROOT_OUT"]); out.mkdir(parents=True, exist_ok=True)
+            (out / "rootfs.img").write_bytes(b"synthetic rootfs")
+        return type("Result", (), {"returncode": 0})()
+
+    with mock.patch.object(build_module.os, "geteuid", return_value=1000), \
+         mock.patch.object(build_module.os, "getuid", return_value=1000), \
+         mock.patch.object(build_module.os, "getgid", return_value=1000), \
+         mock.patch.object(build_module, "_version", return_value="synthetic"), \
+         mock.patch.object(build_module.subprocess, "run", side_effect=fake_run):
+        assert build_module.build_command(args, home, repo) == 0
+    privileged, env = captured[0]
+    handoff = '"/bin/sh" "$1"; rc=$?; chown -R "$2:$3" "$4" "$5"; owner_rc=$?; [ "$rc" -ne 0 ] && exit "$rc"; exit "$owner_rc"'
+    expected = ["sudo", "env", "-i"] + [key + "=" + value for key, value in sorted(env.items())] + [
+        "/bin/sh", "-c", handoff, "openstick-build", str(repo / "scripts/20-rootfs.sh"),
+        "1000", "1000", env["OUT"], env["WORK"]]
+    assert privileged == expected, (privileged[:3], expected[:3])
+
+    root_args = type("Args", (), {"profile": "prod", "build_board": "ufi103s",
+                                   "bake_user_env": False, "dry_run": False})()
+    with mock.patch.object(build_module.os, "geteuid", return_value=0), \
+         mock.patch.object(build_module.subprocess, "run", side_effect=AssertionError("root refusal ran a command")):
+        try:
+            build_module.build_command(root_args, home, repo)
+        except store.RefusedError as exc:
+            assert "non-root" in str(exc)
+        else:
+            raise AssertionError("build as root was accepted")
+
+def test_build_dry_run_default_login(root):
+    home = store.ensure_store(root / "dry-run-home")
+    repo = root / "build-safety-repo"
+    args = type("Args", (), {"profile": "dev", "build_board": "ufi103s",
+                              "bake_user_env": False, "dry_run": True})()
+    output = io.StringIO()
+    with redirect_stdout(output):
+        assert build_module.build_command(args, home, repo) == 0
+    assert "DEFAULT_USER=openstick" in output.getvalue() and "DEFAULT_PASS=openstick" in output.getvalue()
+
+
+def test_common_rejects_empty_openstick_out():
+    for mode in ("legacy", "generic"):
+        env = dict(os.environ, OPENSTICK_ROOT=str(ROOT), OPENSTICK_CONFIG_MODE=mode,
+                   OPENSTICK_OUT="", PATH="/usr/bin:/bin")
+        result = subprocess.run(["/bin/sh", "-c", '. "$OPENSTICK_ROOT/scripts/common.sh"'],
+                                env=env, capture_output=True, text=True)
+        assert result.returncode != 0 and "OPENSTICK_OUT" in result.stderr, (mode, result.returncode, result.stderr)
+    generic_missing = dict(os.environ, OPENSTICK_ROOT=str(ROOT), OPENSTICK_CONFIG_MODE="generic",
+                           PATH="/usr/bin:/bin")
+    generic_missing.pop("OPENSTICK_OUT", None)
+    result = subprocess.run(["/bin/sh", "-c", '. "$OPENSTICK_ROOT/scripts/common.sh"'],
+                            env=generic_missing, capture_output=True, text=True)
+    assert result.returncode != 0 and "OPENSTICK_OUT" in result.stderr, (result.returncode, result.stderr)
 
 
 def make_backup(home):
@@ -295,6 +374,9 @@ def make_install_tools(directory, live_path):
 import errno, os, shutil, sys
 from pathlib import Path
 disk=Path(%r); a=sys.argv[1:]; op=a[0]
+log=os.environ.get('OPENSTICK_INSTALL_EDL_LOG')
+if log:
+ with Path(log).open('a') as f: f.write(' '.join(a)+'\\n')
 if op=='getstorageinfo': print('serial=DEADBEEF'); raise SystemExit(0)
 if op=='rf':
  out=Path(next(x for x in a[1:] if not x.startswith('--')))
@@ -348,6 +430,10 @@ raise SystemExit(2)
 def run():
     with tempfile.TemporaryDirectory(prefix="ostpkg-test-") as td:
         root = pathlib.Path(td)
+        verify_build_safety(root)
+        test_build_dry_run_default_login(root)
+        test_common_rejects_empty_openstick_out()
+        test_verify_package_requires_sensitive_marking(root)
         home = store.ensure_store(root / "state")
         device = make_backup(home)
         output = root / "restore.ostpkg.tar"
@@ -361,7 +447,9 @@ def run():
         assert (output.stat().st_mode & 0o777) == 0o600
         with tarfile.open(output) as archive:
             names = archive.getnames()
-            assert "SENSITIVE" in archive.extractfile("README.txt").read().decode()
+            package_readme = archive.extractfile("README.txt").read().decode()
+            assert "SENSITIVE" in package_readme
+            assert "UNVALIDATED on hardware" in package_readme
             assert "payload/emmc-full.bin" in names
             assert "payload/rollback-plan.py" in names and "payload/rollback-plan.txt" in names
             script = archive.extractfile("scripts/restore.py").read().decode()
@@ -639,7 +727,7 @@ def run():
             raise AssertionError("symlinked archive path accepted")
 
         # Current M4 build format is GPT-T boot.img + userdata rootfs.img and
-        # cannot be passed to GPT-B boot.bin/rootfs.bin first-install consumer.
+        # cannot be passed to the legacy GPT-B boot.bin/rootfs.bin first-install consumer.
         m4 = root / "m4-build"
         m4.mkdir(); (m4 / "boot.img").write_bytes(b"synthetic boot container")
         (m4 / "rootfs.img").write_bytes(b"synthetic ext4 rootfs")
@@ -694,6 +782,9 @@ def run():
         (install_race / boot_rel).write_bytes(b"changed-after-validation")
         assert (install_snapshot / boot_rel).read_bytes() == before
         install_script = clean_install / "scripts/install.py"
+        install_help = subprocess.run([sys.executable, str(install_script), "--help"],
+                                      env=dict(os.environ, PATH="/usr/bin:/bin"), capture_output=True, text=True)
+        assert "UNVALIDATED on hardware" in install_help.stdout
         wrong_device = subprocess.run([sys.executable, str(install_script), "--device", "cafebabe", "--edl", "/missing/edl",
                                        "--loader", str(loader), "--state-dir", str(root / "install-state")],
                                       env=dict(os.environ, PATH="/usr/bin:/bin"), capture_output=True, text=True)
@@ -717,18 +808,23 @@ def run():
         fake_tools = root / "install-fake-tools"
         install_edl, fastboot_log = make_install_tools(fake_tools, install_live)
         accepted_env = dict(os.environ, PATH=str(fake_tools) + ":/usr/bin:/bin")
+        install_edl_log = root / "install-edl.log"
+        accepted_env["OPENSTICK_INSTALL_EDL_LOG"] = str(install_edl_log)
         assert shutil.which("fastboot", path=accepted_env["PATH"]) == str(fake_tools / "fastboot")
         assert shutil.which("sudo", path=accepted_env["PATH"]) == str(fake_tools / "sudo")
         assert shutil.which("simg2img", path=accepted_env["PATH"]) == str(fake_tools / "simg2img")
         rc, install_output, confirmations = run_flash_session(
             [sys.executable, str(accepted_script), "--device", "deadbeef", "--edl", str(install_edl),
              "--loader", str(loader), "--state-dir", str(root / "accepted-install-state")], accepted_env)
-        assert rc == 0, (rc, install_output[-5000:])
+        assert rc == 2 and "stopped after GPT" in install_output, (rc, install_output[-5000:])
         assert not fastboot_log.exists() or fastboot_log.read_text(encoding="utf-8") == "", "standalone first-install unexpectedly invoked fastboot"
-        assert len(confirmations) == 7, confirmations
+        assert confirmations == {"flash deadbeef gpt"}, confirmations
+        actual_writes = [line.split() for line in install_edl_log.read_text().splitlines()
+                         if line.startswith("ws ") and "--skipwrite" not in line]
+        assert {int(row[1]) for row in actual_writes} == {0, 4096 - 33} and len(actual_writes) == 2, actual_writes
 
         # A standalone restore package carries hashed state evidence from a
-        # registered GPT-B Path A image set. The fake target starts with that
+        # registered legacy GPT-B Path A image set. The fake target starts with that
         # exact GPT/firmware state and must return byte-for-byte to its backup.
         transition_set = root / "transition-gpt-b"
         transition_live = root / "transition-source-live.img"
@@ -776,6 +872,9 @@ def run():
         transition_loader = root / "transition-loader"; transition_loader.write_bytes(loader.read_bytes())
         transition_args = [sys.executable, str(restore_script), "--device", "deadbeef", "--edl", str(transition_edl),
                            "--loader", str(transition_loader)]
+        restore_help = subprocess.run(transition_args + ["--help"], env=transition_env,
+                                      capture_output=True, text=True)
+        assert "UNVALIDATED on hardware" in restore_help.stdout
         inspect = subprocess.run(transition_args, env=transition_env, capture_output=True, text=True)
         assert inspect.returncode == 0 and "Ordered restore phases" in inspect.stdout, (inspect.returncode, inspect.stdout, inspect.stderr)
         restore_phases = re.search(r"Ordered restore phases: (.+)", inspect.stdout).group(1).split(", ")
@@ -786,9 +885,32 @@ def run():
             rc, output_text = run_typed(transition_args + ["--phase", phase, "--state", str(transition_state)],
                                         phase_env, token)
             assert rc == 0, (phase, rc, output_text[-1000:])
+            assert "UNVALIDATED on hardware" in output_text
         assert transition_disk.read_bytes() == (home / "backups" / "deadbeef" / "synthetic-backup" / "emmc-full.bin").read_bytes()
         assert "first-install" in install_output and "readback pass" in install_output.lower()
     print("M6 synthetic package checks PASS")
+
+
+def test_verify_package_requires_sensitive_marking(root):
+    """A package with valid member hashes still needs the SENSITIVE marker."""
+    source = root / "sensitive-valid.ostpkg.tar"
+    mutant = root / "sensitive-marker-removed.ostpkg.tar"
+    make_raw_package(source)
+    with tarfile.open(source, "r:") as original, tarfile.open(mutant, "w") as changed:
+        for member in original.getmembers():
+            data = original.extractfile(member).read() if member.isfile() else None
+            if member.name == "manifest.json":
+                manifest = json.loads(data.decode("utf-8"))
+                manifest["sensitive"] = False
+                data = (json.dumps(manifest, sort_keys=True) + "\n").encode("utf-8")
+                member.size = len(data)
+            changed.addfile(member, __import__("io").BytesIO(data) if data is not None else None)
+    try:
+        packages.verify_package(mutant)
+    except store.RefusedError as exc:
+        assert "SENSITIVE" in str(exc)
+    else:
+        raise AssertionError("package without the SENSITIVE marker was accepted")
 
 
 if __name__ == "__main__":

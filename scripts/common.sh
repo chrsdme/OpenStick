@@ -38,6 +38,12 @@ elif [ "${OPENSTICK_CONFIG_MODE:-legacy}" = legacy ]; then
 else
     echo "ERROR: invalid OPENSTICK_CONFIG_MODE" >&2; exit 1
 fi
+if [ "${OPENSTICK_OUT+x}" = x ] && [ -z "$OPENSTICK_OUT" ]; then
+    echo "ERROR: OPENSTICK_OUT must name an output directory when provided" >&2; exit 1
+fi
+if [ "${OPENSTICK_CONFIG_MODE:-legacy}" = generic ] && [ -z "$OUT" ]; then
+    echo "ERROR: generic mode requires OPENSTICK_OUT to name an output directory" >&2; exit 1
+fi
 [ -f "$ROOT/boards/$BOARD/board.env" ] || { echo "ERROR: unknown BOARD '$BOARD' (no boards/$BOARD/board.env)" >&2; exit 1; }
 . "$ROOT/boards/$BOARD/board.env"
 set +a

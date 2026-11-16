@@ -881,7 +881,7 @@ def package_ok(root):
   return checked if checked and validate_transition(checked[0],checked[1],json.loads((checked[0]/'payload/manifest.json').read_text())) else None
  except (OSError,ValueError,KeyError,TypeError,RuntimeError): return None
 def main():
- ap=argparse.ArgumentParser(description='Portable, fail-closed phased restore from a complete verified backup')
+ ap=argparse.ArgumentParser(description='Portable, fail-closed phased restore from a complete verified backup. UNVALIDATED on hardware; writes require the normal typed restore confirmation.')
  ap.add_argument('--edl',required=True); ap.add_argument('--loader',required=True); ap.add_argument('--device',required=True)
  ap.add_argument('--phase',default='inspect'); ap.add_argument('--dry-run',action='store_true'); ap.add_argument('--state')
  a=ap.parse_args(); root=Path(__file__).resolve().parents[1]; checked=package_ok(root)
@@ -1003,6 +1003,7 @@ def main():
    if dry.returncode: print('REFUSED: EDL dry-run failed; no write occurred',file=sys.stderr); return 2
    token='restore %s %s'%(m['device_id'][-8:],a.phase)
    print('Phase %s at LBA %d for %d sectors; source SHA-256 %s'%(a.phase,row['start'],row['count'],sha(slice_path)))
+   print('WARNING: packaged restore scripts are UNVALIDATED on hardware.')
    if a.dry_run: print('DRY RUN: skipwrite passed; no write occurred'); return 0
    if os.environ.get('COMMIT')!='1' or os.environ.get('CONFIRM')!=token:
     print('REFUSED: requires COMMIT=1 CONFIRM="%s" and typed confirmation'%token,file=sys.stderr); return 2
@@ -1040,7 +1041,7 @@ if __name__=='__main__': raise SystemExit(main())
 '''
 
 _INSTALL_RUNNER = r'''#!/usr/bin/env python3
-"""Standalone runner reusing bundled validated GPT-B flash gates."""
+"""Standalone runner reusing bundled legacy GPT-B flash gates."""
 import argparse,fcntl,hashlib,json,os,re,shutil,stat,sys,tempfile,shlex
 from pathlib import Path
 # __STANDALONE_SNAPSHOT__
@@ -1072,7 +1073,7 @@ def acquire_lock(path):
   os.close(fd); raise RuntimeError('another package operation is active; no write was attempted')
  return fd
 def main():
- p=argparse.ArgumentParser(description='Portable GPT-B install via the bundled OpenStick flash gates')
+ p=argparse.ArgumentParser(description='Portable legacy GPT-B install via the bundled OpenStick flash gates. UNVALIDATED on hardware; writes require the normal typed flash confirmation.')
  p.add_argument('--edl',required=True); p.add_argument('--loader',required=True); p.add_argument('--device',required=True)
  p.add_argument('--state-dir',required=True); p.add_argument('--dry-run',action='store_true'); p.add_argument('--reconcile-state',action='store_true')
  a=p.parse_args(); root=Path(__file__).resolve().parents[1]; checked_package=checked(root)
@@ -1084,12 +1085,13 @@ def main():
   print('REFUSED: external Firehose loader is missing or hash mismatched',file=sys.stderr); return 2
  if (root/'payload/external/firehose-loader.sha256').read_text().strip()!=m['external_dependencies']['firehose_loader_sha256']:
   print('REFUSED: package loader dependency metadata mismatch',file=sys.stderr); return 2
+ print('WARNING: packaged install scripts are UNVALIDATED on hardware.')
  backup=root/'payload/backup'; bm=json.loads((backup/'manifest.json').read_text());
  if bm.get('sha256')!=m.get('required_backup_sha256') or bm.get('device_id','').lower()!=a.device.lower() or sha(backup/'emmc-full.bin')!=bm.get('sha256'):
   print('REFUSED: matching verified full backup is unavailable or invalid',file=sys.stderr); return 2
  image=root/'payload/image-set'; im=json.loads((image/'manifest.json').read_text())
  if im.get('format')!='openstick-gpt-b-image-set' or im.get('board')!=m.get('board') or sha(image/'manifest.json')!=m.get('image_set_manifest_sha256'):
-  print('REFUSED: unsupported or mismatched GPT-B image-set manifest',file=sys.stderr); return 2
+  print('REFUSED: unsupported or mismatched legacy GPT-B image-set manifest',file=sys.stderr); return 2
  runtime=root/'scripts/runtime'; sys.dont_write_bytecode=True; os.environ['PYTHONDONTWRITEBYTECODE']='1'; sys.path.insert(0,str(runtime))
  try:
   lock_fd=acquire_lock(Path(a.state_dir).expanduser()/'.openstick-package-install.lock')
@@ -1135,7 +1137,7 @@ if __name__=='__main__': raise SystemExit(main())
 
 
 def _build_archive(destination, package_type, metadata, staging):
-    (staging / "README.txt").write_text("SENSITIVE OpenStick package. Keep private and retain an offline copy.\nPackage contents are data and scripts; verify before use. Verification never executes content.\n", encoding="utf-8")
+    (staging / "README.txt").write_text("SENSITIVE OpenStick package. Keep private and retain an offline copy.\nPackage contents are data and scripts; verify before use. Verification never executes content.\nWARNING: Packaged install and restore scripts are UNVALIDATED on hardware. Destructive writes require the normal typed flash or restore confirmation.\n", encoding="utf-8")
     files = {}
     for path in sorted(staging.rglob("*")):
         rel = path.relative_to(staging).as_posix()
@@ -1266,7 +1268,7 @@ def _create_restore(home, device, backup, output):
             os.chmod(transition_path, 0o600)
             meta["transition_state"] = transition
             meta["transition_manifest_sha256"] = _sha(transition_path)
-            meta["guarantee"] += "; verified GPT-B Path A transition fingerprints included"
+            meta["guarantee"] += "; verified legacy GPT-B Path A transition fingerprints included"
         result = _build_archive(output, "restore", meta, staging)
         return result
     finally:
@@ -1281,10 +1283,10 @@ def _create_install(home, device, image_set, backup, output):
     if root.is_symlink() or store._has_symlink_component(root) or store._inside_git(root):
         raise store.RefusedError("image-set path is unsafe or inside a Git worktree")
     # flash-board first-install accepts Android sparse boot.bin/rootfs.bin for
-    # GPT-B. Current M4 boot.img + userdata rootfs.img is a different GPT-T set.
+    # legacy GPT-B. Current M4 boot.img + userdata rootfs.img is a different GPT-T set.
     required = (root / ("files-" + str(device.get("board")))).resolve()
     if (root / "build.json").is_file() or (root / "boot.img").is_file() or (root / "rootfs.img").is_file():
-        raise store.RefusedError("M4 boot.img/rootfs.img output is GPT-T and incompatible with first-install's GPT-B sparse boot.bin/rootfs.bin consumer")
+        raise store.RefusedError("M4 boot.img/rootfs.img output is GPT-T and incompatible with first-install's legacy GPT-B sparse boot.bin/rootfs.bin consumer")
     files = required
     if files.parent != root.resolve() or files.is_symlink() or not files.is_dir():
         raise store.RefusedError("image set lacks the exact files-<board> first-install layout")
@@ -1298,7 +1300,7 @@ def _create_install(home, device, image_set, backup, output):
               "files-" + board + "/SHA256SUMS", "fw/layout-" + board + ".env",
               "loader/prog_emmc_firehose_8916.mbn"}
     if not needed.issubset(checked):
-        raise store.RefusedError("MISSING_INPUTS: complete GPT-B images, layout and pinned loader are required")
+        raise store.RefusedError("MISSING_INPUTS: complete legacy GPT-B images, layout and pinned loader are required")
     loader = root / "loader" / "prog_emmc_firehose_8916.mbn"
     if loader.is_symlink() or not loader.is_file() or _sha(loader) != flash_module.common.LOADER_SHA256:
         raise store.RefusedError("MISSING_INPUTS: the pinned Firehose loader is absent or mismatched")
@@ -1410,6 +1412,7 @@ def package_command(args, home, repo):
         _create_restore(home, device, getattr(args, "package_backup", None), output)
     else:
         _create_install(home, device, getattr(args, "package_image_set", None), getattr(args, "package_backup", None), output)
+    print("WARNING: packaged install/restore write scripts are UNVALIDATED on hardware; writes require typed confirmation.")
     print("Created SENSITIVE %s package: %s" % (action, output))
     return 0
 
