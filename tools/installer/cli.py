@@ -103,10 +103,16 @@ def parser():
     restore.add_argument("--backup", dest="restore_backup", metavar="ID")
     restore.add_argument("--reconcile-state", dest="restore_reconcile_state", action="store_true",
                          help="record explicit interactive reconciliation of an interrupted restore; performs no writes")
-    package = subs.add_parser("package", help="create or verify a portable install or restore package")
+    package = subs.add_parser(
+        "package",
+        help="create or verify portable install or restore packages (write scripts UNVALIDATED on hardware)",
+        description="Create or verify portable install or restore packages. write scripts UNVALIDATED on hardware.")
     ps = package.add_subparsers(dest="package_command", required=True)
     for package_type in ("install", "restore"):
-        create = ps.add_parser(package_type, help="create a portable %s package" % package_type)
+        create = ps.add_parser(
+            package_type,
+            help="create a portable %s package; packaged writes are UNVALIDATED on hardware and require typed confirmation" % package_type,
+            description="Create a portable %s package. Packaged writes are UNVALIDATED on hardware and require typed confirmation." % package_type)
         create.set_defaults(package_type=package_type)
         create.add_argument("--device", dest="package_device", metavar="ID")
         create.add_argument("--backup", dest="package_backup", metavar="ID")
