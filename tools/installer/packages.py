@@ -553,22 +553,79 @@ def _write_script(path, content):
 
 _RESTORE_RUNNER_INSPECT = r'''#!/usr/bin/env python3
 """Standalone guarded restore package entrypoint (Python 3 standard library)."""
-import argparse, hashlib, json, os, re, shutil, subprocess, sys, tempfile
+import argparse, hashlib, json, os, re, shlex, shutil, signal, subprocess, sys, tempfile
 from pathlib import Path
-
+PINNED_LOADER_SHA256="959439aa5864685999b713c3ed12ad5fa408149648b670a9a9ef77bcc9dcab14"
+IDENTITY_READ_TIMEOUT_SECONDS=20
+INTERRUPT_GRACE_SECONDS=10
+POWER_CYCLE_HINT='The board may be in a half-open EDL session. Unplug USB for 30 s and reconnect WITHOUT the button, then re-enter EDL.'
 def sha(path):
     h=hashlib.sha256()
     with open(path,'rb') as f:
         for b in iter(lambda:f.read(1024*1024),b''): h.update(b)
     return h.hexdigest()
-
+def resolve_client(requested):
+    directory=os.environ.get('OPENSTICK_EDL_DIR')
+    if directory:
+        root=Path(directory); executable=root/'edl'; script=root/'edl.py'
+        if executable.is_file() and os.access(executable,os.X_OK): return [str(executable.resolve())]
+        if script.is_file(): return [sys.executable,str(script.resolve())]
+        raise RuntimeError('OPENSTICK_EDL_DIR must contain edl or edl.py')
+    candidate=Path(requested) if requested else None
+    if candidate and candidate.is_file():
+        if candidate.suffix=='.py': return [sys.executable,str(candidate.resolve())]
+        if os.access(candidate,os.X_OK): return [str(candidate.resolve())]
+    found=shutil.which(requested or 'edl')
+    if found: return [str(Path(found).resolve())]
+    raise RuntimeError('EDL client unavailable; set OPENSTICK_EDL_DIR or provide an executable path')
+def run_edl(client,operation,loader,timeout,verbose=False,debug=False):
+    cmd=client+operation+['--loader='+str(loader),'--memory=emmc']
+    print('EDL command: '+shlex.join(cmd))
+    p=subprocess.Popen(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+    try: out,err=p.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try: p.send_signal(signal.SIGINT)
+        except ProcessLookupError: pass
+        try: out,err=p.communicate(timeout=INTERRUPT_GRACE_SECONDS)
+        except subprocess.TimeoutExpired:
+            p.terminate()
+            try: out,err=p.communicate(timeout=INTERRUPT_GRACE_SECONDS)
+            except subprocess.TimeoutExpired: raise RuntimeError('EDL client ignored SIGINT and terminate. '+POWER_CYCLE_HINT)
+            raise RuntimeError('EDL client timed out after SIGINT. '+POWER_CYCLE_HINT)
+        raise RuntimeError('EDL client timed out. '+POWER_CYCLE_HINT)
+    if p.returncode:
+        if verbose or debug:
+            tail='\n'.join((out+'\n'+err).splitlines()[-12:])
+            if tail: print('EDL client output (last lines):\n'+tail,file=sys.stderr)
+        raise RuntimeError('EDL client exited unsuccessfully. Hint: verify EDL mode, USB connection, and pinned loader. '+POWER_CYCLE_HINT)
+    return out,err
+def parse_sahara(text):
+    serial=re.search(r'(?m)^Serial:\s*0x([0-9a-fA-F]{8,16})\s*$',text)
+    hwid=re.search(r'(?m)^HWID:\s*0x([0-9a-fA-F]{8,16})(?:\s|$)',text)
+    pk=re.search(r'(?m)^PK_HASH:\s*0x([0-9a-fA-F]{64})\s*$',text)
+    if not (serial and hwid and pk): raise RuntimeError('EDL Sahara identity block is missing or malformed. Hint: verify EDL mode and client compatibility.')
+    return {'serial':serial.group(1).lower(),'hwid':hwid.group(1).lower(),'pk_hash':pk.group(1).lower()}
+def resolve_client(requested=None):
+ directory=os.environ.get('OPENSTICK_EDL_DIR')
+ if directory:
+  root=Path(directory); executable=root/'edl'; script=root/'edl.py'
+  if executable.is_file() and os.access(executable,os.X_OK): return [str(executable.resolve())]
+  if script.is_file(): return [sys.executable,str(script.resolve())]
+  raise RuntimeError('OPENSTICK_EDL_DIR must contain edl or edl.py')
+ candidate=Path(requested) if requested else None
+ if candidate and candidate.is_file():
+  if candidate.suffix=='.py': return [sys.executable,str(candidate.resolve())]
+  if os.access(candidate,os.X_OK): return [str(candidate.resolve())]
+ found=shutil.which(requested or 'edl')
+ if found: return [str(Path(found).resolve())]
+ raise RuntimeError('EDL client unavailable; set OPENSTICK_EDL_DIR or provide an executable path')
 def main():
     p=argparse.ArgumentParser(description='Offline verified OpenStick restore package')
-    p.add_argument('--edl', default='edl', help='explicit EDL client executable')
+    p.add_argument('--edl', help='explicit EDL client executable')
+    p.add_argument('--loader', required=True, help='pinned Firehose loader')
     p.add_argument('--device', required=True, help='expected live EDL serial')
-    p.add_argument('--dry-run', action='store_true')
-    p.add_argument('--phase', choices=('inspect','restore'), default='inspect')
-    p.add_argument('--confirm', default='')
+    p.add_argument('--dry-run', action='store_true'); p.add_argument('--verbose',action='store_true'); p.add_argument('--debug',action='store_true')
+    p.add_argument('--phase', choices=('inspect','restore'), default='inspect'); p.add_argument('--confirm', default='')
     a=p.parse_args(); root=Path(__file__).resolve().parents[1]
     package=json.loads((root/'manifest.json').read_text())
     if package.get('format')!='ostpkg' or package.get('package_type')!='restore' or package.get('sensitive') is not True:
@@ -589,14 +646,21 @@ def main():
         print('REFUSED: packaged full-disk backup hash or size mismatch',file=sys.stderr); return 2
     if not re.fullmatch('[0-9a-fA-F]{8,64}',a.device) or a.device.lower()!=m['device_id'].lower():
         print('REFUSED: expected package device identity does not match',file=sys.stderr); return 2
+    loader=Path(a.loader).absolute()
+    expected=package.get('external_dependencies',{}).get('firehose_loader_sha256',PINNED_LOADER_SHA256)
+    if loader.is_symlink() or not loader.is_file() or sha(loader)!=expected:
+        print('REFUSED: external Firehose loader is missing or hash mismatched',file=sys.stderr); return 2
+    loader=loader.resolve(strict=True)
     try:
-        result=subprocess.run([a.edl,'getstorageinfo'],capture_output=True,text=True,timeout=30)
-        text=result.stdout+'\n'+result.stderr
-        match=re.search(r'serial\s*=\s*([0-9a-fA-F]+)',text)
-        if result.returncode or not match or match.group(1).lower()!=m['device_id'].lower():
-            print('REFUSED: live EDL serial mismatch or unavailable',file=sys.stderr); return 2
-    except (OSError,subprocess.TimeoutExpired):
-        print('REFUSED: EDL identity could not be read',file=sys.stderr); return 2
+        client=resolve_client(a.edl)
+        with tempfile.TemporaryDirectory(prefix='openstick-package-inspect-') as td:
+            target=Path(td)/'primary-gpt.bin'
+            out,err=run_edl(client,['rs','0','34',str(target)],loader,IDENTITY_READ_TIMEOUT_SECONDS,a.verbose,a.debug)
+            if not target.is_file() or target.stat().st_size!=34*512: raise RuntimeError('primary GPT identity range was incomplete')
+            identity=parse_sahara(out+'\n'+err)
+            if identity['serial']!=m['device_id'].lower(): raise RuntimeError('live EDL serial mismatch')
+    except (OSError,RuntimeError) as exc:
+        print('REFUSED: '+str(exc),file=sys.stderr); return 2
     if a.phase=='inspect':
         print('PASS: package hash, backup identity, and live EDL serial verified; read-only inspect only')
         print('Restore is not enabled by this package runner; use the reviewed OpenStick restore integration.')
@@ -730,26 +794,81 @@ def _snapshot_package(source,expected_type):
 
 _RESTORE_RUNNER = r'''#!/usr/bin/env python3
 """Standalone phased restore package. Python 3 stdlib plus pinned external tools."""
-import argparse,fcntl,hashlib,json,os,re,shutil,stat,subprocess,sys,tempfile,time
+import argparse,fcntl,hashlib,json,os,re,shutil,signal,stat,subprocess,sys,tempfile,time,shlex
 from pathlib import Path
 # __STANDALONE_SNAPSHOT__
 PINNED_LOADER_SHA256="959439aa5864685999b713c3ed12ad5fa408149648b670a9a9ef77bcc9dcab14"
 CHUNK=1024*1024
+IDENTITY_READ_TIMEOUT_SECONDS=20
+RANGE_READ_TIMEOUT_SECONDS=120
+FULL_READ_TIMEOUT_SECONDS=3600
+WRITE_TIMEOUT_SECONDS=600
+INTERRUPT_GRACE_SECONDS=10
+POWER_CYCLE_HINT='The board may be in a half-open EDL session. Unplug USB for 30 s and reconnect WITHOUT the button, then re-enter EDL.'
+EDL_CLIENT=[]; EDL_LOADER=None; VERBOSE=False; DEBUG=False
 def sha(p):
  h=hashlib.sha256()
  with open(p,'rb') as f:
   for b in iter(lambda:f.read(CHUNK),b''): h.update(b)
  return h.hexdigest()
 def call(cmd,timeout=300): return subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,timeout=timeout)
+def resolve_client(requested=None):
+ directory=os.environ.get('OPENSTICK_EDL_DIR')
+ if directory:
+  root=Path(directory); executable=root/'edl'; script=root/'edl.py'
+  if executable.is_file() and os.access(executable,os.X_OK): return [str(executable.resolve())]
+  if script.is_file(): return [sys.executable,str(script.resolve())]
+  raise RuntimeError('OPENSTICK_EDL_DIR must contain edl or edl.py')
+ candidate=Path(requested) if requested else None
+ if candidate and candidate.is_file():
+  if candidate.suffix=='.py': return [sys.executable,str(candidate.resolve())]
+  if os.access(candidate,os.X_OK): return [str(candidate.resolve())]
+ found=shutil.which(requested or 'edl')
+ if found: return [str(Path(found).resolve())]
+ raise RuntimeError('EDL client unavailable; set OPENSTICK_EDL_DIR or provide an executable path')
+def edl_call(operation,timeout=300,allow_failure=False):
+ cmd=EDL_CLIENT+operation+['--loader='+str(EDL_LOADER),'--memory=emmc']
+ print('EDL command: '+shlex.join(cmd))
+ p=subprocess.Popen(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,start_new_session=True)
+ try: out,err=p.communicate(timeout=timeout)
+ except subprocess.TimeoutExpired:
+  try: os.killpg(p.pid,signal.SIGINT)
+  except ProcessLookupError: pass
+  try: out,err=p.communicate(timeout=INTERRUPT_GRACE_SECONDS)
+  except subprocess.TimeoutExpired:
+   try: os.killpg(p.pid,signal.SIGTERM)
+   except ProcessLookupError: pass
+   try: out,err=p.communicate(timeout=INTERRUPT_GRACE_SECONDS)
+   except subprocess.TimeoutExpired: raise RuntimeError('EDL client ignored SIGINT and terminate. '+POWER_CYCLE_HINT)
+   raise RuntimeError('EDL client timed out after SIGINT. '+POWER_CYCLE_HINT)
+  raise RuntimeError('EDL client timed out. '+POWER_CYCLE_HINT)
+ if p.returncode:
+  if VERBOSE or DEBUG:
+   tail='\n'.join((out+'\n'+err).splitlines()[-12:])
+   if tail: print('EDL client output (last lines):\n'+tail,file=sys.stderr)
+  if not allow_failure:
+   raise RuntimeError('EDL client exited unsuccessfully. Hint: verify EDL mode, USB connection, and pinned loader. '+POWER_CYCLE_HINT)
+ return subprocess.CompletedProcess(cmd,p.returncode,out,err)
+def parse_sahara(text):
+ serial=re.search(r'(?m)^Serial:\s*0x([0-9a-fA-F]{8,16})\s*$',text)
+ hwid=re.search(r'(?m)^HWID:\s*0x([0-9a-fA-F]{8,16})(?:\s|$)',text)
+ pk=re.search(r'(?m)^PK_HASH:\s*0x([0-9a-fA-F]{64})\s*$',text)
+ if not (serial and hwid and pk): raise RuntimeError('EDL Sahara identity block is missing or malformed. Hint: verify EDL mode and client compatibility.')
+ return {'serial':serial.group(1).lower(),'hwid':hwid.group(1).lower(),'pk_hash':pk.group(1).lower()}
+def read_identity(directory,expected_id):
+ target=Path(directory)/'identity-primary-gpt.bin'
+ result=edl_call(['rs','0','34',str(target)],IDENTITY_READ_TIMEOUT_SECONDS)
+ if not target.is_file() or target.stat().st_size!=34*512: raise RuntimeError('EDL primary GPT identity range was incomplete. Hint: verify EDL mode and reconnect USB.')
+ identity=parse_sahara(result.stdout+'\n'+result.stderr)
+ if expected_id and identity['serial']!=expected_id.lower(): raise RuntimeError('live EDL serial mismatch. Hint: reconnect the intended board in EDL mode.')
+ return identity
 def read_range(edl,loader,start,count,path):
- r=call([edl,'rs',str(start),str(count),str(path),'--loader='+str(loader),'--memory=emmc'],120)
+ r=edl_call(['rs',str(start),str(count),str(path)],RANGE_READ_TIMEOUT_SECONDS)
  if r.returncode or not Path(path).is_file() or Path(path).stat().st_size!=count*512: raise RuntimeError('live EDL range read failed')
  return sha(path)
 def live_state(edl,loader,m,p,payload,work,completed,origin=None):
  if origin not in (None,'target','backup'): raise RuntimeError('restore GPT origin is unknown')
- info=call([edl,'getstorageinfo'],30)
- match=re.search(r'serial\s*=\s*([0-9a-fA-F]+)',info.stdout+'\n'+info.stderr)
- if info.returncode or not match or match.group(1).lower()!=m['device_id'].lower(): raise RuntimeError('live EDL serial mismatch')
+ read_identity(work,m['device_id'])
  for name in ('fsg','sec','fsc'):
   part=m['partitions'][name]
   got=read_range(edl,loader,int(part['start_lba']),int(part['end_lba'])-int(part['start_lba'])+1,work/('gate-'+name+'.bin'))
@@ -882,8 +1001,9 @@ def package_ok(root):
  except (OSError,ValueError,KeyError,TypeError,RuntimeError): return None
 def main():
  ap=argparse.ArgumentParser(description='Portable, fail-closed phased restore from a complete verified backup. UNVALIDATED on hardware; writes require the normal typed restore confirmation.')
- ap.add_argument('--edl',required=True); ap.add_argument('--loader',required=True); ap.add_argument('--device',required=True)
+ ap.add_argument('--edl'); ap.add_argument('--loader',required=True); ap.add_argument('--device',required=True)
  ap.add_argument('--phase',default='inspect'); ap.add_argument('--dry-run',action='store_true'); ap.add_argument('--state')
+ ap.add_argument('--verbose',action='store_true'); ap.add_argument('--debug',action='store_true')
  a=ap.parse_args(); root=Path(__file__).resolve().parents[1]; checked=package_ok(root)
  if not checked: print('REFUSED: package integrity failed',file=sys.stderr); return 2
  root,p=checked
@@ -891,21 +1011,23 @@ def main():
  if p.get('device_id','').lower()!=m.get('device_id','').lower() or p.get('backup_sha256')!=m.get('sha256') or p.get('full_disk_bytes')!=m.get('size') or sha(disk)!=m.get('sha256') or disk.stat().st_size!=m.get('size'):
   print('REFUSED: complete backup integrity/identity mismatch',file=sys.stderr); return 2
  if a.device.lower()!=m['device_id'].lower(): print('REFUSED: selected device mismatch',file=sys.stderr); return 2
- loader=Path(a.loader)
+ loader=Path(a.loader).absolute()
  if loader.is_symlink() or not loader.is_file() or sha(loader)!=PINNED_LOADER_SHA256:
   print('REFUSED: Firehose loader missing or not pinned SHA-256',file=sys.stderr); return 2
+ loader=loader.resolve(strict=True)
  state=Path.home()/('.local/state/openstick/restore-'+m['device_id']+'-'+m['sha256']+'.json')
  if a.state and Path(a.state).expanduser().absolute()!=state.absolute():
   print('REFUSED: restore state path is pinned per device and backup; alternate state files cannot authorize a retry',file=sys.stderr); return 2
  lock_fd=None
+ global EDL_CLIENT, EDL_LOADER, VERBOSE, DEBUG
+ try: EDL_CLIENT=resolve_client(a.edl)
+ except RuntimeError as exc: print('REFUSED: '+str(exc),file=sys.stderr); return 2
+ EDL_LOADER=loader; VERBOSE=a.verbose; DEBUG=a.debug
  try:
   with tempfile.TemporaryDirectory(prefix='ostpkg-restore-') as td:
    work=Path(td); os.chmod(work,0o700); live=work/'live-emmc.bin'
-   info=call([a.edl,'getstorageinfo'],30)
-   match=re.search(r'serial\s*=\s*([0-9a-fA-F]+)',info.stdout+'\n'+info.stderr)
-   if info.returncode or not match or match.group(1).lower()!=m['device_id'].lower():
-    print('REFUSED: live EDL serial mismatch/unavailable',file=sys.stderr); return 2
-   read=call([a.edl,'rf',str(live),'--loader='+str(loader),'--memory=emmc'],600)
+   read_identity(work,m['device_id'])
+   read=edl_call(['rf',str(live)],FULL_READ_TIMEOUT_SECONDS)
    if read.returncode or not live.is_file() or live.stat().st_size!=m['size']:
     print('REFUSED: live full-disk identity read unavailable or wrong-sized',file=sys.stderr); return 2
    for name in ('fsg','sec','fsc'):
@@ -921,7 +1043,7 @@ def main():
     if h.hexdigest()!=m['identity'].get(name): print('REFUSED: live '+name+' fingerprint mismatch',file=sys.stderr); return 2
    planner=[sys.executable,'-I',str(payload/'rollback-plan.py'),'--dump',str(disk),'--csv',str(payload/'partitions.csv'),
     '--primary',str(payload/'gpt-primary.bin'),'--secondary',str(payload/'gpt-secondary.bin'),'--emmc',str(m['sectors']),
-    '--dump-sha',m['sha256'],'--work',str(work),'--loader',str(loader),'--edl',a.edl]
+    '--dump-sha',m['sha256'],'--work',str(work),'--loader',str(loader),'--edl',EDL_CLIENT[-1]]
    plan=call(planner,300)
    if plan.returncode: print('REFUSED: bundled rollback planner rejected backup',file=sys.stderr); return 2
    rows=[]
@@ -979,7 +1101,7 @@ def main():
    if a.phase=='final':
     if completed!=ordered:
      print('REFUSED: final exact-hash check requires every planned restore phase to be completed',file=sys.stderr); return 2
-    final=work/'final-emmc.bin'; r=call([a.edl,'rf',str(final),'--loader='+str(loader),'--memory=emmc'],600)
+    final=work/'final-emmc.bin'; r=edl_call(['rf',str(final)],FULL_READ_TIMEOUT_SECONDS,allow_failure=True)
     if r.returncode or not final.is_file() or final.stat().st_size!=m['size'] or sha(final)!=m['sha256']:
      state_data.update({'status':'failed-verify','phase':'final','at':int(time.time())}); atomic(state,state_data)
      print('VERIFY FAILED: complete full-disk readback differs. Do not boot.',file=sys.stderr); return 3
@@ -998,9 +1120,8 @@ def main():
      dst.write(b); left-=len(b)
     dst.flush(); os.fsync(dst.fileno())
    os.chmod(slice_path,0o600)
-   cmd=[a.edl,'ws',str(row['start']),str(slice_path),'--sectorsize=512','--loader='+str(loader),'--memory=emmc']
-   dry=call(cmd[:4]+['--skipwrite']+cmd[4:])
-   if dry.returncode: print('REFUSED: EDL dry-run failed; no write occurred',file=sys.stderr); return 2
+   cmd=['ws',str(row['start']),str(slice_path),'--sectorsize=512']
+   dry=edl_call(cmd+['--skipwrite'],RANGE_READ_TIMEOUT_SECONDS)
    token='restore %s %s'%(m['device_id'][-8:],a.phase)
    print('Phase %s at LBA %d for %d sectors; source SHA-256 %s'%(a.phase,row['start'],row['count'],sha(slice_path)))
    print('WARNING: packaged restore scripts are UNVALIDATED on hardware.')
@@ -1015,17 +1136,20 @@ def main():
    except (OSError,ValueError,KeyError,RuntimeError,subprocess.TimeoutExpired) as e:
     print('REFUSED: live identity/firmware/GPT changed before destructive phase: '+str(e),file=sys.stderr); return 2
    state_data.update({'status':'write-started','phase':a.phase,'at':int(time.time())}); atomic(state,state_data)
-   written=call(cmd,600)
+   try: written=edl_call(cmd,WRITE_TIMEOUT_SECONDS,allow_failure=True)
+   except RuntimeError as e:
+    state_data.update({'status':'interrupted','at':int(time.time())}); atomic(state,state_data)
+    print('REFUSED: '+str(e)+' The write state is unresolved and this phase will not be retried.',file=sys.stderr); return 2
    if written.returncode:
     state_data.update({'status':'interrupted','at':int(time.time())}); atomic(state,state_data)
     print('REFUSED: write failed; state is unresolved and this phase will not be retried',file=sys.stderr); return 2
-   rb=work/'readback.bin'; rr=call([a.edl,'rs',str(row['start']),str(row['count']),str(rb),'--loader='+str(loader),'--memory=emmc'],600)
+   rb=work/'readback.bin'; rr=edl_call(['rs',str(row['start']),str(row['count']),str(rb)],RANGE_READ_TIMEOUT_SECONDS,allow_failure=True)
    if rr.returncode or not rb.is_file() or sha(rb)!=sha(slice_path):
     state_data.update({'status':'failed-write','at':int(time.time())}); atomic(state,state_data)
     print('REFUSED: phase readback failed; state is unresolved',file=sys.stderr); return 2
    state_data.setdefault('completed',[]).append(a.phase); state_data.update({'status':'ready','phase':a.phase,'at':int(time.time())}); atomic(state,state_data)
    if all(r['name'] in state_data['completed'] for r in rows):
-    final=work/'final-emmc.bin'; r=call([a.edl,'rf',str(final),'--loader='+str(loader),'--memory=emmc'],600)
+    final=work/'final-emmc.bin'; r=edl_call(['rf',str(final)],FULL_READ_TIMEOUT_SECONDS,allow_failure=True)
     if r.returncode or not final.is_file() or final.stat().st_size!=m['size'] or sha(final)!=m['sha256']:
      state_data.update({'status':'failed-verify','phase':'final','at':int(time.time())}); atomic(state,state_data)
      print('VERIFY FAILED: complete full-disk readback differs. Do not boot.',file=sys.stderr); return 3
@@ -1116,14 +1240,20 @@ def main():
     # Adapt the existing wrapper's documented `sudo .venv/bin/python edl/edl.py`
     # call to the explicit external client. No source checkout is consulted.
     tool=Path(a.edl).absolute()
+    if not tool.is_file() or (tool.suffix!='.py' and not os.access(tool,os.X_OK)):
+     print('REFUSED: live EDL client unavailable; provide an executable or Python script path',file=sys.stderr); return 2
     vpython=work/'.venv/bin/python'; vpython.parent.mkdir(mode=0o700,parents=True)
-    quoted=shlex.quote(str(tool))
+    edl_prefix=([sys.executable,str(tool)] if tool.suffix=='.py' else [str(tool)])
+    quoted=shlex.join(edl_prefix)
     vpython.write_text('#!/bin/sh\n[ "${1:-}" = edl/edl.py ] && shift\nexec '+quoted+' "$@"\n'); os.chmod(vpython,0o700)
-    (work/'edl').mkdir(mode=0o700); (work/'edl/edl.py').write_text('# external EDL adapter is the adjacent .venv/bin/python shim\n')
+    edl_dir=work/'edl'; edl_dir.mkdir(mode=0o700)
+    shutil.copyfile(loader,edl_dir/'prog_emmc_firehose_8916.mbn'); os.chmod(edl_dir/'prog_emmc_firehose_8916.mbn',0o600)
+    (edl_dir/'edl.py').write_text('# external EDL adapter is the adjacent .venv/bin/python shim\n')
     bindir=work/'bin'; bindir.mkdir(mode=0o700)
-    edlshim=bindir/'edl'; edlshim.write_text('#!/bin/sh\nexec '+quoted+' "$@"\n'); os.chmod(edlshim,0o700)
+    edlshim=edl_dir/'edl'; edlshim.write_text('#!/bin/sh\nexec '+quoted+' "$@"\n'); os.chmod(edlshim,0o700)
     os.environ['PATH']=str(bindir)+os.pathsep+str(tool.parent)+os.pathsep+os.environ.get('PATH','/usr/bin:/bin')
     os.environ['OPENSTICK_ROOT']=str(runtime)
+    os.environ['OPENSTICK_EDL_DIR']=str(edl_dir)
     os.chdir(work)
     args=type('Args',(),{'flash_device':m['device_id'],'image_set':str(staged),'board':m['board'],
       'i_accept_untested':False,'dry_run':a.dry_run,'reconcile_state':a.reconcile_state})()
@@ -1358,6 +1488,12 @@ def _create_install(home, device, image_set, backup, output):
             flash_module.common.LOADER_SHA256)
         bundled_cli.write_text(cli_text, encoding="utf-8")
         os.chmod(bundled_cli, 0o500)
+        bundled_edl_runner = runtime / "tools/installer/edl_runner.py"
+        runner_text = bundled_edl_runner.read_text(encoding="utf-8").replace(
+            "959439aa5864685999b713c3ed12ad5fa408149648b670a9a9ef77bcc9dcab14",
+            flash_module.common.LOADER_SHA256)
+        bundled_edl_runner.write_text(runner_text, encoding="utf-8")
+        os.chmod(bundled_edl_runner, 0o500)
         for rel in ("tools/flash/flash-board.sh", "tools/pathA/pathA-flash.sh", "tools/pathA/fwlib.sh",
                     "tools/pathA/pathA-rollback.sh", "scripts/common.sh", "config/defaults.env",
                     "boards/" + board + "/board.env"):
@@ -1375,7 +1511,7 @@ def _create_install(home, device, image_set, backup, output):
                     "image_set_manifest_sha256": _sha(manifest_path),
                     "external_dependencies": {"firehose_loader_sha256": flash_module.common.LOADER_SHA256,
                                                "edl_client": "explicit executable path supplied at install time",
-                                               "sudo": "required by the existing EDL shell engine", "fastboot": "existing helper prerequisite",
+                                               "sudo": "not used by the installer EDL client; device access follows installed udev permissions", "fastboot": "existing helper prerequisite",
                                                "simg2img": "existing first-install prerequisite", "python3": "3.9+ standard library", "bash": "Path A"},
                     "firmware_provenance": "source image-set attests redistribution authorization"}
         _build_archive(output, "install", metadata, staging)

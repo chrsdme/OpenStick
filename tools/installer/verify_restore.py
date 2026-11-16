@@ -8,6 +8,8 @@ import hashlib
 import json
 import os
 import re
+import shlex
+import signal
 import shutil
 import shlex
 import stat
@@ -18,13 +20,17 @@ import time
 from pathlib import Path
 
 from . import cli as common
+from . import edl_runner
 from . import store
 
 
 IDENTITY = ("fsg", "sec", "fsc")
-INITIAL_FULL_READ_TIMEOUT_SECONDS = 300
-FINAL_FULL_READ_TIMEOUT_SECONDS = 600
+INITIAL_FULL_READ_TIMEOUT_SECONDS = edl_runner.FULL_READ_TIMEOUT_SECONDS
+FINAL_FULL_READ_TIMEOUT_SECONDS = edl_runner.FULL_READ_TIMEOUT_SECONDS
 EDL_COMMAND_TIMEOUT_SECONDS = 600
+IDENTITY_READ_TIMEOUT_SECONDS = edl_runner.IDENTITY_READ_TIMEOUT_SECONDS
+RANGE_READ_TIMEOUT_SECONDS = edl_runner.RANGE_READ_TIMEOUT_SECONDS
+ROLLBACK_ENGINE_TIMEOUT_SECONDS = 900
 RESTORE_ORDER = ("userdata", "cache", "persist", "boot", "modemst1", "modemst2",
                  "sbl1", "rpm", "tz", "tzbak", "hyp", "aboot")
 PLAN_PHASES = ("pad",) + RESTORE_ORDER + ("gpt-secondary", "gpt-primary")
@@ -49,6 +55,10 @@ def _sha(path):
         for block in iter(lambda: stream.read(8 * 1024 * 1024), b""):
             h.update(block)
     return h.hexdigest()
+
+
+def _edl_verbose(env):
+    return env.get("OPENSTICK_EDL_VERBOSE") == "1", env.get("OPENSTICK_EDL_DEBUG") == "1"
 
 
 def _safe_host(value):
@@ -240,35 +250,43 @@ def _parse_plan(plan, planner_dir, manifest, parsed):
 
 
 def _live(edl, env, loader, directory, expected_id):
-    info = subprocess.run([edl, "getstorageinfo"], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                          text=True, env=env, timeout=30)
-    match = re.search(r"serial\s*=\s*([0-9a-fA-F]+)", info.stdout + "\n" + info.stderr)
-    if info.returncode or not match:
-        raise store.RefusedError("live EDL serial unavailable")
+    verbose, debug = _edl_verbose(env)
+    identity_path = directory / "live-primary-gpt.bin"
+    info = edl_runner.run(["rs", "0", "34", str(identity_path)],
+                          timeout=IDENTITY_READ_TIMEOUT_SECONDS, env=env,
+                          client=edl, loader=loader, verbose=verbose, debug=debug)
+    if not identity_path.is_file() or identity_path.stat().st_size != 34 * 512:
+        raise store.RefusedError("live EDL primary GPT identity read was incomplete; hint: check EDL mode and USB before retrying")
+    identity = edl_runner.parse_sahara_info(info.stdout + "\n" + info.stderr)
     dump = directory / "live-before.bin"
-    read = subprocess.run([edl, "rf", str(dump), "--loader=" + str(loader), "--memory=emmc"], stdout=subprocess.PIPE,
-                          stderr=subprocess.PIPE, env=env, timeout=INITIAL_FULL_READ_TIMEOUT_SECONDS)
-    if read.returncode or not dump.is_file() or dump.stat().st_size % 512:
+    edl_runner.run(["rf", str(dump)], timeout=INITIAL_FULL_READ_TIMEOUT_SECONDS,
+                   env=env, client=edl, loader=loader, verbose=verbose, debug=debug)
+    if not dump.is_file() or dump.stat().st_size % 512:
         raise store.RefusedError("live EDL full-disk read failed")
     parts = common._parse_gpt(dump)
     fingerprints = {name: common._hash_range(dump, *parts[name]) for name in IDENTITY}
-    return match.group(1).lower(), fingerprints, dump, parts
+    return identity["serial"], fingerprints, dump, parts
 
 
 def _live_identity_only(edl, env, loader, directory, expected_id, parsed, expected):
-    info = subprocess.run([edl, "getstorageinfo"], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                          text=True, env=env, timeout=30)
-    match = re.search(r"serial\s*=\s*([0-9a-fA-F]+)", info.stdout + "\n" + info.stderr)
-    if info.returncode or not match or match.group(1).lower() != expected_id:
+    verbose, debug = _edl_verbose(env)
+    identity_path = directory / "identity-primary-gpt.bin"
+    info = edl_runner.run(["rs", "0", "34", str(identity_path)],
+                          timeout=IDENTITY_READ_TIMEOUT_SECONDS, env=env,
+                          client=edl, loader=loader, verbose=verbose, debug=debug)
+    if not identity_path.is_file() or identity_path.stat().st_size != 34 * 512:
+        raise store.RefusedError("live EDL identity range read was incomplete")
+    identity = edl_runner.parse_sahara_info(info.stdout + "\n" + info.stderr)
+    if identity["serial"] != expected_id:
         raise store.RefusedError("live EDL serial changed before destructive phase")
     observed = {}
     for name in IDENTITY:
         start, end = parsed[name]
         target = directory / ("identity-" + name + ".bin")
-        read = subprocess.run([edl, "rs", str(start), str(end - start + 1), str(target),
-                               "--loader=" + str(loader), "--memory=emmc"],
-                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, timeout=120)
-        if read.returncode or not target.is_file() or target.stat().st_size != (end - start + 1) * 512:
+        edl_runner.run(["rs", str(start), str(end - start + 1), str(target)],
+                       timeout=RANGE_READ_TIMEOUT_SECONDS, env=env, client=edl, loader=loader,
+                       verbose=verbose, debug=debug)
+        if not target.is_file() or target.stat().st_size != (end - start + 1) * 512:
             raise store.RefusedError("live EDL identity partition read failed")
         observed[name] = _sha(target)
     if observed != expected:
@@ -435,19 +453,20 @@ def restore_command(args, home, repo):
             raise store.RefusedError("restore state has an invalid unresolved phase")
         if prior_state.get("backup_sha256") != manifest["sha256"] or prior_state.get("backup_id") != item.get("id"):
             raise store.RefusedError("reconciliation backup differs from the interrupted restore")
-        edl = shutil.which("edl")
-        loader = common._loader_candidate()
-        if not edl or not loader or _sha(loader) != common.LOADER_SHA256:
-            raise store.RefusedError("reconciliation requires the pinned EDL client and Firehose loader")
+        edl = edl_runner.resolve_client()
+        loader = edl_runner.resolve_loader()
         with tempfile.TemporaryDirectory(prefix="openstick-restore-reconcile-") as temp:
             os.chmod(temp, 0o700)
             identity_env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": os.environ.get("HOME", ""),
                             "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"}
+            identity_env["OPENSTICK_EDL_VERBOSE"] = "1" if getattr(args, "verbose", False) else "0"
+            identity_env["OPENSTICK_EDL_DEBUG"] = "1" if getattr(args, "debug", False) else "0"
             _live_identity_only(edl, identity_env, loader, Path(temp), device_id, parsed, manifest["identity"])
             start, end = _phase_span(phase, manifest, parsed)
             readback = Path(temp) / "phase-reconcile.bin"
             _edl(edl, ["rs", str(start), str(end - start + 1), str(readback),
-                       "--loader=" + str(loader), "--memory=emmc"], identity_env)
+                       "--loader=" + str(loader), "--memory=emmc"], identity_env, loader,
+                  )
             if not readback.is_file() or readback.stat().st_size != (end - start + 1) * 512:
                 raise store.RefusedError("read-only phase reconciliation readback failed")
             observed = _sha(readback)
@@ -498,9 +517,7 @@ def restore_command(args, home, repo):
             raise store.RefusedError("an interrupted restore requires manual reconciliation; no phase will be repeated")
         if state.get("backup_sha256") and state.get("backup_sha256") != manifest["sha256"]:
             raise store.RefusedError("restore backup differs from the previously recorded phase state")
-    edl = shutil.which("edl")
-    if not edl:
-        raise store.RefusedError("EDL client unavailable")
+    edl = edl_runner.resolve_client()
     parent = Path(home) / "devices" / device_id
     parent.mkdir(mode=0o700, parents=True, exist_ok=True); os.chmod(parent, 0o700)
     state = {"schema": 1, "device_id": device_id, "backup_id": item["id"],
@@ -514,9 +531,9 @@ def restore_command(args, home, repo):
         engine = _make_fwlib_engine(repo, work / "rollback-engine")
         env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": os.environ.get("HOME", ""),
                "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "PYTHONDONTWRITEBYTECODE": "1"}
-        loader = common._loader_candidate()
-        if not loader or _sha(loader) != common.LOADER_SHA256:
-            raise store.RefusedError("pinned Firehose loader is missing or hash-mismatched")
+        env["OPENSTICK_EDL_VERBOSE"] = "1" if getattr(args, "verbose", False) else "0"
+        env["OPENSTICK_EDL_DEBUG"] = "1" if getattr(args, "debug", False) else "0"
+        loader = edl_runner.resolve_loader()
         serial, live_identity, live_dump, live_parts = _live(edl, env, loader, work, device_id)
         if serial != device_id or live_identity != manifest.get("identity") or live_identity != device.get("identity"):
             raise store.RefusedError("live EDL serial and fsg/sec/fsc fingerprints must match verified backup")
@@ -632,7 +649,8 @@ def _prepare_plan_phase(edl, env, loader, step, backup, manifest, live_dump, wor
         raise store.RefusedError("phase source does not match verified backup")
     if phase == "pad":
         # Gate 0 read -> hash -> dry-run noop -> write same bytes -> readback hash.
-        _edl(edl, ["rs", str(start), str(count), str(work / "pad-current.bin"), "--loader=" + str(loader), "--memory=emmc"], env)
+        _edl(edl, ["rs", str(start), str(count), str(work / "pad-current.bin"), "--loader=" + str(loader), "--memory=emmc"], env, loader,
+             verbose=_edl_verbose(env)[0], debug=_edl_verbose(env)[1])
         if _sha(work / "pad-current.bin") != want:
             raise store.RefusedError("pad pre-write hash mismatch")
     return {"phase": phase, "name": phase, "start": start, "end": end,
@@ -674,15 +692,26 @@ put "$LABEL" "$LBA" "$SECTORS" "$SOURCE" "$MODE"
     return {"directory": directory, "runner": runner}
 
 
-def _run_fwlib_phase(engine, edl, env, loader, prepared, work, write):
+def _run_fwlib_phase(engine, edl, env, loader, prepared, work, write, verbose=False, debug=False):
+    env_verbose, env_debug = _edl_verbose(env)
+    verbose = verbose or env_verbose
+    debug = debug or env_debug
     phase = prepared["phase"]
-    if (not isinstance(edl, str) or not re.fullmatch(r"/[A-Za-z0-9._/-]+", edl)
-            or not Path(edl).is_file() or not os.access(edl, os.X_OK)):
+    try:
+        edl_prefix = [os.fspath(item) for item in edl] if isinstance(edl, (list, tuple)) else shlex.split(edl)
+    except ValueError:
+        edl_prefix = []
+    if (not edl_prefix or any(not Path(item).is_absolute() or not re.fullmatch(r"/[A-Za-z0-9._/-]+", item)
+                              for item in edl_prefix)
+            or (len(edl_prefix) == 1 and (not Path(edl_prefix[0]).is_file() or not os.access(edl_prefix[0], os.X_OK)))
+            or (len(edl_prefix) == 2 and (Path(edl_prefix[0]).resolve() != Path(sys.executable).resolve()
+                                         or not Path(edl_prefix[1]).is_file()))
+            or len(edl_prefix) > 2):
         raise store.RefusedError("EDL client path cannot be safely passed to the existing rollback helper")
     logs = work / "fwlib-logs"; logs.mkdir(mode=0o700, exist_ok=True)
     helper_home = work / "fwlib-home"; helper_home.mkdir(mode=0o700, exist_ok=True)
     child_env = {"PATH": _fwlib_path(), "HOME": str(helper_home), "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8",
-                 "LDR": str(loader), "W": str(logs), "EDL_CMD": edl,
+                 "LDR": str(loader), "W": str(logs), "EDL_CMD": shlex.join(edl_prefix),
                  "PYTHONDONTWRITEBYTECODE": "1"}
     # Never inherit fwlib's test-only loader override from a caller environment.
     child_env.pop("FWLIB_TEST_LDR_SHA", None)
@@ -692,22 +721,59 @@ def _run_fwlib_phase(engine, edl, env, loader, prepared, work, write):
         child_env["CONFIRM"] = "rollback-" + phase
     command = ["/bin/bash", str(engine["runner"]), phase, mode, phase,
                str(prepared["start"]), str(prepared["end"] - prepared["start"] + 1), str(prepared["source"])]
+    print("EDL engine command: " + shlex.join(command))
     try:
-        result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                                env=child_env, timeout=900)
-    except (OSError, subprocess.TimeoutExpired):
-        raise store.RefusedError("existing rollback helper invocation failed")
-    if result.returncode:
-        raise store.RefusedError("existing rollback helper refused or failed phase " + phase)
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                   env=child_env, start_new_session=True)
+        try:
+            stdout, stderr = process.communicate(timeout=ROLLBACK_ENGINE_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process.pid, signal.SIGINT)
+            except ProcessLookupError:
+                pass
+            try:
+                stdout, stderr = process.communicate(timeout=edl_runner.INTERRUPT_GRACE_SECONDS)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(process.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                try:
+                    stdout, stderr = process.communicate(timeout=edl_runner.INTERRUPT_GRACE_SECONDS)
+                except subprocess.TimeoutExpired as exc:
+                    if verbose or debug:
+                        tail = edl_runner._tail(exc.output or "", exc.stderr or "")
+                        if tail:
+                            print("EDL engine output (last lines):\n" + tail, file=sys.stderr)
+                    raise store.RefusedError("rollback EDL engine ignored SIGINT and terminate; " + edl_runner.POWER_CYCLE_HINT) from exc
+                if verbose or debug:
+                    tail = edl_runner._tail(stdout, stderr)
+                    if tail:
+                        print("EDL engine output (last lines):\n" + tail, file=sys.stderr)
+                raise store.RefusedError("rollback EDL engine timed out after SIGINT; " + edl_runner.POWER_CYCLE_HINT)
+            if verbose or debug:
+                tail = edl_runner._tail(stdout, stderr)
+                if tail:
+                    print("EDL engine output (last lines):\n" + tail, file=sys.stderr)
+            raise store.RefusedError("rollback EDL engine timed out; " + edl_runner.POWER_CYCLE_HINT)
+    except OSError as exc:
+        raise store.RefusedError("existing rollback helper invocation failed; hint: verify the EDL client path and retry") from exc
+    if process.returncode:
+        if verbose or debug:
+            tail = edl_runner._tail(stdout, stderr)
+            if tail:
+                print("EDL engine output (last lines):\n" + tail, file=sys.stderr)
+        raise store.RefusedError("existing rollback helper refused or failed phase " + phase + ". Hint: check EDL mode, USB stability, and the phase log before reconciling state.")
 
 
 def _verify_final_disk(edl, env, loader, work, manifest, state):
     final = work / "final-full.bin"
     try:
-        _edl(edl, ["rf", str(final), "--loader=" + str(loader), "--memory=emmc"], env,
-             timeout=FINAL_FULL_READ_TIMEOUT_SECONDS)
+        _edl(edl, ["rf", str(final), "--loader=" + str(loader), "--memory=emmc"], env, loader,
+             timeout=FINAL_FULL_READ_TIMEOUT_SECONDS, verbose=_edl_verbose(env)[0], debug=_edl_verbose(env)[1])
         matched = final.is_file() and final.stat().st_size == manifest["size"] and _sha(final) == manifest["sha256"]
-    except (store.RefusedError, OSError, subprocess.TimeoutExpired):
+    except (store.RefusedError, edl_runner.EdlRunnerError, OSError, subprocess.TimeoutExpired):
         matched = False
     if not matched:
         print("FAIL final full-disk readback failed or SHA-256 mismatched; do not boot", file=sys.stderr)
@@ -716,9 +782,19 @@ def _verify_final_disk(edl, env, loader, work, manifest, state):
     print("PASS final full-disk readback exactly matches the verified backup SHA-256")
 
 
-def _edl(edl, args, env, timeout=EDL_COMMAND_TIMEOUT_SECONDS):
-    result = subprocess.run([edl] + args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                            env=env, timeout=timeout)
-    if result.returncode:
-        raise store.RefusedError("EDL phase command failed; operation stopped")
-    return result
+def _edl(edl, args, env, loader, timeout=EDL_COMMAND_TIMEOUT_SECONDS, verbose=False, debug=False):
+    env_verbose, env_debug = _edl_verbose(env)
+    verbose = verbose or env_verbose
+    debug = debug or env_debug
+    operation = []
+    for item in args:
+        if item.startswith("--loader="):
+            if item != "--loader=" + str(loader):
+                raise store.RefusedError("EDL phase requested a loader different from the verified loader")
+        elif item.startswith("--memory="):
+            if item != "--memory=emmc":
+                raise store.RefusedError("EDL phase requested a non-eMMC memory target")
+        else:
+            operation.append(item)
+    return edl_runner.run(operation, timeout=timeout, env=env, client=edl, loader=loader,
+                          verbose=verbose, debug=debug)

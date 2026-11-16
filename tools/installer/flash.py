@@ -3,6 +3,8 @@ import hashlib
 import json
 import os
 import re
+import shlex
+import signal
 import shutil
 import subprocess
 import sys
@@ -12,12 +14,14 @@ from pathlib import Path
 
 from . import store
 from . import cli as common
+from . import edl_runner
 
 
 PHASES = ("pre", "gpt", "tz", "rpm", "sbl1", "hyp", "aboot", "final", "first-install")
 WRITE_PHASES = PHASES[1:]
 IDENTITY_PARTS = ("fsg", "sec", "fsc")
-IDENTITY_READ_TIMEOUT_SECONDS = 30
+IDENTITY_READ_TIMEOUT_SECONDS = edl_runner.IDENTITY_READ_TIMEOUT_SECONDS
+ENGINE_PHASE_TIMEOUT_SECONDS = 7200
 
 
 def _hash(path):
@@ -51,36 +55,20 @@ def _checked_sum_file(root, filename="SHA256SUMS", require_all=False):
 
 
 def _resolve_edl_command():
-    edl_dir = os.environ.get("OPENSTICK_EDL_DIR")
-    if edl_dir:
-        directory = Path(edl_dir)
-        executable = directory / "edl"
-        script = directory / "edl.py"
-        if executable.is_file() and os.access(executable, os.X_OK):
-            command = [str(executable.resolve())]
-        elif script.is_file():
-            command = [sys.executable, str(script.resolve())]
-        else:
-            raise store.RefusedError("OPENSTICK_EDL_DIR must contain an executable edl or edl.py")
-    else:
-        executable = shutil.which("edl")
-        if not executable:
-            raise store.RefusedError("EDL client not found; set OPENSTICK_EDL_DIR or add edl to PATH")
-        command = [str(Path(executable).resolve())]
-    if any(not re.fullmatch(r"/[A-Za-z0-9._/-]+", item) for item in command):
+    command = edl_runner.resolve_client()
+    if any(not Path(item).is_absolute() or not re.fullmatch(r"/[A-Za-z0-9._/-]+", item) for item in command):
         raise store.RefusedError("EDL command path contains unsupported characters")
     return command
 
 
-def _live_identity(edl_command, env, temp, recorded_parts):
-    result = subprocess.run(edl_command + ["getstorageinfo"], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                            text=True, env=env, timeout=IDENTITY_READ_TIMEOUT_SECONDS)
-    if result.returncode:
-        raise store.RefusedError("could not read live EDL identity")
-    combined = result.stdout + "\n" + result.stderr
-    serial = re.search(r"serial\s*=\s*([0-9a-fA-F]+)", combined)
-    if not serial:
-        raise store.RefusedError("EDL did not report a live device identity")
+def _live_identity(edl_command, loader, env, temp, recorded_parts):
+    gpt_path = Path(temp) / "live-primary-gpt.bin"
+    result = edl_runner.run(["rs", "0", "34", str(gpt_path)],
+                            timeout=edl_runner.IDENTITY_READ_TIMEOUT_SECONDS,
+                            env=env, client=edl_command, loader=loader)
+    if not gpt_path.is_file() or gpt_path.stat().st_size != 34 * 512:
+        raise store.RefusedError("could not read the live primary GPT range. Hint: verify EDL mode and reconnect USB before retrying.")
+    identity = edl_runner.parse_sahara_info(result.stdout + "\n" + result.stderr)
     observed = {}
     for name in IDENTITY_PARTS:
         row = recorded_parts.get(name, {})
@@ -89,13 +77,13 @@ def _live_identity(edl_command, env, temp, recorded_parts):
             raise store.RefusedError("verified backup has invalid identity partition geometry for " + name)
         target = Path(temp) / ("live-identity-" + name + ".bin")
         count = end - start + 1
-        result = subprocess.run(edl_command + ["rs", str(start), str(count), str(target), "--memory=emmc"],
-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env,
-                                timeout=IDENTITY_READ_TIMEOUT_SECONDS)
-        if result.returncode or not target.is_file() or target.stat().st_size != count * 512:
+        edl_runner.run(["rs", str(start), str(count), str(target)],
+                       timeout=edl_runner.RANGE_READ_TIMEOUT_SECONDS, env=env,
+                       client=edl_command, loader=loader)
+        if not target.is_file() or target.stat().st_size != count * 512:
             raise store.RefusedError("could not read live EDL identity partition " + name)
         observed[name] = _hash(target)
-    return serial.group(1).lower(), observed
+    return identity["serial"], observed
 
 
 def _verified_backup(home, device):
@@ -167,7 +155,49 @@ def _invoke(command, env):
     print("Executing: " + " ".join(command))
     if env.get("EDL_CMD"):
         print("EDL command: " + env["EDL_CMD"])
-    return subprocess.run(command, env=env).returncode
+    try:
+        process = subprocess.Popen(command, env=env, start_new_session=True)
+    except OSError as exc:
+        raise store.StoreError("could not start the flash engine. Hint: check the installer files and EDL client path before retrying.") from exc
+
+    def show_tail():
+        if env.get("OPENSTICK_EDL_VERBOSE") != "1" and env.get("OPENSTICK_EDL_DEBUG") != "1":
+            return
+        try:
+            lines = (Path(env.get("W", "")) / "last-edl.log").read_text(
+                encoding="utf-8", errors="replace").splitlines()[-12:]
+            if lines:
+                print("EDL client output (last lines):\n" + "\n".join(lines), file=sys.stderr)
+        except OSError:
+            pass
+
+    try:
+        returncode = process.wait(timeout=ENGINE_PHASE_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGINT)
+        except ProcessLookupError:
+            pass
+        try:
+            returncode = process.wait(timeout=edl_runner.INTERRUPT_GRACE_SECONDS)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                process.wait(timeout=edl_runner.INTERRUPT_GRACE_SECONDS)
+            except subprocess.TimeoutExpired:
+                show_tail()
+                raise store.StoreError("flash engine ignored SIGINT and terminate. " + edl_runner.POWER_CYCLE_HINT)
+            show_tail()
+            raise store.StoreError("flash engine timed out after SIGINT. " + edl_runner.POWER_CYCLE_HINT)
+        show_tail()
+        raise store.StoreError("flash engine timed out. " + edl_runner.POWER_CYCLE_HINT)
+    if returncode:
+        show_tail()
+        print("Hint: check the EDL mode, USB connection, pinned loader, and flash-engine log before deciding whether to retry.", file=sys.stderr)
+    return returncode
 
 
 def flash_command(args, home, repo):
@@ -217,6 +247,7 @@ def flash_command(args, home, repo):
         print("REFUSED: non-interactive flash is read-only; use --dry-run to inspect phases.", file=sys.stderr)
         args.dry_run = True
     edl_command = _resolve_edl_command()
+    edl_loader = edl_runner.resolve_loader()
 
     with tempfile.TemporaryDirectory(prefix="openstick-flash-") as temp:
         os.chmod(temp, 0o700)
@@ -227,10 +258,12 @@ def flash_command(args, home, repo):
                "OPENSTICK_PROFILE": "prod", "OPENSTICK_OUT": str(image_set),
                "PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(Path(temp) / "home"),
                "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "TERM": "dumb",
-               "PYTHONDONTWRITEBYTECODE": "1", "LDR": str(image_set / "loader" / "prog_emmc_firehose_8916.mbn"),
-               "EDL_CMD": " ".join(edl_command)}
+               "PYTHONDONTWRITEBYTECODE": "1", "LDR": str(edl_loader),
+               "EDL_CMD": shlex.join(edl_command), "W": str(Path(temp) / "patha-work"),
+               "OPENSTICK_EDL_VERBOSE": "1" if getattr(args, "verbose", False) else "0",
+               "OPENSTICK_EDL_DEBUG": "1" if getattr(args, "debug", False) else "0"}
         env["BACKUP_DIR"] = str(flash_backup)
-        serial, identity = _live_identity(edl_command, env, temp, backup_manifest.get("partitions", {}))
+        serial, identity = _live_identity(edl_command, edl_loader, env, temp, backup_manifest.get("partitions", {}))
         if serial != device_id or identity != backup_manifest.get("identity") or identity != device.get("identity"):
             raise store.RefusedError("live EDL identity fingerprints do not match the registered verified backup")
         print("Live EDL identity and fsg/sec/fsc fingerprints match the verified backup.")
@@ -255,8 +288,8 @@ def flash_command(args, home, repo):
             shutil.copytree(source_group, patha / group)
         shutil.copyfile(data_patha / "SHA256SUMS", patha / "SHA256SUMS")
         os.chmod(patha / "SHA256SUMS", 0o400)
-        loader = image_set / "loader" / "prog_emmc_firehose_8916.mbn"
-        if loader.is_symlink() or not loader.is_file() or _hash(loader) != common.LOADER_SHA256:
+        image_loader = image_set / "loader" / "prog_emmc_firehose_8916.mbn"
+        if image_loader.is_symlink() or not image_loader.is_file() or _hash(image_loader) != common.LOADER_SHA256:
             raise store.RefusedError("verified pinned Firehose loader is missing or mismatched")
         if "loader/prog_emmc_firehose_8916.mbn" not in checked:
             raise store.RefusedError("Firehose loader is not covered by image-set SHA256SUMS")
@@ -321,7 +354,7 @@ def flash_command(args, home, repo):
             checked_now = _checked_sum_file(image_set, require_all=True)
             if not checked.issubset(checked_now):
                 raise store.RefusedError("image-set manifest changed during flash")
-            if _hash(loader) != common.LOADER_SHA256:
+            if _hash(image_loader) != common.LOADER_SHA256:
                 raise store.RefusedError("pinned Firehose loader changed during flash")
             if _hash(data_patha / "SHA256SUMS") != patha_manifest_hash:
                 raise store.RefusedError("Path A artifact manifest changed during flash")
@@ -362,12 +395,12 @@ def flash_command(args, home, repo):
                 raise store.RefusedError("verified backup changed after confirmation")
             _checked_sum_file(image_set, require_all=True)
             _checked_sum_file(image_set / ("files-" + board), require_all=True)
-            if _hash(loader) != common.LOADER_SHA256 or _hash(data_patha / "SHA256SUMS") != patha_manifest_hash:
+            if _hash(image_loader) != common.LOADER_SHA256 or _hash(data_patha / "SHA256SUMS") != patha_manifest_hash:
                 raise store.RefusedError("verified firmware input changed after confirmation")
             patha_current = _checked_sum_file(data_patha, "SHA256SUMS")
             if not patha_required.issubset(patha_current):
                 raise store.RefusedError("Path A firmware/GPT/rollback hashes are incomplete")
-            serial, identity = _live_identity(edl_command, env, temp, backup_manifest.get("partitions", {}))
+            serial, identity = _live_identity(edl_command, edl_loader, env, temp, backup_manifest.get("partitions", {}))
             if serial != device_id or identity != backup_manifest.get("identity") or identity != device.get("identity"):
                 raise store.RefusedError("live EDL identity fingerprints changed after confirmation")
             phase_env["COMMIT"] = "1"

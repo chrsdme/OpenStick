@@ -95,10 +95,15 @@ class M5Tests(unittest.TestCase):
         self.fake_edl_path = self.fakebin / "edl"
         self.fake_edl_path.write_text(self._fake_edl_script())
         self.fake_edl_path.chmod(0o700)
+        self.fake_loader_path = self.fakebin / m5.edl_runner.LOADER_NAME
+        import shutil
+        shutil.copyfile(self.loader, self.fake_loader_path)
+        m5.edl_runner.PINNED_LOADER_SHA256 = hashlib.sha256(self.fake_loader_path.read_bytes()).hexdigest()
         self.fake_sha_path = self.fakebin / "sha256sum"
         self.fake_sha_path.write_text(self._fake_sha_script())
         self.fake_sha_path.chmod(0o700)
         self.env = dict(os.environ, OPENSTICK_FAKE_EMMC=str(self.disk),
+                        OPENSTICK_EDL_DIR=str(self.fakebin),
                         PATH=str(self.fakebin) + ":/usr/bin:/bin")
         self._register_patha_fixture()
 
@@ -106,6 +111,15 @@ class M5Tests(unittest.TestCase):
         template = r'''#!/bin/bash
 set -eu
 op=${1:-}
+loader= memory=
+for arg in "$@"; do
+  case "$arg" in --loader=*) loader=${arg#--loader=};; --memory=*) memory=${arg#--memory=};; esac
+done
+if [[ -z $loader || $loader != /* || $memory != emmc ]]; then echo 'FAKE EDL ASSERTION FAILED: required loader and memory flags missing' >&2; exit 91; fi
+printf 'Qualcomm Sahara / Firehose Client V3.62 (c) B.Kerler 2018-2025.\n'
+printf 'main - Mode detected: sahara\nsahara -\n\nVersion 0x2\n------------------------\n'
+printf 'HWID:              0x007050e100000000 (MSM_ID:0x007050e1,OEM_ID:0x0000,MODEL_ID:0x0000)\n'
+printf 'CPU detected:      "MSM8916"\nPK_HASH:           0x0000000000000000000000000000000000000000000000000000000000000000\nSerial:            0xdeadbeef\n\n'
 case "$op" in
   ws)
     if [[ " $* " == *' --skipwrite '* ]]; then printf 'ws-dry\n' >> __CALLS__; exit 0; fi
@@ -129,7 +143,7 @@ case "$op" in
     dd if=__DISK__ of="$out" iflag=skip_bytes,count_bytes skip="$start" count="$count" status=none
     ;;
   rf) printf 'rf\n' >> __CALLS__; cp -- __DISK__ "$2";;
-  getstorageinfo) printf 'getstorageinfo\n' >> __CALLS__; printf 'serial = deadbeef\n';;
+  getstorageinfo) printf 'getstorageinfo\n' >> __CALLS__; echo "GetStorageInfo command isn't supported.";;
   *) exit 2;;
 esac
 '''
@@ -146,7 +160,7 @@ for arg in "$@"; do
 done
 exec /usr/bin/sha256sum "$@"
 '''
-        return template.replace("__LOADER__", shlex.quote(str(self.loader)))
+        return template.replace("__LOADER__", shlex.quote(str(self.fake_loader_path)))
 
     def _register_patha_fixture(self):
         """Create fully synthetic rollback provenance matching the fake board."""
@@ -269,11 +283,11 @@ exec /usr/bin/sha256sum "$@"
              mock.patch.object(m5, "_confirm", side_effect=lambda phase, ident: "restore %s %s" % (ident[-8:], phase)):
             self.assertEqual(m5.restore_command(args, self.home, ROOT), 0)
         calls = self.call_log.read_text().splitlines()
-        self.assertEqual(calls[:2], ["getstorageinfo", "rf"])
+        self.assertEqual(calls[:2], ["rs", "rf"])
         first_write = calls.index("ws-write")
         self.assertIn("ws-dry", calls[:first_write])
         self.assertGreaterEqual(calls[:first_write].count("rs"), 3)
-        self.assertGreater(calls[:first_write].count("getstorageinfo"), 1)
+        self.assertEqual(calls[:first_write].count("getstorageinfo"), 0)
         self.assertEqual(self.disk.read_bytes(), (self.backup / "emmc-full.bin").read_bytes())
 
     def test_resume_full_live_read_rejects_completed_range_mismatch_before_write(self):
@@ -290,7 +304,7 @@ exec /usr/bin/sha256sum "$@"
              mock.patch.object(m5, "_fwlib_path", return_value=str(self.fakebin) + ":/usr/bin:/bin"):
             with self.assertRaisesRegex(store.RefusedError, "live bytes differ"):
                 m5.restore_command(args, self.home, ROOT)
-        self.assertEqual(self.call_log.read_text().splitlines(), ["getstorageinfo", "rf"])
+        self.assertEqual(self.call_log.read_text().splitlines(), ["rs", "rf"])
         self.assertFalse(self.write_log.exists())
 
     def test_verified_planner_accepts_synthetic_gpt_geometry(self):
@@ -328,10 +342,9 @@ exec /usr/bin/sha256sum "$@"
         args = types.SimpleNamespace(restore_device="deadbeef", restore_backup="synthetic", dry_run=True)
         fake_loader = self.tmp / "loader.mbn"; fake_loader.write_bytes(b"synthetic loader")
         fake_live = lambda edl, env, loader, directory, ident: ("deadbeef", self.identity, self.disk, self.parts)
-        with mock.patch.dict(os.environ, dict(self.env, FWLIB_TEST_LDR_SHA="0" * 64), clear=True), \
+        with mock.patch.dict(os.environ, self.env, clear=True), \
              mock.patch.object(m5, "_live", side_effect=fake_live), \
-             mock.patch.object(m5.shutil, "which", return_value=str(self.fake_edl_path)), \
-             mock.patch.object(m5.common, "_loader_candidate", return_value=fake_loader):
+             mock.patch.object(m5.edl_runner, "PINNED_LOADER_SHA256", "0" * 64):
             with self.assertRaisesRegex(store.RefusedError, "pinned Firehose loader"):
                 m5.restore_command(args, self.home, ROOT)
         wrong = dict(self.identity); wrong["fsg"] = "0" * 64
@@ -446,7 +459,7 @@ exec /usr/bin/sha256sum "$@"
         fake_loader = self.tmp / "loader.mbn"; fake_loader.write_bytes(b"synthetic loader")
         args = types.SimpleNamespace(restore_device="deadbeef", restore_backup="synthetic", dry_run=False)
         fake_live = lambda edl, env, loader, directory, ident: ("deadbeef", self.identity, self.disk, self.parts)
-        def bad_final(edl, edl_args, env, **kwargs):
+        def bad_final(edl, edl_args, env, loader=None, **kwargs):
             self.fake_edl(edl, edl_args, env)
             if edl_args[0] == "rf":
                 target = pathlib.Path(edl_args[1])
@@ -473,10 +486,10 @@ exec /usr/bin/sha256sum "$@"
         fake_loader = self.tmp / "loader.mbn"; fake_loader.write_bytes(b"synthetic loader")
         fake_live = lambda edl, env, loader, directory, ident: ("deadbeef", self.identity, self.disk, self.parts)
         real_edl = m5._edl
-        def timeout_final(edl, edl_args, env, **kwargs):
+        def timeout_final(edl, edl_args, env, loader=None, **kwargs):
             if edl_args[0] == "rf":
                 raise subprocess.TimeoutExpired([edl] + edl_args, 600)
-            return real_edl(edl, edl_args, env)
+            return real_edl(edl, edl_args, env, loader)
         argv = ["--home", str(self.home), "restore", "--device", "deadbeef", "--backup", "synthetic"]
         with mock.patch.dict(os.environ, self.env, clear=True), \
              mock.patch.object(m5, "_live", side_effect=fake_live), \

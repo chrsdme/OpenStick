@@ -254,11 +254,14 @@ import os, shutil, sys
 from pathlib import Path
 a=sys.argv[1:]; op=a[0]; disk=Path(os.environ['OPENSTICK_FAKE_EMMC'])
 with Path(os.environ['OPENSTICK_EDL_LOG']).open('a') as log: log.write(' '.join(a)+'\\n')
-if op=='getstorageinfo':
- race=os.environ.get('RACE_PACKAGE_ROOT')
- if race:
-  (Path(race)/'payload/emmc-full.bin').write_bytes(b'changed-after-validation')
- print('serial=DEADBEEF'); raise SystemExit(0)
+loader=next((x.split('=',1)[1] for x in a if x.startswith('--loader=')), '')
+memory=next((x.split('=',1)[1] for x in a if x.startswith('--memory=')), '')
+if not loader.startswith('/') or memory!='emmc': print('FAKE EDL ASSERTION FAILED: required loader and memory flags missing',file=sys.stderr); raise SystemExit(91)
+print('Qualcomm Sahara / Firehose Client V3.62 (c) B.Kerler 2018-2025.')
+print('HWID:              0x007050e100000000 (MSM_ID:0x007050e1,OEM_ID:0x0000,MODEL_ID:0x0000)')
+print('PK_HASH:           0x0000000000000000000000000000000000000000000000000000000000000000')
+print('Serial:            0xdeadbeef')
+if op=='getstorageinfo': print("GetStorageInfo command isn't supported."); raise SystemExit(0)
 if op=='rf':
  out=Path(next(x for x in a[1:] if not x.startswith('--'))); shutil.copyfile(disk,out)
  if os.environ.get('CORRUPT_RF')=='1':
@@ -276,6 +279,8 @@ if op=='ws':
  raise SystemExit(0)
 if op=='rs':
  lba,count=int(a[1]),int(a[2]); out=Path(next(x for x in a[3:] if not x.startswith('--')))
+ if lba==0 and count==34 and os.environ.get('RACE_PACKAGE_ROOT'):
+  (Path(os.environ['RACE_PACKAGE_ROOT'])/'payload/emmc-full.bin').write_bytes(b'changed-after-validation')
  with disk.open('rb') as f: f.seek(lba*512); data=f.read(count*512)
  out.write_bytes(data); raise SystemExit(0)
 raise SystemExit(2)
@@ -375,7 +380,14 @@ import errno, os, shutil, sys
 from pathlib import Path
 disk=Path(%r); a=sys.argv[1:]; op=a[0]
 with Path(%r).open('a') as f: f.write(' '.join(a)+'\\n')
-if op=='getstorageinfo': print('serial=DEADBEEF'); raise SystemExit(0)
+loader=next((x.split('=',1)[1] for x in a if x.startswith('--loader=')), '')
+memory=next((x.split('=',1)[1] for x in a if x.startswith('--memory=')), '')
+if not loader.startswith('/') or memory!='emmc': print('FAKE EDL ASSERTION FAILED: required loader and memory flags missing',file=sys.stderr); raise SystemExit(91)
+print('Qualcomm Sahara / Firehose Client V3.62 (c) B.Kerler 2018-2025.')
+print('HWID:              0x007050e100000000 (MSM_ID:0x007050e1,OEM_ID:0x0000,MODEL_ID:0x0000)')
+print('PK_HASH:           0x0000000000000000000000000000000000000000000000000000000000000000')
+print('Serial:            0xdeadbeef')
+if op=='getstorageinfo': print("GetStorageInfo command isn't supported."); raise SystemExit(0)
 if op=='rf':
  out=Path(next(x for x in a[1:] if not x.startswith('--')))
  with disk.open('rb') as src, out.open('wb') as dst:
