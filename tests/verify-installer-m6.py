@@ -18,10 +18,89 @@ import select
 import time
 import fcntl
 from unittest import mock
+from contextlib import redirect_stdout
+import io
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from tools.installer import packages, store
+from tools.installer import build as build_module
+
+
+def verify_build_safety(root):
+    home = store.ensure_store(root / "build-safety-home")
+    repo = root / "build-safety-repo"
+    (repo / "boards/ufi103s").mkdir(parents=True)
+    (repo / "boards/ufi103s/board.env").write_text("BOARD_DESC=synthetic\n")
+    (repo / "scripts").mkdir()
+    for name in ("20-rootfs.sh", "50-boot-img.sh", "51-rootfs-img.sh"):
+        (repo / "scripts" / name).write_text("#!/bin/sh\nexit 0\n")
+    (repo / "out").mkdir()
+    (repo / "out/base-bookworm-arm64.tar.gz").write_bytes(b"synthetic base")
+    args = type("Args", (), {"profile": "prod", "build_board": "ufi103s",
+                              "bake_user_env": False, "dry_run": False})()
+    captured = []
+
+    def fake_run(command, env=None, **kwargs):
+        if command[0] == "git":
+            return type("Result", (), {"returncode": 128, "stdout": ""})()
+        captured.append((list(command), dict(env or {})))
+        if "50-boot-img.sh" in command[-1]:
+            out = pathlib.Path(env["PROD_OUT"]); out.mkdir(parents=True, exist_ok=True)
+            (out / "boot.img").write_bytes(b"synthetic boot")
+        if "51-rootfs-img.sh" in command[-1]:
+            out = pathlib.Path(env["PRODROOT_OUT"]); out.mkdir(parents=True, exist_ok=True)
+            (out / "rootfs.img").write_bytes(b"synthetic rootfs")
+        return type("Result", (), {"returncode": 0})()
+
+    with mock.patch.object(build_module.os, "geteuid", return_value=1000), \
+         mock.patch.object(build_module.os, "getuid", return_value=1000), \
+         mock.patch.object(build_module.os, "getgid", return_value=1000), \
+         mock.patch.object(build_module, "_version", return_value="synthetic"), \
+         mock.patch.object(build_module.subprocess, "run", side_effect=fake_run):
+        assert build_module.build_command(args, home, repo) == 0
+    privileged, env = captured[0]
+    handoff = '"/bin/sh" "$1"; rc=$?; chown -R "$2:$3" "$4" "$5"; owner_rc=$?; [ "$rc" -ne 0 ] && exit "$rc"; exit "$owner_rc"'
+    expected = ["sudo", "env", "-i"] + [key + "=" + value for key, value in sorted(env.items())] + [
+        "/bin/sh", "-c", handoff, "openstick-build", str(repo / "scripts/20-rootfs.sh"),
+        "1000", "1000", env["OUT"], env["WORK"]]
+    assert privileged == expected, (privileged[:3], expected[:3])
+
+    root_args = type("Args", (), {"profile": "prod", "build_board": "ufi103s",
+                                   "bake_user_env": False, "dry_run": False})()
+    with mock.patch.object(build_module.os, "geteuid", return_value=0), \
+         mock.patch.object(build_module.subprocess, "run", side_effect=AssertionError("root refusal ran a command")):
+        try:
+            build_module.build_command(root_args, home, repo)
+        except store.RefusedError as exc:
+            assert "non-root" in str(exc)
+        else:
+            raise AssertionError("build as root was accepted")
+
+def test_build_dry_run_default_login(root):
+    home = store.ensure_store(root / "dry-run-home")
+    repo = root / "build-safety-repo"
+    args = type("Args", (), {"profile": "dev", "build_board": "ufi103s",
+                              "bake_user_env": False, "dry_run": True})()
+    output = io.StringIO()
+    with redirect_stdout(output):
+        assert build_module.build_command(args, home, repo) == 0
+    assert "DEFAULT_USER=openstick" in output.getvalue() and "DEFAULT_PASS=openstick" in output.getvalue()
+
+
+def test_common_rejects_empty_openstick_out():
+    for mode in ("legacy", "generic"):
+        env = dict(os.environ, OPENSTICK_ROOT=str(ROOT), OPENSTICK_CONFIG_MODE=mode,
+                   OPENSTICK_OUT="", PATH="/usr/bin:/bin")
+        result = subprocess.run(["/bin/sh", "-c", '. "$OPENSTICK_ROOT/scripts/common.sh"'],
+                                env=env, capture_output=True, text=True)
+        assert result.returncode != 0 and "OPENSTICK_OUT" in result.stderr, (mode, result.returncode, result.stderr)
+    generic_missing = dict(os.environ, OPENSTICK_ROOT=str(ROOT), OPENSTICK_CONFIG_MODE="generic",
+                           PATH="/usr/bin:/bin")
+    generic_missing.pop("OPENSTICK_OUT", None)
+    result = subprocess.run(["/bin/sh", "-c", '. "$OPENSTICK_ROOT/scripts/common.sh"'],
+                            env=generic_missing, capture_output=True, text=True)
+    assert result.returncode != 0 and "OPENSTICK_OUT" in result.stderr, (result.returncode, result.stderr)
 
 
 def make_backup(home):
@@ -348,6 +427,10 @@ raise SystemExit(2)
 def run():
     with tempfile.TemporaryDirectory(prefix="ostpkg-test-") as td:
         root = pathlib.Path(td)
+        verify_build_safety(root)
+        test_build_dry_run_default_login(root)
+        test_common_rejects_empty_openstick_out()
+        test_verify_package_requires_sensitive_marking(root)
         home = store.ensure_store(root / "state")
         device = make_backup(home)
         output = root / "restore.ostpkg.tar"
@@ -786,9 +869,32 @@ def run():
             rc, output_text = run_typed(transition_args + ["--phase", phase, "--state", str(transition_state)],
                                         phase_env, token)
             assert rc == 0, (phase, rc, output_text[-1000:])
+            assert "UNVALIDATED on hardware" in output_text
         assert transition_disk.read_bytes() == (home / "backups" / "deadbeef" / "synthetic-backup" / "emmc-full.bin").read_bytes()
         assert "first-install" in install_output and "readback pass" in install_output.lower()
     print("M6 synthetic package checks PASS")
+
+
+def test_verify_package_requires_sensitive_marking(root):
+    """A package with valid member hashes still needs the SENSITIVE marker."""
+    source = root / "sensitive-valid.ostpkg.tar"
+    mutant = root / "sensitive-marker-removed.ostpkg.tar"
+    make_raw_package(source)
+    with tarfile.open(source, "r:") as original, tarfile.open(mutant, "w") as changed:
+        for member in original.getmembers():
+            data = original.extractfile(member).read() if member.isfile() else None
+            if member.name == "manifest.json":
+                manifest = json.loads(data.decode("utf-8"))
+                manifest["sensitive"] = False
+                data = (json.dumps(manifest, sort_keys=True) + "\n").encode("utf-8")
+                member.size = len(data)
+            changed.addfile(member, __import__("io").BytesIO(data) if data is not None else None)
+    try:
+        packages.verify_package(mutant)
+    except store.RefusedError as exc:
+        assert "SENSITIVE" in str(exc)
+    else:
+        raise AssertionError("package without the SENSITIVE marker was accepted")
 
 
 if __name__ == "__main__":

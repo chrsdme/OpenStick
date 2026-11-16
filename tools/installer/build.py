@@ -58,6 +58,8 @@ def build_command(args, home, repo):
     if args.dry_run:
         mode = "legacy settings enabled" if args.bake_user_env else "generic isolated settings"
         print("DRY RUN: build profile=%s board=%s (%s)" % (args.profile, board, mode))
+        if args.profile == "dev" and not args.bake_user_env:
+            print("Generic dev images retain config/defaults.env credentials: DEFAULT_USER=openstick DEFAULT_PASS=openstick (public defaults; password expires on first login).")
         print("Order: scripts/20-rootfs.sh, scripts/50-boot-img.sh, scripts/51-rootfs-img.sh")
         return 0
     if os.geteuid() == 0:

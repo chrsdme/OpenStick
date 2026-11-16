@@ -17,7 +17,7 @@ Work in progress. First target: UFI103S (`BOARD=ufi103s`), kernel 6.6 (postmarke
 Per-board config (`boards/<BOARD>/board.env`) and a GPT generated from the eMMC size are implemented.
 Not yet implemented: `BOOT_MODE=stock-repack`. Kernel 6.12 is a future option (the board runs 6.6, pmOS 6.6-r5). Nothing here has been flashed or booted yet.
 
-The separate installer wrapper is documented in [docs/INSTALLER.md](docs/INSTALLER.md). Offline installer tests use synthetic fixtures and shims only. The M4 build output (`boot.img`, `rootfs.img`) is not the legacy first-install input (`boot.bin`, `rootfs.bin`). A GPT-T adapter validates and maps the build artifacts to `boot` and `userdata`; the current flash wrapper still refuses that image set because a safe hardware write/readback path is not validated. Do not bypass the refusal by renaming files.
+The separate installer wrapper is documented in [docs/INSTALLER.md](docs/INSTALLER.md). Offline installer tests use synthetic fixtures and shims only. The M4 build output (`boot.img`, `rootfs.img`) is not the legacy first-install input (`boot.bin`, `rootfs.bin`). A GPT-T adapter validates and maps the build artifacts to `boot` and `userdata`; the current flash wrapper still refuses that image set because a safe hardware write/readback path is not validated. See the [GPT-T installer description](docs/INSTALLER.md#build-install-and-verify). Do not bypass the refusal by renaming files.
 
 ### Installer quickstart (offline inspection)
 
@@ -38,13 +38,15 @@ python3-cryptography python3-pyasn1-modules python3-pycryptodome unzip wget`
 arm64 emulation uses binfmt_misc with the `F` flag; no `qemu-aarch64-static` copy is needed. Check:
 `cat /proc/sys/fs/binfmt_misc/qemu-aarch64`. About 10 GB of free disk is recommended.
 
+Installer generic builds do not change the defaults in `config/defaults.env`. A generic `PROFILE=dev` image still has `DEFAULT_USER=openstick` and `DEFAULT_PASS=openstick`; that public password expires at first login. Use `PROFILE=prod` for an image without the dev test account. `build --dry-run` prints this fact.
+
 ## Build
 
 ```sh
 scripts/fetch-src.sh                 # external sources at pinned commits
 scripts/fetch-dts.sh                 # kernel 6.6 DT headers (sparse checkout, ~25 MB)
 scripts/build-dtb.sh                 # dts/<DTB_NAME>.dts -> out/dtbs/
-scripts/gen-gpt.sh                   # GPT-B from BOARD_GPT_TEMPLATE (config/local.env) -> out/fw/gpt-{primary,secondary}.bin, gpt_both0.bin
+scripts/gen-gpt.sh                   # legacy GPT-B from BOARD_GPT_TEMPLATE (config/local.env) -> out/fw/gpt-{primary,secondary}.bin, gpt_both0.bin
 sudo scripts/10-base.sh           # stage 1: minimal base -> out/base-bookworm-arm64.tar.gz
 sudo scripts/20-rootfs.sh         # stage 2: packages + config -> out/rootfs-<board>.tgz
 sudo scripts/30-gt.sh             # USB gadget tools (cross-built, not in the rootfs)
@@ -68,7 +70,7 @@ The following sparse `boot.bin`/`rootfs.bin` instructions document the retained 
 
 `out/files-<board>/boot.bin` and `rootfs.bin` are **Android sparse images** (`img2simg` of a raw ext2 / ext4 file),
 so they are small on disk (rootfs ~216 MB) but expand to the full partition size when flashed or converted.
-That is why `rootfs.bin` is ~216 MB while the GPT `rootfs` partition is ~2.62 GiB (GPT-B): sparse files store only the used chunks
+That is why `rootfs.bin` is ~216 MB while the GPT `rootfs` partition is ~2.62 GiB (legacy GPT-B): sparse files store only the used chunks
 and a "don't care" marker for the rest. `file rootfs.bin` shows the expanded size in 4096-byte blocks.
 
 Sizes: `scripts/gen-gpt.sh` rounds the `rootfs` partition DOWN to a multiple of 8 sectors (4096 B) and writes
@@ -79,7 +81,7 @@ against the GPT, and checks `SHA256SUMS`). `30-gt.sh` writes `work/gt-dist`; `40
 
 | File | Partition | Notes |
 |---|---|---|
-| `out/fw/gpt_both0.bin` | GPT (`partition`) | = `gpt-primary.bin` + `gpt-secondary.bin`, GPT-B from the board template; only after the backup is verified |
+| `out/fw/gpt_both0.bin` | GPT (`partition`) | = `gpt-primary.bin` + `gpt-secondary.bin`, legacy GPT-B from the board template; only after the backup is verified |
 | `out/files-<board>/boot.bin` | `boot` | ext2, holds `extlinux/`, kernel, DTBs (read by lk2nd) |
 | `out/files-<board>/rootfs.bin` | `rootfs` | ext4 |
 
@@ -103,7 +105,7 @@ is not verified here). Never write the raw files to a whole-disk device node.
 
 ## Current boot path (board #6, verified on device): boot.img + rootfs in `userdata`
 
-State verified by the owner on board #6: lk2nd + Debian rootfs in `userdata` of the CURRENT GPT (not GPT-B), kernel 6.6
+State verified by the owner on board #6: lk2nd + Debian rootfs in `userdata` of the CURRENT GPT (not legacy GPT-B), kernel 6.6
 reaches userspace, systemd running, ssh, WiFi, modem and LTE work.
 ```sh
 sudo scripts/20-rootfs.sh        # rootfs tgz (fstab LABEL=osroot, growfs, gadget, usb0, watchdog, marker /etc/openstick-rootfs)
@@ -220,7 +222,7 @@ the LTE modem profile. `polkit` is not installed, so `nmcli` commands that chang
 
 Each board is a directory `boards/<id>/board.env` (DTB, lk2nd compatible, eMMC size). To add one: copy `boards/ufi103s`,
 put its DTS in `dts/`, set `BOARD=<id>`. `scripts/gen-gpt.sh` is template based: set `BOARD_GPT_TEMPLATE` (a GPT dump of YOUR unit, outside the repo) in
-`config/local.env`; kept entries are copied byte-identical, only `boot` and `rootfs` are new (GPT-B, see FLASH-PLAN.md). Use the `EMMC_SECTORS` of YOUR unit, not a guess.
+`config/local.env`; kept entries are copied byte-identical, only `boot` and `rootfs` are new (legacy GPT-B, see FLASH-PLAN.md). Use the `EMMC_SECTORS` of YOUR unit, not a guess.
 DTS files come from [x7780/OpenStick-Builder](https://github.com/x7780/OpenStick-Builder) and are compiled against the
 `msm8916/6.6` kernel headers; `dts/msm8916-ufi.dtsi` has a small documented change for that tree.
 
