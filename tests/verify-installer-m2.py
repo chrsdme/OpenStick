@@ -107,8 +107,9 @@ class EdlRunnerTests(unittest.TestCase):
             self.loader.write_bytes(b"synthetic pinned loader fixture")
             self.loader.unlink()
             with mock.patch.dict(os.environ, self.env, clear=True):
-                with self.assertRaisesRegex(store.RefusedError, "loader"):
+                with self.assertRaisesRegex(store.RefusedError, "loader") as missing:
                     edl_runner.run(["rs", "0", "1", str(self.base / "read.bin")], timeout=1)
+            self.assertIn("hint:", str(missing.exception).lower())
         self.assertFalse((self.base / "edl-count").exists())
 
     def test_parse_sahara_info_accepts_transcript_and_rejects_malformed_or_absent_blocks(self):
@@ -118,8 +119,9 @@ class EdlRunnerTests(unittest.TestCase):
         })
         for invalid in ("", "Serial: 0xdeadbee\nHWID: 0x1234\nPK_HASH: 0x" + "0" * 64,
                         "Serial: deadbeef\nHWID: 0x1234\nPK_HASH: 0x" + "0" * 64):
-            with self.subTest(invalid=invalid), self.assertRaisesRegex(store.StoreError, "Sahara"):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(store.StoreError, "Sahara") as caught:
                 edl_runner.parse_sahara_info(invalid)
+            self.assertIn("Hint:", str(caught.exception))
 
     def test_hang_sends_sigint_reports_power_cycle_and_does_not_register_backup(self):
         home = self.base / "hang-home"

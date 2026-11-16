@@ -68,14 +68,22 @@ def resolve_loader():
             if not candidate.exists():
                 continue
             if candidate.is_symlink() or not candidate.is_file():
-                raise store.RefusedError("Firehose loader must be a regular non-symlink file")
+                raise store.RefusedError(
+                    "Firehose loader must be a regular non-symlink file; hint: install the pinned loader in the EDL directory or out/"
+                )
             absolute = candidate.resolve(strict=True)
             if _hash(absolute) != PINNED_LOADER_SHA256:
-                raise store.RefusedError("Firehose loader SHA-256 does not match the pinned loader")
+                raise store.RefusedError(
+                    "Firehose loader SHA-256 does not match the pinned loader; hint: replace it with the pinned loader before retrying"
+                )
             return absolute
         except OSError as exc:
-            raise store.RefusedError("could not verify the Firehose loader") from exc
-    raise store.RefusedError("pinned Firehose loader is missing: " + LOADER_NAME)
+            raise store.RefusedError(
+                "could not verify the Firehose loader; hint: check file access and install the pinned loader"
+            ) from exc
+    raise store.RefusedError(
+        "pinned Firehose loader is missing: " + LOADER_NAME + "; hint: install it in OPENSTICK_EDL_DIR or out/"
+    )
 
 
 def _tail(stdout, stderr, limit=12):
@@ -106,8 +114,11 @@ def run(args, timeout, *, env=None, cwd=None, verbose=False, debug=False):
            item == "--memory" or item.startswith("--memory=") for item in operation):
         raise store.RefusedError("EDL runner owns the --loader and --memory arguments")
     command = client + operation + ["--loader=" + str(loader), "--memory=emmc"]
-    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                               text=True, env=env, cwd=cwd)
+    try:
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   text=True, env=env, cwd=cwd)
+    except OSError as exc:
+        raise _failure("could not start the EDL client", "", str(exc), verbose or debug) from exc
     try:
         stdout, stderr = process.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -162,7 +173,8 @@ def parse_sahara_info(text):
     pk_hash = re.search(r"(?m)^PK_HASH:\s*0x([0-9a-fA-F]{64})\s*$", text)
     if not (serial and hwid and pk_hash):
         raise store.StoreError(
-            "EDL client did not report a valid Sahara identity block (Serial, HWID, and PK_HASH required)"
+            "EDL client did not report a valid Sahara identity block (Serial, HWID, and PK_HASH required). "
+            "Hint: confirm EDL mode and use a client that prints the Sahara information block."
         )
     return {
         "serial": serial.group(1).lower(),
