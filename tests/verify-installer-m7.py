@@ -309,7 +309,7 @@ class WizardTests(unittest.TestCase):
             self.assertTrue(store._inside_git(link / "a" / "b" / "future"))
         self.assertFalse(git_log.exists(), "inside-git check must not call git")
 
-    def test_cli_wizard_failed_stage_can_be_retried(self):
+    def test_wizard_failed_stage_can_be_retried(self):
         state_args = args("doctor", wizard_id="retry-doctor")
         first = wizard.run(state_args, self.home, self.repo)
         self.assertNotEqual(first, 0)
