@@ -6,6 +6,8 @@ TMP=$(mktemp -d)
 trap 'rm -rf -- "$TMP"' EXIT
 export TMPDIR="$TMP"
 export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"
+shopt -s nullglob
+m4_tmp_before=("$TMP"/openstick-m4-test-*)
 
 pass=0 fail=0 skip=0
 run() {
@@ -161,6 +163,13 @@ for test in verify-fetch-firehose.sh verify-flash-board.sh verify-harden.sh veri
     run "legacy-$test" bash "$ROOT/tests/$test"
   fi
 done
+
+m4_tmp_after=("$TMP"/openstick-m4-test-*)
+if (( ${#m4_tmp_after[@]} > ${#m4_tmp_before[@]} )); then
+  printf 'FAIL installer temp cleanup: openstick-m4-test-* count grew from %d to %d under TMPDIR\n' \
+    "${#m4_tmp_before[@]}" "${#m4_tmp_after[@]}"
+  fail=$((fail + 1))
+fi
 
 printf 'TOTAL PASS=%d FAIL=%d SKIP=%d\n' "$pass" "$fail" "$skip"
 (( fail == 0 ))
