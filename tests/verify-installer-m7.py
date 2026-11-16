@@ -31,6 +31,8 @@ def args(stage, **values):
 class WizardTests(unittest.TestCase):
     def setUp(self):
         self.tmp = pathlib.Path(tempfile.mkdtemp(prefix="openstick-wizard-m7-"))
+        self._old_git_ceiling = os.environ.get("GIT_CEILING_DIRECTORIES")
+        os.environ["GIT_CEILING_DIRECTORIES"] = str(self.tmp.parent)
         # Wizard unit tests use a prepared private-store fixture. Store location
         # refusal has its own CLI and store tests; this sandbox marks /tmp/.git.
         self.home = self.tmp / "private"
@@ -48,6 +50,10 @@ class WizardTests(unittest.TestCase):
             except OSError:
                 pass
         shutil.rmtree(self.tmp, ignore_errors=True)
+        if self._old_git_ceiling is None:
+            os.environ.pop("GIT_CEILING_DIRECTORIES", None)
+        else:
+            os.environ["GIT_CEILING_DIRECTORIES"] = self._old_git_ceiling
 
     def _state(self, names, pending=None):
         path = wizard._state_path(self.home, "synthetic-run")
@@ -268,9 +274,8 @@ class WizardTests(unittest.TestCase):
                     self.assertTrue(hasattr(namespace, name), "%s lacks %s" % (stage, name))
         self.assertEqual(wizard._args_for(args("doctor"), "doctor", state, self.home).home, str(self.home))
 
-    def test_cli_wizard_is_refused_by_git_marker_before_dispatch(self):
-        """The sandbox's /tmp/.git marker blocks private store setup before stage dispatch."""
-        import shutil
+    def test_cli_wizard_dispatches_doctor_and_rejects_backup_after_failed_doctor(self):
+        """Exercise the public CLI; local missing hardware prerequisites keep doctor failed."""
         fake_bin = self.tmp / "bin"
         fake_bin.mkdir()
         for name in ("edl", "fastboot", "debugfs", "e2fsck", "mke2fs"):
@@ -284,11 +289,20 @@ class WizardTests(unittest.TestCase):
                                  "--id", run_id, "--stage", "doctor"], env=env,
                                 text=True, capture_output=True)
         state_path = home / "wizard" / (run_id + ".json")
-        # The sandbox's read-only /tmp/.git marker is intentionally fail-closed,
-        # so the public command is rejected before wizard dispatch here.
-        self.assertEqual(result.returncode, 2)
-        self.assertIn("outside every Git worktree", result.stderr)
+        # The ceiling lets the private store exist. Doctor then reports the
+        # unavailable EDL/loader/USB prerequisites; backup correctly depends
+        # on a successful doctor and is not dispatched yet.
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("FAIL EDL client", result.stdout)
         self.assertNotIn("AttributeError", result.stderr)
+        backup = subprocess.run([str(ROOT / "openstick"), "--home", str(home), "wizard",
+                                 "--id", run_id, "--stage", "backup", "--resume",
+                                 "--device", "deadbeef"], env=env, text=True, capture_output=True)
+        self.assertEqual(backup.returncode, 2)
+        self.assertIn("requires completed stage(s): doctor", backup.stderr)
+        state = json.loads(state_path.read_text())
+        self.assertEqual([item["name"] for item in state["stages"]], ["doctor"])
+        self.assertEqual(state["stages"][0]["status"], "failed")
 
     def test_inside_git_walks_markers_even_when_git_is_unavailable_and_through_symlinks(self):
         repo = self.tmp / "repo"
@@ -473,6 +487,9 @@ class WizardTests(unittest.TestCase):
         m5_helpers.make_disk(disk)
         bin_dir = self.tmp / "fake-bin"
         bin_dir.mkdir()
+        edl = bin_dir / "edl"
+        edl.write_bytes((ROOT / "tests/shims/bin/edl").read_bytes())
+        edl.chmod(0o700)
         ssh = bin_dir / "ssh"
         ssh.write_text("#!/bin/sh\ncat >/dev/null\n" + "".join(
             "printf '%s\\t%s\\t%s\\n'\n" % ("PASS", key, "synthetic evidence")
@@ -558,6 +575,7 @@ class WizardTests(unittest.TestCase):
         spec.loader.exec_module(helpers)
         fixture = helpers.M5Tests("test_restore_fake_disk_is_byte_identical_and_records_each_phase")
         fixture.setUp()
+        fixture.env["GIT_CEILING_DIRECTORIES"] = str(fixture.tmp.parent)
         try:
             # Simulate a changed userdata partition after the verified stock backup.
             with fixture.disk.open("r+b") as stream:
