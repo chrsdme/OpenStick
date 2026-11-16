@@ -126,6 +126,15 @@ def configure_test(tmp):
     imported = seed.parse((home / "seeds/pub.seed").read_text())
     assert imported["SSH_AUTHORIZED_KEYS"] == base64.b64encode(public.read_bytes()).decode()
 
+    whitespace_answers = iter(["spacehost", "Etc/UTC", "", "-", " edge ssid ", "GB", " edge apn ", "", ""])
+    with mock.patch("builtins.input", side_effect=lambda _p: next(whitespace_answers)), \
+            mock.patch("getpass.getpass", side_effect=["", " edge psk ", " edge psk ", "", ""]):
+        configure(home, "whitespace", "dev")
+    spaced = seed.parse((home / "seeds/whitespace.seed").read_text())
+    assert base64.b64decode(spaced["WIFI_SSID_B64"]).decode() == " edge ssid "
+    assert base64.b64decode(spaced["WIFI_PSK_B64"]).decode() == " edge psk "
+    assert base64.b64decode(spaced["APN_B64"]).decode() == " edge apn "
+
 
 def g4_test(tmp):
     home = ensure_store(tmp / "g4-home")
@@ -288,6 +297,19 @@ def shell_network_roundtrip_test(tmp):
         config = (root / "etc/NetworkManager/system-connections/wifi-client.nmconnection").read_text()
         escaped = value.replace("\\", "\\\\").replace('"', '\\"').replace(" ", "\\s")
         assert 'psk="%s"' % escaped in config, (index, config)
+    # The POSIX shell parser must reject a trailing newline before command
+    # substitution can silently strip it from the decoded value.
+    root, bindir, log = fake_root(tmp / "network-trailing-newline")
+    data = {"SEED_VERSION": "1", "PROFILE": "dev",
+            "WIFI_SSID_B64": base64.b64encode(b"test-network").decode(),
+            "WIFI_PSK_B64": base64.b64encode(b"test-psk-not-real\n").decode()}
+    seedfile = root / "etc/openstick/seed.env"
+    seedfile.write_text("SEED_VERSION=1\nPROFILE=dev\nWIFI_SSID_B64=%s\nWIFI_PSK_B64=%s\n" %
+                        (data["WIFI_SSID_B64"], data["WIFI_PSK_B64"]))
+    seedfile.chmod(0o600)
+    env = dict(os.environ, OPENSTICK_ROOT=str(root), PATH=str(bindir) + ":/usr/bin:/bin", SHIM_LOG=str(log))
+    subprocess.run([str(ROOT / "configs/apply-seed")], env=env, capture_output=True, text=True, check=True)
+    assert seedfile.exists() and not (root / "etc/openstick/seed.applied").exists()
     for index, value in enumerate(["Coffee café", "Bob's WiFi", "Room\\2", 'The "Place"', " edge spaces ", "S" * 32]):
         root, bindir, log = fake_root(tmp / ("ssid-%d" % index))
         data = {"SEED_VERSION": "1", "PROFILE": "dev",

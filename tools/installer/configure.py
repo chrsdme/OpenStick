@@ -35,7 +35,7 @@ def password_hash(password):
 
 def _ask(prompt, default=""):
     suffix = " [%s]" % default if default else ""
-    value = input(prompt + suffix + ": ").strip()
+    value = input(prompt + suffix + ": ")
     return value or default
 
 
