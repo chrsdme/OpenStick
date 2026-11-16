@@ -1,6 +1,7 @@
 """M1 command line, diagnostics, and device registry operations."""
 import argparse
 import hashlib
+import grp
 import json
 import os
 import shutil
@@ -29,8 +30,9 @@ EXIT_VERIFY = 3
 class VerificationError(ValueError):
     """A concrete integrity or read-back verification failure."""
 
-LOADER_SHA256 = "959439aa5864685999b713c3ed12ad5fa408149648b670a9a9ef77bcc9dcab14"
-LOADER_NAME = "prog_emmc_firehose_8916.mbn"
+LOADER_SHA256 = edl_runner.PINNED_LOADER_SHA256
+LOADER_NAME = edl_runner.LOADER_NAME
+
 
 
 def log(message, verbose=False, enabled=False):
@@ -152,15 +154,6 @@ def _which(name):
     return shutil.which(name)
 
 
-def _loader_candidate():
-    edl_dir = os.environ.get("OPENSTICK_EDL_DIR")
-    candidates = []
-    if edl_dir:
-        candidates.extend([Path(edl_dir) / LOADER_NAME, Path(edl_dir) / "../" / LOADER_NAME])
-    candidates.extend([Path("out") / LOADER_NAME, Path(__file__).resolve().parents[2] / "out" / LOADER_NAME])
-    return next((p.resolve() for p in candidates if p.is_file()), None)
-
-
 def _disk_free(path):
     probe = Path(path)
     while not probe.exists() and probe != probe.parent:
@@ -168,41 +161,108 @@ def _disk_free(path):
     return shutil.disk_usage(probe).free
 
 
-def doctor(args):
+def _loader_candidate():
+    """Compatibility wrapper for callers being migrated to edl_runner."""
+    try:
+        return edl_runner.resolve_loader()
+    except (store.RefusedError, store.StoreError):
+        return None
+
+
+def _plugdev_group_exists():
+    try:
+        grp.getgrnam("plugdev")
+        return True
+    except KeyError:
+        return False
+
+
+def _edl_usb_udev_hint(plugdev_exists=None):
+    if plugdev_exists is None:
+        plugdev_exists = _plugdev_group_exists()
+    rule = 'SUBSYSTEM=="usb", ATTR{idVendor}=="05c6", ATTR{idProduct}=="9008", TAG+="uaccess"'
+    hint = "add this narrow udev rule, reload udev rules, then reconnect the board: " + rule
+    if plugdev_exists:
+        hint += '; alternatively use MODE="0660", GROUP="plugdev" and add the user to plugdev'
+    return hint
+
+
+def _check_edl_usb(sysfs_root="/sys/bus/usb/devices", usb_device_root="/dev/bus/usb",
+                   access_check=os.access, plugdev_exists=None):
+    """Check R/W access to an attached Qualcomm 9008 USB device, if present."""
+    root = Path(sysfs_root)
+    try:
+        entries = list(root.iterdir())
+    except OSError:
+        return "FAIL", "could not scan " + str(root) + " for an attached EDL device", \
+            "confirm sysfs is mounted and readable, then rerun doctor"
+    for entry in entries:
+        try:
+            vendor = (entry / "idVendor").read_text().strip().lower()
+            product = (entry / "idProduct").read_text().strip().lower()
+        except OSError:
+            continue
+        if (vendor, product) != ("05c6", "9008"):
+            continue
+        try:
+            busnum = (entry / "busnum").read_text().strip()
+            devnum = (entry / "devnum").read_text().strip()
+            if not (busnum.isdecimal() and devnum.isdecimal()):
+                raise ValueError("busnum/devnum are not numeric")
+            device_path = Path(usb_device_root) / busnum.zfill(3) / devnum.zfill(3)
+        except (OSError, ValueError):
+            return "FAIL", "could not derive the USB device node for attached EDL device", _edl_usb_udev_hint(plugdev_exists)
+        try:
+            accessible = access_check(str(device_path), os.R_OK | os.W_OK)
+        except OSError:
+            accessible = False
+        if accessible:
+            return "PASS", "read/write access to " + str(device_path), None
+        return "FAIL", "read/write access unavailable for " + str(device_path), _edl_usb_udev_hint(plugdev_exists)
+    return "INFO", "no EDL device attached; access will be checked when one is", None
+
+
+def doctor(args, usb_sysfs_root="/sys/bus/usb/devices", usb_device_root="/dev/bus/usb",
+           access_check=os.access):
     checks = []
     for name, candidates in (("python3", ("python3",)), ("bash", ("bash",)), ("e2fsprogs", ("debugfs", "e2fsck", "mke2fs")), ("fastboot", ("fastboot",))):
         found = [_which(c) for c in candidates]
         ok = all(found)
-        checks.append((name, ok, ", ".join(found) if ok else "missing: " + ", ".join(c for c, f in zip(candidates, found) if not f)))
-    edl_dir = os.environ.get("OPENSTICK_EDL_DIR")
-    edl = (Path(edl_dir) / "edl.py") if edl_dir else None
-    edl_ok = bool(edl and edl.is_file()) or bool(_which("edl"))
-    checks.append(("EDL client", edl_ok, str(edl) if edl and edl.is_file() else (_which("edl") or "missing: set OPENSTICK_EDL_DIR or add edl to PATH")))
-    loader = _loader_candidate()
-    if loader:
-        digest = hashlib.sha256(loader.read_bytes()).hexdigest()
-        checks.append(("Firehose loader", digest == LOADER_SHA256, str(loader) + (" (sha256 verified)" if digest == LOADER_SHA256 else " (sha256 mismatch)")))
-    else:
-        checks.append(("Firehose loader", False, "missing: " + LOADER_NAME))
-    checks.append(("USB permissions", os.access("/dev/bus/usb", os.R_OK | os.W_OK), "USB access available" if os.access("/dev/bus/usb", os.R_OK | os.W_OK) else "USB access unavailable; suggested udev rule: SUBSYSTEM==\"usb\", ATTR{idVendor}==\"05c6\", MODE=\"0660\", GROUP=\"plugdev\""))
+        checks.append(("PASS" if ok else "FAIL", name,
+                       ", ".join(found) if ok else "missing: " + ", ".join(c for c, f in zip(candidates, found) if not f), None))
+    try:
+        client = edl_runner.resolve_client()
+        checks.append(("PASS", "EDL client", " ".join(client), None))
+    except (store.RefusedError, store.StoreError) as exc:
+        checks.append(("FAIL", "EDL client", str(exc) + "; hint: set OPENSTICK_EDL_DIR to a directory with executable edl or edl.py, or add edl to PATH", None))
+    try:
+        loader = edl_runner.resolve_loader()
+        checks.append(("PASS", "Firehose loader", str(loader) + " (sha256 verified)", None))
+    except (store.RefusedError, store.StoreError) as exc:
+        checks.append(("FAIL", "Firehose loader", str(exc), None))
+    usb_status, usb_detail, usb_hint = _check_edl_usb(
+        usb_sysfs_root, usb_device_root, access_check=access_check)
+    checks.append((usb_status, "USB permissions", usb_detail, usb_hint))
     free = _disk_free(args.home)
-    checks.append(("Free disk space", free >= 12 * 1024 ** 3, "%.1f GiB free (12 GiB required)" % (free / 1024 ** 3)))
+    checks.append(("PASS" if free >= 12 * 1024 ** 3 else "FAIL", "Free disk space",
+                   "%.1f GiB free (12 GiB required)" % (free / 1024 ** 3), None))
     try:
         store.validate_location(args.home)
-        checks.append(("Private store location", True, str(Path(args.home).absolute())))
+        checks.append(("PASS", "Private store location", str(Path(args.home).absolute()), None))
         if Path(args.home).exists():
             mode = Path(args.home).stat().st_mode & 0o777
-            checks.append(("Private store permissions", mode == 0o700, "mode %03o" % mode))
+            checks.append(("PASS" if mode == 0o700 else "FAIL", "Private store permissions", "mode %03o" % mode, None))
         else:
-            checks.append(("Private store permissions", True, "will be created with mode 700"))
+            checks.append(("PASS", "Private store permissions", "will be created with mode 700", None))
     except store.RefusedError as exc:
-        checks.append(("Private store location", False, str(exc)))
-    for name, ok, detail in checks:
-        print("%s %s: %s" % ("PASS" if ok else "FAIL", name, detail))
-        if not ok:
-            if name in ("python3", "bash", "e2fsprogs", "fastboot", "EDL client", "Firehose loader"):
-                print("  Install hint: Debian: apt install python3 bash e2fsprogs android-sdk-platform-tools; Fedora: dnf install python3 bash e2fsprogs android-tools")
-    return EXIT_OK if all(ok for _, ok, _ in checks) else EXIT_ERROR
+        checks.append(("FAIL", "Private store location", str(exc), None))
+    for status, name, detail, hint in checks:
+        print("%s %s: %s" % (status, name, detail))
+        if hint:
+            print("  Hint: " + hint)
+        elif status == "FAIL" and name in ("python3", "bash", "e2fsprogs", "fastboot"):
+            print("  Install hint: Debian: apt install python3 bash e2fsprogs android-sdk-platform-tools; Fedora: dnf install python3 bash e2fsprogs android-tools")
+    return EXIT_OK if not any(status == "FAIL" for status, _, _, _ in checks) else EXIT_ERROR
 
 
 def _find_device(registry, ident):
