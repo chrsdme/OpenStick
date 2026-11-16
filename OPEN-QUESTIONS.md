@@ -10,13 +10,14 @@ M0 defaults are recorded as recommendations, not verified device behavior. Hardw
 | §3 scripts | Existing Path A and flash-board engines remain unchanged. M4 wraps them with verification and typed-confirmation gates. | Hardware execution remains forbidden and unverified here. |
 | §3 profile | Tree has dev/prod behavior. M3 configure records the dev/prod account policy in the seed. M4 generic mode omits personal settings and allows an unseeded prod rootfs for later injection. | Generic prod behavior is covered by wrapper tests; image assembly was not run. |
 | §4 commands | `./openstick` includes M1-M7 command interfaces, including verify/restore, package, image-set and wizard commands. | M5-M7 code and tests are present in this worktree but uncommitted; GPT-T first-install remains hardware-required and fail-closed. |
-| §5 store/registry | M1 private store and registry exist; M4 registers immutable build artifacts and partial flash state. | Registry paths are absolute and need re-verification after moving the store. |
+| §5 store/registry | The implemented layout is a root-level `registry.json` and append-only `events.jsonl`, rather than per-device registry files. Seed application history is recorded in the registry. `OPENSTICK_HOME` now participates in the documented precedence. | Keep this layout for this repair round; a future migration to `devices/<id>/device.json` would need a schema and migration plan. Registry paths are absolute and need re-verification after moving the store. |
 | §6 seed | M3 strict parser, configurator, apply utility/service, injection and push exist. | Seed encoding and deletion choice are resolved below and in DESIGN.md. Hardware behavior remains unverified. |
 | §6.6 baseline | No generated images/artifacts/caches in sanitized workspace; image hashes unavailable without external inputs/build. | Keep this explicit limitation; before first installer build, capture hashes only if reproducible inputs are already present. Do not run an external build to fabricate baseline. |
 | §7 restore package | M6 packaging code and synthetic checks exist. | Package fixtures do not prove real backup provenance or physical restore behavior; preserve the full verified backup and all identity/calibration data required by the selected restore plan. |
 | §8 gates | M4 implements flash backup, live identity, input hash, typed confirmation, non-interactive and interrupted-state gates. | Real EDL, firmware provenance and hardware readback remain unverified. |
 | §9 docs | `docs/INSTALLER.md` and README quickstart updates are present in the worktree. | Documentation is uncommitted and must not imply hardware validation. |
 | §10 dashboard | No dashboard should be implemented. | Keep out of scope. |
+| Test sandbox store path | This sandbox exposes an empty read-only `/tmp/.git` marker. Literal fail-closed marker walking therefore treats `/tmp` as inside a Git worktree, and the CLI cannot initialize a private store there. | Keep the required fail-closed behavior. Repeat the CLI wizard doctor/backup path from an approved writable directory outside all `.git` marker ancestors. |
 
 ## Decision questions
 

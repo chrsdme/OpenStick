@@ -31,7 +31,14 @@ def args(stage, **values):
 class WizardTests(unittest.TestCase):
     def setUp(self):
         self.tmp = pathlib.Path(tempfile.mkdtemp(prefix="openstick-wizard-m7-"))
-        self.home = store.ensure_store(self.tmp / "private")
+        self._old_git_ceiling = os.environ.get("GIT_CEILING_DIRECTORIES")
+        os.environ["GIT_CEILING_DIRECTORIES"] = str(self.tmp.parent)
+        # Wizard unit tests use a prepared private-store fixture. Store location
+        # refusal has its own CLI and store tests; this sandbox marks /tmp/.git.
+        self.home = self.tmp / "private"
+        self.home.mkdir(mode=0o700)
+        for name in ("devices", "backups", "seeds", "builds", "images", "packages", "logs"):
+            (self.home / name).mkdir(mode=0o700)
         self.repo = self.tmp / "builder"
         self.repo.mkdir()
 
@@ -39,10 +46,15 @@ class WizardTests(unittest.TestCase):
         import shutil
         for path in sorted(self.tmp.rglob("*"), key=lambda item: len(item.parts), reverse=True):
             try:
-                os.chmod(path, 0o700 if path.is_dir() else 0o600)
+                if not path.is_symlink():
+                    os.chmod(path, 0o700 if path.is_dir() else 0o600)
             except OSError:
                 pass
         shutil.rmtree(self.tmp, ignore_errors=True)
+        if self._old_git_ceiling is None:
+            os.environ.pop("GIT_CEILING_DIRECTORIES", None)
+        else:
+            os.environ["GIT_CEILING_DIRECTORIES"] = self._old_git_ceiling
 
     def _state(self, names, pending=None):
         path = wizard._state_path(self.home, "synthetic-run")
@@ -240,6 +252,164 @@ class WizardTests(unittest.TestCase):
         with self.assertRaisesRegex(store.RefusedError, "cannot change during resume"):
             wizard.run(args("doctor", resume=True, wizard_device="cafebabe"), self.home, self.repo)
 
+    def test_every_stage_argument_builder_supplies_public_api_fields(self):
+        state = wizard._new_state("synthetic-run")
+        state["selection"] = {"device_id": "deadbeef", "backup_id": "backup",
+                               "build_id": "build", "seed_id": "seed",
+                               "image_set": "/tmp/set", "board": "ufi103s",
+                               "profile": "prod", "host": "user@host",
+                               "package_type": "restore", "package_output": "/tmp/pkg"}
+        expected = {
+            "doctor": {"home"}, "backup": {"paranoid", "again"},
+            "configure": {"seed", "profile", "show"},
+            "build": {"build_board", "profile", "bake_user_env"},
+            "inject": {"build", "seed"},
+            "flash": {"flash_device", "image_set", "reconcile_state"},
+            "verify": {"host", "device_id"}, "restore": {"restore_device", "restore_backup"},
+            "package": {"package_type", "package_output", "package_device"},
+        }
+        for stage, names in expected.items():
+            with self.subTest(stage=stage):
+                namespace = wizard._args_for(args(stage), stage, state, self.home)
+                for name in names:
+                    self.assertTrue(hasattr(namespace, name), "%s lacks %s" % (stage, name))
+        self.assertEqual(wizard._args_for(args("doctor"), "doctor", state, self.home).home, str(self.home))
+
+    def test_cli_wizard_dispatches_doctor_and_rejects_backup_after_failed_doctor(self):
+        """Exercise the public CLI; local missing hardware prerequisites keep doctor failed."""
+        fake_bin = self.tmp / "bin"
+        fake_bin.mkdir()
+        for name in ("edl", "fastboot", "debugfs", "e2fsck", "mke2fs"):
+            source = ROOT / "tests/shims/bin" / name
+            if source.exists():
+                (fake_bin / name).symlink_to(source)
+        env = dict(os.environ, PATH=str(fake_bin) + ":/usr/bin:/bin")
+        home = self.tmp / "cli-home"
+        run_id = "cli-doctor"
+        result = subprocess.run([str(ROOT / "openstick"), "--home", str(home), "wizard",
+                                 "--id", run_id, "--stage", "doctor"], env=env,
+                                text=True, capture_output=True)
+        state_path = home / "wizard" / (run_id + ".json")
+        # The ceiling lets the private store exist. Doctor then reports the
+        # unavailable EDL/loader/USB prerequisites; backup correctly depends
+        # on a successful doctor and is not dispatched yet.
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("PASS EDL client", result.stdout)
+        self.assertIn("FAIL Firehose loader", result.stdout)
+        self.assertNotIn("AttributeError", result.stderr)
+        backup = subprocess.run([str(ROOT / "openstick"), "--home", str(home), "wizard",
+                                 "--id", run_id, "--stage", "backup", "--resume",
+                                 "--device", "deadbeef"], env=env, text=True, capture_output=True)
+        self.assertEqual(backup.returncode, 2)
+        self.assertIn("requires completed stage(s): doctor", backup.stderr)
+        state = json.loads(state_path.read_text())
+        self.assertEqual([item["name"] for item in state["stages"]], ["doctor"])
+        self.assertEqual(state["stages"][0]["status"], "failed")
+
+    def test_inside_git_walks_markers_even_when_git_is_unavailable_and_through_symlinks(self):
+        repo = self.tmp / "repo"
+        repo.mkdir()
+        (repo / ".git").write_text("malformed gitdir marker\n")
+        nested = repo / "a" / "b"
+        nested.mkdir(parents=True)
+        link = self.tmp / "linked-repo"
+        link.symlink_to(repo, target_is_directory=True)
+        fake_bin = self.tmp / "no-git-bin"
+        fake_bin.mkdir()
+        fake_git = fake_bin / "git"
+        git_log = self.tmp / "git-invocations"
+        fake_git.write_text("#!/bin/sh\nprintf x >> \"$GIT_LOG\"\nexit 97\n")
+        fake_git.chmod(0o700)
+        with mock.patch.dict(os.environ, {"PATH": str(fake_bin), "GIT_LOG": str(git_log)}):
+            self.assertTrue(store._inside_git(nested / "future"))
+            self.assertTrue(store._inside_git(link / "a" / "b" / "future"))
+        self.assertFalse(git_log.exists(), "inside-git check must not call git")
+
+    def test_git_ceiling_allows_private_store_above_foreign_marker(self):
+        parent = self.tmp.parent
+        with mock.patch.dict(os.environ, {"GIT_CEILING_DIRECTORIES": str(parent)}):
+            path = self.tmp / "ceiling-store"
+            self.assertFalse(store._inside_git(path))
+            self.assertEqual(store.ensure_store(path), path)
+
+    def test_git_ceiling_still_blocks_markers_inside_walk_and_symlink_into_repo(self):
+        ceiling = self.tmp.parent
+        repo = self.tmp / "nested-repo"
+        repo.mkdir()
+        (repo / ".git").mkdir()
+        nested = repo / "child"
+        nested.mkdir()
+        link = self.tmp / "repo-link"
+        link.symlink_to(repo, target_is_directory=True)
+        marker_file_repo = self.tmp / "marker-file-repo"
+        marker_file_repo.mkdir()
+        (marker_file_repo / ".git").write_text("gitdir: /synthetic\n")
+        with mock.patch.dict(os.environ, {"GIT_CEILING_DIRECTORIES": str(ceiling)}):
+            self.assertTrue(store._inside_git(nested / "future"))
+            self.assertTrue(store._inside_git(marker_file_repo / "future"))
+            self.assertTrue(store._inside_git(link / "child" / "future"))
+
+    def test_git_ceiling_without_environment_keeps_foreign_marker_fail_closed(self):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("GIT_CEILING_DIRECTORIES", None)
+            self.assertTrue(store._inside_git(self.tmp / "future"))
+
+    def test_wizard_failed_stage_can_be_retried(self):
+        state_args = args("doctor", wizard_id="retry-doctor")
+        first = wizard.run(state_args, self.home, self.repo)
+        self.assertNotEqual(first, 0)
+        retry = wizard.run(args("doctor", wizard_id="retry-doctor", resume=True), self.home, self.repo)
+        self.assertNotEqual(retry, 0)
+        state = json.loads((self.home / "wizard/retry-doctor.json").read_text())
+        self.assertEqual([item["status"] for item in state["stages"]], ["failed", "failed"])
+
+    def test_cli_store_home_precedence_and_package_output_alias(self):
+        from tools.installer import cli
+        with mock.patch.dict(os.environ, {"OPENSTICK_HOME": str(self.tmp / "openstick-home"),
+                                         "XDG_DATA_HOME": str(self.tmp / "xdg")}):
+            self.assertEqual(cli.resolve_home(), self.tmp / "openstick-home")
+            self.assertEqual(cli.resolve_home(self.tmp / "explicit-home"), self.tmp / "explicit-home")
+        with mock.patch.dict(os.environ, {"XDG_DATA_HOME": str(self.tmp / "xdg")}, clear=True):
+            self.assertEqual(cli.resolve_home(), self.tmp / "xdg" / "openstick")
+        with mock.patch.dict(os.environ, {"HOME": str(self.tmp / "default-home")}, clear=True):
+            self.assertEqual(cli.resolve_home(), self.tmp / "default-home" / ".local/share/openstick")
+        help_result = subprocess.run([str(ROOT / "openstick"), "package", "restore", "--help"],
+                                     text=True, capture_output=True)
+        self.assertEqual(help_result.returncode, 0)
+        self.assertIn("--out", help_result.stdout)
+        self.assertIn("--output", help_result.stdout)
+        package_help = subprocess.run([str(ROOT / "openstick"), "package", "--help"],
+                                      text=True, capture_output=True)
+        self.assertIn("write scripts", package_help.stdout)
+        self.assertIn("UNVALIDATED on hardware", package_help.stdout)
+        for package_type in ("install", "restore"):
+            type_help = subprocess.run([str(ROOT / "openstick"), "package", package_type, "--help"],
+                                       text=True, capture_output=True)
+            self.assertIn("UNVALIDATED on hardware", type_help.stdout)
+            self.assertIn("require typed confirmation", type_help.stdout)
+        help_result = subprocess.run([str(ROOT / "openstick"), "package", "restore", "--help"],
+                                     text=True, capture_output=True)
+        self.assertIn("--out", help_result.stdout)
+        self.assertIn("--output", help_result.stdout)
+
+    def test_cli_unknown_exception_is_one_line_and_exit_one(self):
+        env = dict(os.environ, PYTHONPATH=str(ROOT), OPENSTICK_HOME=str(self.tmp / "home"))
+        code = ("from tools.installer import cli; "
+                "cli.doctor = lambda args: (_ for _ in ()).throw(RuntimeError('detail')); "
+                "raise SystemExit(cli.main(['doctor']))")
+        result = subprocess.run([sys.executable, "-c", code], cwd=ROOT, env=env,
+                                text=True, capture_output=True)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("unexpected exception", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_cli_only_specific_verification_errors_exit_three(self):
+        from tools.installer import cli
+        with mock.patch.object(cli, "doctor", side_effect=ValueError("ordinary invalid input")):
+            self.assertEqual(cli.main(["doctor"]), 1)
+        with mock.patch.object(cli, "doctor", side_effect=cli.VerificationError("bad readback")):
+            self.assertEqual(cli.main(["doctor"]), 3)
+
     def test_selected_image_set_checks_hashes_and_rejects_unlisted_files(self):
         image_set = self.tmp / "image-set"
         image_set.mkdir()
@@ -328,6 +498,9 @@ class WizardTests(unittest.TestCase):
         m5_helpers.make_disk(disk)
         bin_dir = self.tmp / "fake-bin"
         bin_dir.mkdir()
+        edl = bin_dir / "edl"
+        edl.write_bytes((ROOT / "tests/shims/bin/edl").read_bytes())
+        edl.chmod(0o700)
         ssh = bin_dir / "ssh"
         ssh.write_text("#!/bin/sh\ncat >/dev/null\n" + "".join(
             "printf '%s\\t%s\\t%s\\n'\n" % ("PASS", key, "synthetic evidence")
@@ -413,6 +586,7 @@ class WizardTests(unittest.TestCase):
         spec.loader.exec_module(helpers)
         fixture = helpers.M5Tests("test_restore_fake_disk_is_byte_identical_and_records_each_phase")
         fixture.setUp()
+        fixture.env["GIT_CEILING_DIRECTORIES"] = str(fixture.tmp.parent)
         try:
             # Simulate a changed userdata partition after the verified stock backup.
             with fixture.disk.open("r+b") as stream:

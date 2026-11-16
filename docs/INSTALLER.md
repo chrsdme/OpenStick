@@ -6,7 +6,9 @@ This guide describes the installer commands available in this source tree. The o
 
 Use Linux with Debian 12 Bookworm and Python 3.9 or newer. The launcher uses the Python standard library. Individual commands need additional tools: build needs the existing builder toolchain and an already prepared `out/base-bookworm-arm64.tar.gz`; image assembly needs the existing filesystem tools; backup, flash and restore need the matching external EDL/fastboot tools when run on real hardware. The `doctor` output lists local prerequisites, but passing `doctor` is not proof that a board or firmware is supported.
 
-The default private store is `~/.local/share/openstick`. Use `--home DIR` to place it elsewhere. The store must be outside every Git worktree, must not pass through symlinks, and is created with private directory and file permissions. Keep backups and personalized artifacts on encrypted storage and make a second offline copy of a verified backup. A full eMMC backup contains unique identity and calibration data; do not share it or put it in Git.
+The private store path uses this precedence: `--home DIR`, `OPENSTICK_HOME`, `${XDG_DATA_HOME}/openstick`, then `~/.local/share/openstick`. The store must be outside every Git worktree, must not pass through symlinks, and is created with private directory and file permissions. Keep backups and personalized artifacts on encrypted storage and make a second offline copy of a verified backup. A full eMMC backup contains unique identity and calibration data; do not share it or put it in Git.
+
+The current registry uses a single `registry.json` plus an append-only `events.jsonl` in the store root. It does not use the specification's per-device `devices/<id>/device.json` and per-device event files. Seed application history is recorded in the registry; other device details remain in its device entry.
 
 ## First-run inspection
 
@@ -19,6 +21,8 @@ Start with read-only diagnostics and inspect registered state:
 ```
 
 The current wizard runs one named stage at a time, recording run history under the private store:
+
+CLI details: `build` requires both `--profile` and `--board`; `verify` requires `--host`; and `wizard` requires an explicit `--stage` on every call. `package restore` and `package install` accept either `--output PATH` or its `--out PATH` alias.
 
 ```sh
 ./openstick wizard --id my-first-run --stage backup --resume
@@ -82,4 +86,4 @@ No physical device flash was attempted by this work. Before a human performs har
 
 ## Exit status and recovery
 
-The launcher uses exit `0` for success, `1` for operational error or interruption, `2` for a refused safety gate, and `3` for verification failure. Preserve the event log and phase state after any failure. For uncertain destructive state, stop, keep the device in its current mode if safe, and have the owner inspect it against the phase plan before any explicit reconciliation. Do not clear state by editing registry files.
+The launcher uses exit `0` for success, `1` for operational error or interruption, `2` for a refused safety gate, and `3` for a specific integrity or read-back verification failure. Unexpected exceptions exit `1`; add `--debug` to request a traceback. The launcher does not redact arbitrary exception text, so secrets must never be included in exception messages. Preserve the event log and phase state after any failure. For uncertain destructive state, stop, keep the device in its current mode if safe, and have the owner inspect it against the phase plan before any explicit reconciliation. Do not clear state by editing registry files.
