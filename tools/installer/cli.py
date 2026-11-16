@@ -14,6 +14,7 @@ import signal
 import zlib
 import subprocess
 import datetime
+import traceback
 from pathlib import Path
 
 from . import store
@@ -24,34 +25,38 @@ EXIT_OK = 0
 EXIT_ERROR = 1
 EXIT_REFUSED = 2
 EXIT_VERIFY = 3
+class VerificationError(Exception):
+    """A concrete integrity or read-back verification failure."""
+
 LOADER_SHA256 = "959439aa5864685999b713c3ed12ad5fa408149648b670a9a9ef77bcc9dcab14"
 LOADER_NAME = "prog_emmc_firehose_8916.mbn"
 
 
-def _redact(message):
-    text = str(message)
-    for key in ("WIFI_PSK", "PASSWORD", "APN_PASSWORD", "ROOT_PASSWORD_HASH", "SSH_PRIVATE_KEY"):
-        # Do not print environment-provided values if an exception includes one.
-        value = os.environ.get(key)
-        if value:
-            text = text.replace(value, "[REDACTED]")
-    return text
-
-
 def log(message, verbose=False, enabled=False):
     if not verbose or enabled:
-        print(_redact(message), file=sys.stderr if enabled else sys.stdout)
+        print(str(message), file=sys.stderr if enabled else sys.stdout)
 
 
 def default_home():
-    return Path(os.environ.get("XDG_DATA_HOME", str(Path.home() / ".local" / "share"))) / "openstick"
+    return resolve_home(None)
+
+
+def resolve_home(explicit=None):
+    if explicit:
+        return Path(explicit).expanduser()
+    if os.environ.get("OPENSTICK_HOME"):
+        return Path(os.environ["OPENSTICK_HOME"]).expanduser()
+    if os.environ.get("XDG_DATA_HOME"):
+        return Path(os.environ["XDG_DATA_HOME"]).expanduser() / "openstick"
+    return Path.home() / ".local" / "share" / "openstick"
 
 
 def parser():
     p = argparse.ArgumentParser(prog="openstick", description="Safe OpenStick installer and device registry.")
-    p.add_argument("--home", metavar="DIR", help="private state directory (default: %(default)s)", default=str(default_home()))
+    p.add_argument("--home", metavar="DIR", help="private state directory (default: OPENSTICK_HOME, XDG_DATA_HOME, or ~/.local/share/openstick)")
     p.add_argument("--dry-run", action="store_true", help="show planned changes without writing")
     p.add_argument("--verbose", action="store_true", help="show diagnostic details")
+    p.add_argument("--debug", action="store_true", help="show a traceback for unexpected errors")
     p.add_argument("--no-color", action="store_true", help="disable colored output")
     p.add_argument("--board", metavar="NAME", help="select a board class")
     p.add_argument("--device", metavar="ID", help="select a registered device")
@@ -106,7 +111,7 @@ def parser():
         create.add_argument("--device", dest="package_device", metavar="ID")
         create.add_argument("--backup", dest="package_backup", metavar="ID")
         create.add_argument("--image-set", dest="package_image_set", metavar="PATH")
-        create.add_argument("--output", dest="package_output", required=True, metavar="PATH")
+        create.add_argument("--output", "--out", dest="package_output", required=True, metavar="PATH")
     package_verify = ps.add_parser("verify", help="verify package integrity without executing its contents")
     package_verify.add_argument("path", metavar="PATH")
     image_set = subs.add_parser("image-set", help="prepare or verify a hash-bound GPT-T build image set")
@@ -186,7 +191,7 @@ def doctor(args):
     except store.RefusedError as exc:
         checks.append(("Private store location", False, str(exc)))
     for name, ok, detail in checks:
-        print("%s %s: %s" % ("PASS" if ok else "FAIL", name, _redact(detail)))
+        print("%s %s: %s" % ("PASS" if ok else "FAIL", name, detail))
         if not ok:
             if name in ("python3", "bash", "e2fsprogs", "fastboot", "EDL client", "Firehose loader"):
                 print("  Install hint: Debian: apt install python3 bash e2fsprogs android-sdk-platform-tools; Fedora: dnf install python3 bash e2fsprogs android-tools")
@@ -203,44 +208,44 @@ def _find_device(registry, ident):
 def _parse_gpt(path):
     size = path.stat().st_size
     if size % 512 or size < 1024:
-        raise ValueError("image size is not a whole number of sectors")
+        raise VerificationError("image size is not a whole number of sectors")
     sectors = size // 512
     def hdr(lba):
         with path.open("rb") as f:
             f.seek(lba * 512); raw = f.read(512)
-        if len(raw) != 512 or raw[:8] != b"EFI PART": raise ValueError("GPT header signature is invalid")
+        if len(raw) != 512 or raw[:8] != b"EFI PART": raise VerificationError("GPT header signature is invalid")
         rev, hsize, crc, reserved = struct.unpack_from("<IIII", raw, 8)
         cur, alt, first, last = struct.unpack_from("<QQQQ", raw, 24)
         elba, count, esize, ecrc = struct.unpack_from("<QIII", raw, 72)
         if hsize < 92 or hsize > 512 or reserved or cur != lba or alt >= sectors or first > last or last >= sectors:
-            raise ValueError("GPT header geometry is invalid")
+            raise VerificationError("GPT header geometry is invalid")
         check = bytearray(raw[:hsize]); struct.pack_into("<I", check, 16, 0)
-        if zlib.crc32(check) & 0xffffffff != crc: raise ValueError("GPT header CRC mismatch")
+        if zlib.crc32(check) & 0xffffffff != crc: raise VerificationError("GPT header CRC mismatch")
         if count < 1 or esize < 128 or esize % 8 or count * esize > size:
-            raise ValueError("GPT entry geometry is invalid")
+            raise VerificationError("GPT entry geometry is invalid")
         with path.open("rb") as f:
             f.seek(elba * 512); entries = f.read(count * esize)
         if len(entries) != count * esize or zlib.crc32(entries) & 0xffffffff != ecrc:
-            raise ValueError("GPT partition table CRC mismatch")
+            raise VerificationError("GPT partition table CRC mismatch")
         rows=[]
         for i in range(count):
             e=entries[i*esize:(i+1)*esize]
             if e[:16] == b"\0"*16: continue
             start,end=struct.unpack_from("<QQ",e,32)
             name=e[56: min(128,esize)].decode("utf-16le", "strict").rstrip("\0")
-            if not name or start < first or end < start or end > last: raise ValueError("GPT partition boundary is invalid")
+            if not name or start < first or end < start or end > last: raise VerificationError("GPT partition boundary is invalid")
             rows.append((name,start,end))
         return alt, first, last, rows
     p=hdr(1)
-    if p[0] != sectors-1: raise ValueError("primary GPT does not point to the final disk sector")
+    if p[0] != sectors-1: raise VerificationError("primary GPT does not point to the final disk sector")
     b=hdr(sectors-1)
-    if b[0] != 1 or p[1:3] != b[1:3] or p[3] != b[3]: raise ValueError("primary and backup GPT disagree")
+    if b[0] != 1 or p[1:3] != b[1:3] or p[3] != b[3]: raise VerificationError("primary and backup GPT disagree")
     ordered=sorted(p[3], key=lambda row: row[1]); prior=p[1]-1
     for _, start, end in ordered:
-        if start <= prior: raise ValueError("GPT partitions overlap")
+        if start <= prior: raise VerificationError("GPT partitions overlap")
         prior=end
     by={n:(s,e) for n,s,e in ordered}
-    if not all(n in by for n in ("fsg","sec","fsc")): raise ValueError("GPT lacks required identity partitions")
+    if not all(n in by for n in ("fsg","sec","fsc")): raise VerificationError("GPT lacks required identity partitions")
     return by
 
 
@@ -250,7 +255,7 @@ def _hash_range(path, start, end):
         f.seek(start*512); left=(end-start+1)*512
         while left:
             data=f.read(min(left, 8*1024*1024))
-            if not data: raise ValueError("partition data is truncated")
+            if not data: raise VerificationError("partition data is truncated")
             h.update(data); left-=len(data)
     return h.hexdigest()
 
@@ -303,7 +308,7 @@ def backup_command(args, root):
         if args.paranoid:
             second=staging/"comparison.bin"; read_to(second)
             if dump.stat().st_size != second.stat().st_size or _sha_file(dump)!=_sha_file(second):
-                raise ValueError("paranoid full read comparison failed")
+                raise VerificationError("paranoid full read comparison failed")
             second.unlink()
         parts=_parse_gpt(dump)
         image_hash=hashlib.sha256()
@@ -407,7 +412,7 @@ def inject_seed(args, root):
     original_sha = _sha_file(original)
     check = subprocess.run([e2fsck, "-fn", str(original)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if check.returncode != 0:
-        raise ValueError("generic rootfs image failed read-only filesystem validation")
+        raise VerificationError("generic rootfs image failed read-only filesystem validation")
     target_dir = build_dir / ("personal-" + args.seed)
     if target_dir.exists() or target_dir.is_symlink():
         raise store.RefusedError("personalized image destination already exists")
@@ -435,19 +440,19 @@ def inject_seed(args, root):
         os.chmod(target, 0o600)
         inject = subprocess.run([debugfs, "-w", "-R", "write %s /etc/openstick/seed.env" % _debugfs_quote(payload), str(target)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         if inject.returncode:
-            raise ValueError("debugfs seed injection failed")
+            raise VerificationError("debugfs seed injection failed")
         for field in ("uid", "gid"):
             owner = subprocess.run([debugfs, "-w", "-R", "set_inode_field /etc/openstick/seed.env %s 0" % field, str(target)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             if owner.returncode:
-                raise ValueError("debugfs seed ownership update failed")
+                raise VerificationError("debugfs seed ownership update failed")
         check = subprocess.run([e2fsck, "-fn", str(target)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         if check.returncode != 0:
-            raise ValueError("personalized rootfs failed read-only filesystem validation")
+            raise VerificationError("personalized rootfs failed read-only filesystem validation")
         dump = subprocess.run([debugfs, "-R", "dump -p /etc/openstick/seed.env %s" % _debugfs_quote(readback), str(target)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         if dump.returncode or not readback.is_file() or _sha_file(readback) != _sha_file(seed_path):
-            raise ValueError("injected seed read-back SHA-256 mismatch")
+            raise VerificationError("injected seed read-back SHA-256 mismatch")
         if _sha_file(original) != original_sha:
-            raise ValueError("generic rootfs image changed during injection")
+            raise VerificationError("generic rootfs image changed during injection")
         manifest = {"sensitive": True, "build_id": args.build, "seed_name": args.seed, "seed_sha256": _sha_file(seed_path), "rootfs_sha256": _sha_file(target), "verified_by": ["debugfs-injection", "e2fsck-read-only", "debugfs-readback-sha256"]}
         out = staging / "personal.json"
         out.write_text(json.dumps(manifest, sort_keys=True, indent=2) + "\n", encoding="utf-8")
@@ -498,6 +503,7 @@ def push_seed(args, root):
 
 def main(argv=None):
     args = parser().parse_args(argv)
+    args.home = str(resolve_home(args.home))
     try:
         if args.command == "doctor":
             return doctor(args)
@@ -542,14 +548,23 @@ def main(argv=None):
             return wizard.run(args, root, Path(__file__).resolve().parents[2])
         return device_command(args, root)
     except store.RefusedError as exc:
-        print("REFUSED: " + _redact(exc), file=sys.stderr)
+        print("REFUSED: " + str(exc), file=sys.stderr)
         return EXIT_REFUSED
     except KeyboardInterrupt:
         print("ERROR: operation interrupted; temporary staging removed. If a destructive flash or restore phase had started, inspect device state and run the matching flash --reconcile-state or restore --reconcile-state before any new write.", file=sys.stderr)
         return EXIT_ERROR
+    except VerificationError as exc:
+        print("FAIL verification: " + str(exc), file=sys.stderr)
+        return EXIT_VERIFY
     except (store.StoreError, OSError, ValueError, json.JSONDecodeError) as exc:
-        print("ERROR: " + _redact(exc), file=sys.stderr)
-        return EXIT_VERIFY if isinstance(exc, ValueError) else EXIT_ERROR
+        print("ERROR: " + str(exc), file=sys.stderr)
+        return EXIT_ERROR
+    except Exception as exc:
+        if args.debug:
+            traceback.print_exc(file=sys.stderr)
+        else:
+            print("ERROR: unexpected exception (%s)" % type(exc).__name__, file=sys.stderr)
+        return EXIT_ERROR
 
 
 if __name__ == "__main__":
