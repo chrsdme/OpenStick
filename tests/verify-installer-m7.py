@@ -31,7 +31,12 @@ def args(stage, **values):
 class WizardTests(unittest.TestCase):
     def setUp(self):
         self.tmp = pathlib.Path(tempfile.mkdtemp(prefix="openstick-wizard-m7-"))
-        self.home = store.ensure_store(self.tmp / "private")
+        # Wizard unit tests use a prepared private-store fixture. Store location
+        # refusal has its own CLI and store tests; this sandbox marks /tmp/.git.
+        self.home = self.tmp / "private"
+        self.home.mkdir(mode=0o700)
+        for name in ("devices", "backups", "seeds", "builds", "images", "packages", "logs"):
+            (self.home / name).mkdir(mode=0o700)
         self.repo = self.tmp / "builder"
         self.repo.mkdir()
 
@@ -239,6 +244,117 @@ class WizardTests(unittest.TestCase):
             wizard.run(args("doctor"), self.home, self.repo)
         with self.assertRaisesRegex(store.RefusedError, "cannot change during resume"):
             wizard.run(args("doctor", resume=True, wizard_device="cafebabe"), self.home, self.repo)
+
+    def test_every_stage_argument_builder_supplies_public_api_fields(self):
+        state = wizard._new_state("synthetic-run")
+        state["selection"] = {"device_id": "deadbeef", "backup_id": "backup",
+                               "build_id": "build", "seed_id": "seed",
+                               "image_set": "/tmp/set", "board": "ufi103s",
+                               "profile": "prod", "host": "user@host",
+                               "package_type": "restore", "package_output": "/tmp/pkg"}
+        expected = {
+            "doctor": {"home"}, "backup": {"paranoid", "again"},
+            "configure": {"seed", "profile", "show"},
+            "build": {"build_board", "profile", "bake_user_env"},
+            "inject": {"build", "seed"},
+            "flash": {"flash_device", "image_set", "reconcile_state"},
+            "verify": {"host", "device_id"}, "restore": {"restore_device", "restore_backup"},
+            "package": {"package_type", "package_output", "package_device"},
+        }
+        for stage, names in expected.items():
+            with self.subTest(stage=stage):
+                namespace = wizard._args_for(args(stage), stage, state, self.home)
+                for name in names:
+                    self.assertTrue(hasattr(namespace, name), "%s lacks %s" % (stage, name))
+        self.assertEqual(wizard._args_for(args("doctor"), "doctor", state, self.home).home, str(self.home))
+
+    def test_cli_wizard_is_refused_by_git_marker_before_dispatch(self):
+        """The sandbox's /tmp/.git marker blocks private store setup before stage dispatch."""
+        import shutil
+        fake_bin = self.tmp / "bin"
+        fake_bin.mkdir()
+        for name in ("edl", "fastboot", "debugfs", "e2fsck", "mke2fs"):
+            source = ROOT / "tests/shims/bin" / name
+            if source.exists():
+                (fake_bin / name).symlink_to(source)
+        env = dict(os.environ, PATH=str(fake_bin) + ":/usr/bin:/bin")
+        home = self.tmp / "cli-home"
+        run_id = "cli-doctor"
+        result = subprocess.run([str(ROOT / "openstick"), "--home", str(home), "wizard",
+                                 "--id", run_id, "--stage", "doctor"], env=env,
+                                text=True, capture_output=True)
+        state_path = home / "wizard" / (run_id + ".json")
+        # The sandbox's read-only /tmp/.git marker is intentionally fail-closed,
+        # so the public command is rejected before wizard dispatch here.
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("outside every Git worktree", result.stderr)
+        self.assertNotIn("AttributeError", result.stderr)
+
+    def test_inside_git_walks_markers_even_when_git_is_unavailable_and_through_symlinks(self):
+        repo = self.tmp / "repo"
+        repo.mkdir()
+        (repo / ".git").write_text("malformed gitdir marker\n")
+        nested = repo / "a" / "b"
+        nested.mkdir(parents=True)
+        link = self.tmp / "linked-repo"
+        link.symlink_to(repo, target_is_directory=True)
+        fake_bin = self.tmp / "no-git-bin"
+        fake_bin.mkdir()
+        fake_git = fake_bin / "git"
+        git_log = self.tmp / "git-invocations"
+        fake_git.write_text("#!/bin/sh\nprintf x >> \"$GIT_LOG\"\nexit 97\n")
+        fake_git.chmod(0o700)
+        with mock.patch.dict(os.environ, {"PATH": str(fake_bin), "GIT_LOG": str(git_log)}):
+            self.assertTrue(store._inside_git(nested / "future"))
+            self.assertTrue(store._inside_git(link / "a" / "b" / "future"))
+        self.assertFalse(git_log.exists(), "inside-git check must not call git")
+
+    def test_cli_wizard_failed_stage_can_be_retried(self):
+        state_args = args("doctor", wizard_id="retry-doctor")
+        first = wizard.run(state_args, self.home, self.repo)
+        self.assertNotEqual(first, 0)
+        retry = wizard.run(args("doctor", wizard_id="retry-doctor", resume=True), self.home, self.repo)
+        self.assertNotEqual(retry, 0)
+        state = json.loads((self.home / "wizard/retry-doctor.json").read_text())
+        self.assertEqual([item["status"] for item in state["stages"]], ["failed", "failed"])
+
+    def test_cli_store_home_precedence_and_package_output_alias(self):
+        from tools.installer import cli
+        with mock.patch.dict(os.environ, {"OPENSTICK_HOME": str(self.tmp / "openstick-home"),
+                                         "XDG_DATA_HOME": str(self.tmp / "xdg")}):
+            self.assertEqual(cli.resolve_home(), self.tmp / "openstick-home")
+            self.assertEqual(cli.resolve_home(self.tmp / "explicit-home"), self.tmp / "explicit-home")
+        with mock.patch.dict(os.environ, {"XDG_DATA_HOME": str(self.tmp / "xdg")}, clear=True):
+            self.assertEqual(cli.resolve_home(), self.tmp / "xdg" / "openstick")
+        with mock.patch.dict(os.environ, {"HOME": str(self.tmp / "default-home")}, clear=True):
+            self.assertEqual(cli.resolve_home(), self.tmp / "default-home" / ".local/share/openstick")
+        help_result = subprocess.run([str(ROOT / "openstick"), "package", "restore", "--help"],
+                                     text=True, capture_output=True)
+        self.assertEqual(help_result.returncode, 0)
+        self.assertIn("--out", help_result.stdout)
+        self.assertIn("--output", help_result.stdout)
+        help_result = subprocess.run([str(ROOT / "openstick"), "package", "restore", "--help"],
+                                     text=True, capture_output=True)
+        self.assertIn("--out", help_result.stdout)
+        self.assertIn("--output", help_result.stdout)
+
+    def test_cli_unknown_exception_is_one_line_and_exit_one(self):
+        env = dict(os.environ, PYTHONPATH=str(ROOT), OPENSTICK_HOME=str(self.tmp / "home"))
+        code = ("from tools.installer import cli; "
+                "cli.doctor = lambda args: (_ for _ in ()).throw(RuntimeError('detail')); "
+                "raise SystemExit(cli.main(['doctor']))")
+        result = subprocess.run([sys.executable, "-c", code], cwd=ROOT, env=env,
+                                text=True, capture_output=True)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("unexpected exception", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_cli_only_specific_verification_errors_exit_three(self):
+        from tools.installer import cli
+        with mock.patch.object(cli, "doctor", side_effect=ValueError("ordinary invalid input")):
+            self.assertEqual(cli.main(["doctor"]), 1)
+        with mock.patch.object(cli, "doctor", side_effect=cli.VerificationError("bad readback")):
+            self.assertEqual(cli.main(["doctor"]), 3)
 
     def test_selected_image_set_checks_hashes_and_rejects_unlisted_files(self):
         image_set = self.tmp / "image-set"

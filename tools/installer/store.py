@@ -2,8 +2,6 @@
 import json
 import os
 import stat
-import subprocess
-import shutil
 import tempfile
 from pathlib import Path
 
@@ -30,18 +28,20 @@ def _has_symlink_component(path):
 
 
 def _inside_git(path):
-    current = Path(path)
+    try:
+        current = Path(path).resolve(strict=False)
+    except (OSError, RuntimeError):
+        return True
     while True:
+        marker = current / ".git"
         try:
-            git = shutil.which("git") or ("/usr/bin/git" if os.path.exists("/usr/bin/git") else "git")
-            result = subprocess.run(
-                [git, "-C", str(current), "rev-parse", "--is-inside-work-tree"],
-                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=2,
-            )
-            if result.returncode == 0 and result.stdout.strip() == "true":
-                return True
-        except (OSError, subprocess.TimeoutExpired):
+            os.lstat(marker)
+            return True
+        except FileNotFoundError:
             pass
+        except OSError:
+            # An unreadable parent or marker makes the location indeterminate.
+            return True
         if current.parent == current:
             return False
         current = current.parent
