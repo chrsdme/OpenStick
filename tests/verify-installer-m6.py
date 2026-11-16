@@ -652,7 +652,8 @@ def run():
             for member in src.getmembers():
                 content = src.extractfile(member).read() if member.isfile() else None
                 if member.name == "payload/emmc-full.bin":
-                    content = content[:-1] + bytes([content[-1] ^ 1])
+                    offset = 200 * 512
+                    content = content[:offset] + bytes([content[offset] ^ 1]) + content[offset + 1:]
                 dst.addfile(member, __import__("io").BytesIO(content) if content is not None else None)
         try:
             packages.verify_package(tampered)
