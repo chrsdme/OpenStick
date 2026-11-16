@@ -22,6 +22,9 @@ from . import store
 
 
 IDENTITY = ("fsg", "sec", "fsc")
+INITIAL_FULL_READ_TIMEOUT_SECONDS = 300
+FINAL_FULL_READ_TIMEOUT_SECONDS = 600
+EDL_COMMAND_TIMEOUT_SECONDS = 600
 RESTORE_ORDER = ("userdata", "cache", "persist", "boot", "modemst1", "modemst2",
                  "sbl1", "rpm", "tz", "tzbak", "hyp", "aboot")
 PLAN_PHASES = ("pad",) + RESTORE_ORDER + ("gpt-secondary", "gpt-primary")
@@ -244,7 +247,7 @@ def _live(edl, env, loader, directory, expected_id):
         raise store.RefusedError("live EDL serial unavailable")
     dump = directory / "live-before.bin"
     read = subprocess.run([edl, "rf", str(dump), "--loader=" + str(loader), "--memory=emmc"], stdout=subprocess.PIPE,
-                          stderr=subprocess.PIPE, env=env, timeout=300)
+                          stderr=subprocess.PIPE, env=env, timeout=INITIAL_FULL_READ_TIMEOUT_SECONDS)
     if read.returncode or not dump.is_file() or dump.stat().st_size % 512:
         raise store.RefusedError("live EDL full-disk read failed")
     parts = common._parse_gpt(dump)
@@ -404,7 +407,7 @@ def _confirm(phase, device_id):
         raise store.RefusedError("non-interactive restore is read-only")
     expected = "restore %s %s" % (device_id[-8:], phase)
     print("Type exactly: " + expected)
-    if input("> ").strip() != expected:
+    if input("> ") != expected:
         raise store.RefusedError("restore confirmation did not match")
     return expected
 
@@ -701,7 +704,8 @@ def _run_fwlib_phase(engine, edl, env, loader, prepared, work, write):
 def _verify_final_disk(edl, env, loader, work, manifest, state):
     final = work / "final-full.bin"
     try:
-        _edl(edl, ["rf", str(final), "--loader=" + str(loader), "--memory=emmc"], env)
+        _edl(edl, ["rf", str(final), "--loader=" + str(loader), "--memory=emmc"], env,
+             timeout=FINAL_FULL_READ_TIMEOUT_SECONDS)
         matched = final.is_file() and final.stat().st_size == manifest["size"] and _sha(final) == manifest["sha256"]
     except (store.RefusedError, OSError, subprocess.TimeoutExpired):
         matched = False
@@ -712,9 +716,9 @@ def _verify_final_disk(edl, env, loader, work, manifest, state):
     print("PASS final full-disk readback exactly matches the verified backup SHA-256")
 
 
-def _edl(edl, args, env):
+def _edl(edl, args, env, timeout=EDL_COMMAND_TIMEOUT_SECONDS):
     result = subprocess.run([edl] + args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                            env=env, timeout=600)
+                            env=env, timeout=timeout)
     if result.returncode:
         raise store.RefusedError("EDL phase command failed; operation stopped")
     return result
