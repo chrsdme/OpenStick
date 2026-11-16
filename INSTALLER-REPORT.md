@@ -1,6 +1,6 @@
 # OpenStick installer verification report
 
-This report reflects the merged `installer` tree after the Phase 2 integration run. Tests used fake EDL, SSH, fastboot, and build shims. No hardware, sudo, network, real image, or real backup was used.
+This report reflects the merged `installer` tree after hardware fix round 1. Tests use fake EDL, SSH, fastboot, and build shims. No EDL client, sudo, network, real image, or real backup was used. During an earlier M7 validation, the doctor stage read host sysfs and queried device-node permission metadata; it did not run EDL or open, read, or write the device node. The aggregate runner was not rerun after that was identified.
 
 ## Milestones
 
@@ -15,21 +15,21 @@ This report reflects the merged `installer` tree after the Phase 2 integration r
 | M6 Packages | `8593ca0` | VERIFIED-WITH-SHIMS |
 | M7 Wizard and docs | `8593ca0` | PARTIAL |
 
-The required merged branch order was B, A, C, D. Merge commits are `1a5bf0b`, `c11522e`, `3d9cbe3`, and `d0eb749`. Phase 2 integration fixes are in `245af35`; the isolated package hash regression is in `2118b07`. The `baseline` tag remains at `e4cf01b`. M5, M6, and M7 remain grouped in the existing checkpoint commit; history was not rewritten.
+The prior installer work merged branches B, A, C, D in order with merge commits `1a5bf0b`, `c11522e`, `3d9cbe3`, and `d0eb749`. Phase 2 integration fixes are in `245af35`; the isolated package hash regression is in `2118b07`. Hardware fix round 1 merged E, F, G in order with merge commits `a8b9ffc`, `45f3cbd`, and `54268f8`, from work commits `79bf49f` through `1911983`. The `baseline` tag remains at `e4cf01b`; history was not rewritten.
 
-The final aggregate runner result was **26 PASS, 0 FAIL, 0 SKIP**. Standalone results: M3 **15/15**, M4 **25/25**, M5 **25/25**, M6 composite assertion suite **PASS**, M7 **25/25**. M6 is an assert-based composite script and emits no numeric case total. Nested optional legacy checks reported their own skips for unavailable cross compiler, container-backed nft check, or real backup data.
+The pre-hardware-round aggregate runner result was **26 PASS, 0 FAIL, 0 SKIP**. After hardware fix round 1, the aggregate runner was withheld because its M7 doctor invocation inspects host sysfs and `/dev`. Focused synthetic suites passed: M2 **10/10**, doctor **10/10**, M3 **15/15**, M4 **25/25**, M5 **25/25**, and M6 composite package checks **PASS**. M7 **25/25** was recorded before the host-device check restriction and was not rerun. M6 is an assert-based composite script and emits no numeric case total.
 
 ## Feature evidence
 
 ### CLI, private store, and doctor
 
-**Tested with shims:** `test_git_ceiling_allows_private_store_above_foreign_marker`, `test_git_ceiling_still_blocks_markers_inside_walk_and_symlink_into_repo`, `test_git_ceiling_without_environment_keeps_foreign_marker_fail_closed`, `test_cli_unknown_exception_is_one_line_and_exit_one`, `test_cli_only_specific_verification_errors_exit_three`, and the aggregate runner's store and doctor checks.
+**Tested with shims:** `test_git_ceiling_allows_private_store_above_foreign_marker`, `test_git_ceiling_still_blocks_markers_inside_walk_and_symlink_into_repo`, `test_git_ceiling_without_environment_keeps_foreign_marker_fail_closed`, `test_cli_unknown_exception_is_one_line_and_exit_one`, `test_cli_only_specific_verification_errors_exit_three`, and `tests/verify-installer-doctor.py` (10/10).
 
-**Needs real hardware:** Actual USB permissions, installed EDL client output, and pinned loader availability. On this host, doctor reports the loader and USB prerequisites unavailable.
+**Needs real hardware:** Actual EDL client output, pinned loader acceptance, and USB permissions on the target. Fixture tests cover USB device present with and without access, absent device, and resolver behavior.
 
 ### Backup, verify, and restore
 
-**Tested with shims:** `backup-success-and-integrity`, `backup-failures-cleanup`, `test_restore_fake_disk_is_byte_identical_and_records_each_phase`, `test_restore_final_read_timeout_is_exit3_and_blocks_boot_recommendation`, `test_restore_final_read_checks_size_even_when_hash_matches`, and the M5 suite. The final-read timeout raises the shared `VerificationError`, maps to exit 3, persists the failed state, and blocks boot guidance.
+**Tested with shims:** M2 10/10, including `test_backup_identity_uses_sahara_serial_and_required_loader_flags`, `test_parse_sahara_info_accepts_transcript_and_rejects_malformed_or_absent_blocks`, and `test_hang_sends_sigint_reports_power_cycle_and_does_not_register_backup`; M5 25/25, including `test_restore_fake_disk_is_byte_identical_and_records_each_phase`, `test_restore_final_read_timeout_is_exit3_and_blocks_boot_recommendation`, and `test_restore_final_read_checks_size_even_when_hash_matches`. Backup identity uses the Sahara block from a short GPT-range read; full backup and restore reads use named long timeouts. Timeout failures interrupt the client, terminate it after the grace period, and block registration or boot guidance.
 
 **Needs real hardware:** EDL protocol compatibility, device-specific ranges, real flash read/write behavior, USB reliability, and physical restore/readback.
 
@@ -41,13 +41,13 @@ The final aggregate runner result was **26 PASS, 0 FAIL, 0 SKIP**. Standalone re
 
 ### Build and image sets
 
-**Tested with shims:** M4's 25 cases, including `test_build_generic_and_legacy_env_order_and_permissions`, `test_common_config_isolation_and_legacy_precedence`, the build argv and root-refusal checks, and GPT-T image-set hash and layout validation.
+**Tested with shims:** M4's 25 cases, including `test_build_generic_and_legacy_env_order_and_permissions`, `test_common_config_isolation_and_legacy_precedence`, the build argv and root-refusal checks, GPT-T image-set hash and layout validation, `test_flash_identity_check_reads_only_backup_identity_ranges`, and `test_flash_uses_one_edl_command_for_identity_and_engine`.
 
 **Needs real hardware:** A rootful image build with the prepared base tarball and pinned inputs, boot behavior, filesystem content on the target image, and device acceptance of GPT-T.
 
 ### Flash and restore gates
 
-**Tested with shims:** `test_flash_identity_check_reads_only_backup_identity_ranges`, `test_flash_uses_one_edl_command_for_identity_and_engine`, `test_flash_wrong_confirmation_and_noninteractive_dry_only`, `test_flash_dry_confirmation_protocol_and_failure_stop`, and the M6 portable install scenario. The portable install writes only the two GPT ranges in its fake target, then stops because post-GPT identity LBAs are not hardware-validated. The GPT-T first-install path refuses with `HARDWARE_REQUIRED`.
+**Tested with shims:** M4 25/25, M5 25/25, and M6 synthetic package checks. Direct identity and range reads, restore verification, and packaged restore operations now pass through the shared EDL runner or a self-contained generated package adapter with the verified absolute loader and `--memory=emmc`. Engine invocations log their command and supply the resolved client and loader. The portable install writes only the two GPT ranges in its fake target, then stops because post-GPT identity LBAs are not hardware-validated. The GPT-T first-install path refuses with `HARDWARE_REQUIRED`.
 
 **Needs real hardware:** Post-GPT identity ranges, EDL/fastboot identity binding, loader compatibility, real phase readback, and any GPT-T first-install validation. M4 remains PARTIAL and the stop-after-GPT guard remains enabled.
 
@@ -59,9 +59,9 @@ The final aggregate runner result was **26 PASS, 0 FAIL, 0 SKIP**. Standalone re
 
 ### Wizard
 
-**Tested with shims:** M7's 25 cases, including `test_cli_wizard_dispatches_doctor_and_rejects_backup_after_failed_doctor`, `test_every_stage_argument_builder_supplies_public_api_fields`, `test_wizard_failed_stage_can_be_retried`, and `test_wizard_restore_runs_guarded_fake_edl_and_requires_full_disk_match`.
+**Tested with shims:** M7's previously recorded 25 cases, including `test_cli_wizard_dispatches_doctor_and_rejects_backup_after_failed_doctor`, `test_every_stage_argument_builder_supplies_public_api_fields`, `test_wizard_failed_stage_can_be_retried`, and `test_wizard_restore_runs_guarded_fake_edl_and_requires_full_disk_match`. The standalone M7 suite was not rerun after the host-device check restriction.
 
-**Needs real hardware:** A successful non-mock wizard doctor-then-backup flow and full stock-to-install-to-verify-and-restore acceptance. The doctor stage correctly fails here because the host lacks the pinned loader and USB access; the following backup is refused. F-01 E2E has not passed. M7 remains PARTIAL.
+**Needs real hardware:** A successful real-client wizard doctor-then-backup flow and full stock-to-install-to-verify-and-restore acceptance. The CLI regression covers safe refusal when prerequisites are missing, but no successful non-mock EDL session has been run. M7 remains PARTIAL.
 
 ## Findings F-01 to F-22
 
@@ -90,11 +90,38 @@ The final aggregate runner result was **26 PASS, 0 FAIL, 0 SKIP**. Standalone re
 | F-21 | VERIFIED-WITH-SHIMS | `test_build_dry_run_default_login`; generic dev defaults are documented and shown by dry run. |
 | F-22 | VERIFIED-WITH-SHIMS | Closed by owner decision. Owner-private deny-list stays outside the repository; it was not read, copied, quoted, or applied. |
 
+## Hardware findings H-01 to H-09
+
+| Finding | Status | Evidence |
+|---|---|---|
+| H-01 | VERIFIED-WITH-SHIMS | `test_backup_identity_uses_sahara_serial_and_required_loader_flags`; backup obtains Sahara identity from a short GPT range read instead of `getstorageinfo`. |
+| H-02 | VERIFIED-WITH-SHIMS | `test_missing_or_unverified_loader_is_refused_before_client_call` and `test_backup_identity_uses_sahara_serial_and_required_loader_flags`; client calls require the verified absolute loader and `--memory=emmc`. |
+| H-03 | VERIFIED-WITH-SHIMS | `test_hang_sends_sigint_reports_power_cycle_and_does_not_register_backup`; timeout interrupts, waits, then terminates and refuses registration. |
+| H-04 | VERIFIED-WITH-SHIMS | `test_parse_sahara_info_accepts_transcript_and_rejects_malformed_or_absent_blocks`; flash and restore range reads use the same Sahara parsing format. |
+| H-05 | VERIFIED-WITH-SHIMS | `tests/verify-installer-doctor.py` (10/10), including `test_doctor_output_uses_shared_resolvers_and_specific_hints`; doctor uses the shared client and loader resolvers. |
+| H-06 | VERIFIED-WITH-SHIMS | `test_usb_present_with_access_uses_device_node_path`, `test_usb_present_without_access_fails_with_narrow_udev_hint`, and `test_usb_absent_is_info_and_does_not_fail_doctor`; cases use fixture sysfs and injected access callbacks. |
+| H-07 | VERIFIED-WITH-SHIMS | `test_no_loader_shim_mode_matches_transcript_and_exits_cleanly_on_sigint` and `test_shim_fails_calls_missing_required_flags`; shim reproduces the synthetic Sahara and Firehose formats and rejects missing flags. |
+| H-08 | VERIFIED-WITH-SHIMS | `test_verbose_failure_includes_client_output_tail`; verbose and debug failure paths include recent client output. |
+| H-09 | VERIFIED-WITH-SHIMS | `test_doctor_failure_hints_are_specific_for_edl_loader_and_usb`; doctor hints identify the relevant EDL, loader, or USB next step. |
+
+## Hardware acceptance checklist
+
+Owner-run checklist. This round did not exercise it on a board.
+
+1. In EDL mode, run `doctor`; confirm EDL client PASS, loader SHA-256 verified, and USB PASS with the device attached.
+2. Run `--dry-run backup`; confirm identity is printed and no files are written.
+3. Run `backup`; confirm the full read completes, GPT is verified, and fingerprints are recorded.
+4. Compare the recorded `fsg`, `sec`, and `fsc` fingerprints with the owner's original dump slices.
+5. Exit EDL only by cold boot.
+
+Do not perform writes during this acceptance checklist.
+
 ## Limitations and tree scope
 
-- No hardware, sudo, network, real EDL, real SSH, or production image was used.
+- No EDL command, sudo, network, real SSH, or production image was used. One earlier M7 invocation ran doctor against the host and read sysfs plus device-node permission metadata; it did not invoke the client or open/read/write the device node. The aggregate runner was not rerun after this host check was identified.
 - F-01 remains UNFIXED. The CLI wizard test proves the prerequisite failure is handled and backup is refused, not that successful end-to-end backup works.
-- M4 and M7 are PARTIAL. GPT-T first-install and complete wizard end-to-end acceptance lack non-mock hardware evidence.
+- M4 and M7 are PARTIAL. GPT-T first-install and complete wizard end-to-end acceptance lack non-mock EDL evidence.
+- The full aggregate test runner was not run after hardware fix round 1 because its M7 doctor check inspects host sysfs and `/dev`; focused synthetic suites and offline checks were used instead.
 - M6 package install and restore remain UNVALIDATED on hardware.
 - Existing `tools/flash/`, `tools/pathA/`, rollback engines, initramfs code, and the protected flash scripts were not changed by this round.
 - Process artifacts listed in `../FIX-ROUND-1-EXCLUDE.txt`, including the worktree copy of `spec/` and `notes/`, are excluded from product integration.

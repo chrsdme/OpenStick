@@ -130,7 +130,7 @@ class DoctorTests(unittest.TestCase):
         (edl_dir / edl_runner.LOADER_NAME).write_bytes(b"synthetic wrong loader")
         with mock.patch.dict(os.environ, {"OPENSTICK_EDL_DIR": str(edl_dir)}), \
              mock.patch.object(edl_runner, "PINNED_LOADER_SHA256", "0" * 64):
-            with self.assertRaisesRegex(cli.store.RefusedError, "SHA-256 does not match"):
+            with self.assertRaisesRegex(cli.store.RefusedError, "SHA-256 mismatch"):
                 edl_runner.resolve_loader()
 
     def test_doctor_output_uses_shared_resolvers_and_specific_hints(self):
