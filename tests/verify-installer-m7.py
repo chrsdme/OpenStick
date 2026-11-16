@@ -46,7 +46,8 @@ class WizardTests(unittest.TestCase):
         import shutil
         for path in sorted(self.tmp.rglob("*"), key=lambda item: len(item.parts), reverse=True):
             try:
-                os.chmod(path, 0o700 if path.is_dir() else 0o600)
+                if not path.is_symlink():
+                    os.chmod(path, 0o700 if path.is_dir() else 0o600)
             except OSError:
                 pass
         shutil.rmtree(self.tmp, ignore_errors=True)
