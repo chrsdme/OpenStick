@@ -374,6 +374,9 @@ def make_install_tools(directory, live_path):
 import errno, os, shutil, sys
 from pathlib import Path
 disk=Path(%r); a=sys.argv[1:]; op=a[0]
+log=os.environ.get('OPENSTICK_INSTALL_EDL_LOG')
+if log:
+ with Path(log).open('a') as f: f.write(' '.join(a)+'\\n')
 if op=='getstorageinfo': print('serial=DEADBEEF'); raise SystemExit(0)
 if op=='rf':
  out=Path(next(x for x in a[1:] if not x.startswith('--')))
@@ -805,18 +808,23 @@ def run():
         fake_tools = root / "install-fake-tools"
         install_edl, fastboot_log = make_install_tools(fake_tools, install_live)
         accepted_env = dict(os.environ, PATH=str(fake_tools) + ":/usr/bin:/bin")
+        install_edl_log = root / "install-edl.log"
+        accepted_env["OPENSTICK_INSTALL_EDL_LOG"] = str(install_edl_log)
         assert shutil.which("fastboot", path=accepted_env["PATH"]) == str(fake_tools / "fastboot")
         assert shutil.which("sudo", path=accepted_env["PATH"]) == str(fake_tools / "sudo")
         assert shutil.which("simg2img", path=accepted_env["PATH"]) == str(fake_tools / "simg2img")
         rc, install_output, confirmations = run_flash_session(
             [sys.executable, str(accepted_script), "--device", "deadbeef", "--edl", str(install_edl),
              "--loader", str(loader), "--state-dir", str(root / "accepted-install-state")], accepted_env)
-        assert rc == 0, (rc, install_output[-5000:])
+        assert rc == 2 and "stopped after GPT" in install_output, (rc, install_output[-5000:])
         assert not fastboot_log.exists() or fastboot_log.read_text(encoding="utf-8") == "", "standalone first-install unexpectedly invoked fastboot"
-        assert len(confirmations) == 7, confirmations
+        assert confirmations == {"flash deadbeef gpt"}, confirmations
+        actual_writes = [line.split() for line in install_edl_log.read_text().splitlines()
+                         if line.startswith("ws ") and "--skipwrite" not in line]
+        assert {int(row[1]) for row in actual_writes} == {0, 4096 - 33} and len(actual_writes) == 2, actual_writes
 
         # A standalone restore package carries hashed state evidence from a
-        # registered GPT-B Path A image set. The fake target starts with that
+        # registered legacy GPT-B Path A image set. The fake target starts with that
         # exact GPT/firmware state and must return byte-for-byte to its backup.
         transition_set = root / "transition-gpt-b"
         transition_live = root / "transition-source-live.img"
