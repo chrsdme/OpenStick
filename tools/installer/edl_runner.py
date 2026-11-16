@@ -74,7 +74,7 @@ def resolve_loader():
             absolute = candidate.resolve(strict=True)
             if _hash(absolute) != PINNED_LOADER_SHA256:
                 raise store.RefusedError(
-                    "Firehose loader SHA-256 does not match the pinned loader; hint: replace it with the pinned loader before retrying"
+                    "pinned Firehose loader SHA-256 mismatch; hint: replace it with the pinned loader before retrying"
                 )
             return absolute
         except OSError as exc:
@@ -100,15 +100,43 @@ def _failure(message, stdout, stderr, verbose):
     return EdlRunnerError(detail)
 
 
-def run(args, timeout, *, env=None, cwd=None, verbose=False, debug=False):
+def _checked_client(client):
+    if client is None:
+        return resolve_client()
+    prefix = [os.fspath(item) for item in (client if isinstance(client, (list, tuple)) else [client])]
+    if len(prefix) == 1:
+        path = Path(prefix[0])
+        if not path.is_absolute() or path.is_symlink() or not path.is_file() or not os.access(path, os.X_OK):
+            raise store.RefusedError("EDL client must be an absolute executable path")
+        return [str(path.resolve())]
+    if (len(prefix) == 2 and Path(prefix[0]).resolve() == Path(sys.executable).resolve()
+            and Path(prefix[1]).is_absolute() and Path(prefix[1]).is_file()
+            and not Path(prefix[1]).is_symlink()):
+        return [str(Path(prefix[0]).resolve()), str(Path(prefix[1]).resolve())]
+    raise store.RefusedError("EDL script command must be Python plus an absolute regular script path")
+
+
+def _checked_loader(loader):
+    if loader is None:
+        return resolve_loader()
+    path = Path(loader)
+    if path.is_symlink() or not path.is_absolute() or not path.is_file():
+        raise store.RefusedError("Firehose loader must be an absolute regular non-symlink file")
+    absolute = path.resolve(strict=True)
+    if _hash(absolute) != PINNED_LOADER_SHA256:
+        raise store.RefusedError("pinned Firehose loader SHA-256 does not match")
+    return absolute
+
+
+def run(args, timeout, *, env=None, cwd=None, verbose=False, debug=False, client=None, loader=None):
     """Run the real client with the verified absolute loader and eMMC mode.
 
     Callers pass only EDL operation arguments, for example ``["rs", "0",
     "34", output_path]``. The loader and memory arguments are always added by
     this boundary, so an installer call cannot accidentally use auto-selection.
     """
-    loader = resolve_loader()
-    client = resolve_client()
+    loader = _checked_loader(loader)
+    client = _checked_client(client)
     operation = [os.fspath(item) for item in args]
     if any(item == "--loader" or item.startswith("--loader=") or
            item == "--memory" or item.startswith("--memory=") for item in operation):

@@ -442,13 +442,19 @@ class M4Tests(unittest.TestCase):
         args = types.SimpleNamespace(image_set=str(image), flash_device=device_id, board=None,
                                      i_accept_untested=False, dry_run=True, reconcile_state=False)
         fakebin = self.tmp / "fake-edl-bin"; fakebin.mkdir(exist_ok=True)
+        loader_name = flash_module.edl_runner.LOADER_NAME
+        loader_fixture = fakebin / loader_name
+        import shutil
+        shutil.copyfile(image / "loader/prog_emmc_firehose_8916.mbn", loader_fixture)
+        flash_module.edl_runner.PINNED_LOADER_SHA256 = digest(loader_fixture)
         byte_log = self.tmp / "edl-read-bytes.log"
         exec_log = self.tmp / "edl-executions.log"
         edl_wrapper = fakebin / "edl"
         edl_wrapper.write_text("#!/bin/sh\nprintf '%%s %%s\\n' \"$0\" \"$*\" >> %s\nOPENSTICK_FAKE_EMMC=%s OPENSTICK_EDL_BYTES_FILE=%s OPENSTICK_EDL_CALL_FILE=%s exec %s \"$@\"\n" %
                                (exec_log, disk, byte_log, self.tmp / "edl-calls", ROOT / "tests/shims/bin/edl"))
         edl_wrapper.chmod(0o700)
-        env = dict(os.environ, PATH=str(fakebin) + ":" + str(ROOT / "tests/shims/bin") + ":/usr/bin:/bin")
+        env = dict(os.environ, PATH=str(fakebin) + ":" + str(ROOT / "tests/shims/bin") + ":/usr/bin:/bin",
+                   OPENSTICK_EDL_DIR=str(fakebin))
         args.fake_disk = str(disk)
         args.edl_bytes_file = str(byte_log)
         args.edl_exec_log = str(exec_log)
@@ -457,10 +463,10 @@ class M4Tests(unittest.TestCase):
 
     def _install_fake_flash_engines(self):
         patha = self.repo / "tools/pathA/pathA-flash.sh"
-        patha.write_text("#!/bin/sh\n$EDL_CMD getstorageinfo >/dev/null\n")
+        patha.write_text("#!/bin/sh\n$EDL_CMD ws 0 /dev/null --sectorsize=512 --skipwrite --loader=\"$LDR\" --memory=emmc >/dev/null\n")
         patha.chmod(0o700)
         fastboot = self.repo / "tools/flash/flash-board.sh"
-        fastboot.write_text("#!/bin/sh\n$EDL_CMD getstorageinfo >/dev/null\n")
+        fastboot.write_text("#!/bin/sh\n$EDL_CMD ws 0 /dev/null --sectorsize=512 --skipwrite --loader=\"$LDR\" --memory=emmc >/dev/null\n")
         fastboot.chmod(0o700)
 
     def test_flash_refusals_and_input_hashes(self):
@@ -508,8 +514,8 @@ class M4Tests(unittest.TestCase):
             self.assertEqual(flash_module.flash_command(args, self.home, self.repo), 0)
         rows = byte_log.read_text().splitlines()
         reads = [row for row in rows if row.startswith("rs ")]
-        self.assertEqual(len(reads), 3, rows)
-        self.assertTrue(all(row.startswith(("getstorageinfo ", "rs ")) for row in rows), rows)
+        self.assertEqual(len(reads), 4, rows)
+        self.assertTrue(all(row.startswith("rs ") for row in reads), rows)
         self.assertFalse(any(row.startswith("rf ") for row in rows), rows)
         total = sum(int(row.rsplit(" ", 1)[-1]) for row in reads)
         self.assertLessEqual(total, 2 * 1024 * 1024)
@@ -518,7 +524,8 @@ class M4Tests(unittest.TestCase):
                                       manifest["partitions"][name]["end_lba"] - manifest["partitions"][name]["start_lba"] + 1,
                                       (manifest["partitions"][name]["end_lba"] - manifest["partitions"][name]["start_lba"] + 1) * 512)
                     for name in flash_module.IDENTITY_PARTS]
-        self.assertEqual(reads, expected)
+        self.assertEqual(reads[1:], expected)
+        self.assertEqual(reads[0], "rs 0 34 17408")
 
     def test_flash_uses_one_edl_command_for_identity_and_engine(self):
         args, dev, identity, env = self._flash_fixture()
@@ -532,7 +539,8 @@ class M4Tests(unittest.TestCase):
              redirect_stdout(captured):
             self.assertEqual(flash_module.flash_command(args, self.home, self.repo), 0)
         calls = pathlib.Path(args.edl_exec_log).read_text().splitlines()
-        self.assertTrue(any(line.endswith(" getstorageinfo") for line in calls), calls)
+        self.assertTrue(any(" ws " in line for line in calls), calls)
+        self.assertTrue(all("--loader=" in line and "--memory=emmc" in line for line in calls), calls)
         self.assertTrue(any(" rs " in line for line in calls), calls)
         self.assertTrue(all(line.startswith(edl + " ") for line in calls), calls)
         self.assertIn("EDL command: " + edl, captured.getvalue())
