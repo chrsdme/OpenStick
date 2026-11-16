@@ -101,7 +101,7 @@ The pre-hardware-round aggregate runner result was **26 PASS, 0 FAIL, 0 SKIP**. 
 | H-05 | VERIFIED-WITH-SHIMS | `tests/verify-installer-doctor.py` (10/10), including `test_doctor_output_uses_shared_resolvers_and_specific_hints`; doctor uses the shared client and loader resolvers. |
 | H-06 | VERIFIED-WITH-SHIMS | `test_usb_present_with_access_uses_device_node_path`, `test_usb_present_without_access_fails_with_narrow_udev_hint`, and `test_usb_absent_is_info_and_does_not_fail_doctor`; cases use fixture sysfs and injected access callbacks. |
 | H-07 | VERIFIED-WITH-SHIMS | `test_no_loader_shim_mode_matches_transcript_and_exits_cleanly_on_sigint` and `test_shim_fails_calls_missing_required_flags`; shim reproduces the synthetic Sahara and Firehose formats and rejects missing flags. |
-| H-08 | VERIFIED-WITH-SHIMS | `test_verbose_failure_includes_client_output_tail`; verbose and debug failure paths include recent client output. |
+| H-08 | VERIFIED-WITH-SHIMS | `test_verbose_failure_includes_client_output_tail`; the M6 `run()` package integration assertions verify `SYNTHETIC EDL SIGINT OUTPUT TAIL` plus the recovery hint on timeout, and `SYNTHETIC EDL WRITE FAILURE DETAIL` plus the recovery hint on failed writes. |
 | H-09 | VERIFIED-WITH-SHIMS | `test_doctor_failure_hints_are_specific_for_edl_loader_and_usb`; doctor hints identify the relevant EDL, loader, or USB next step. |
 
 ## Hardware acceptance checklist
