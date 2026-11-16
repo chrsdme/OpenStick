@@ -444,7 +444,9 @@ def run():
         assert (output.stat().st_mode & 0o777) == 0o600
         with tarfile.open(output) as archive:
             names = archive.getnames()
-            assert "SENSITIVE" in archive.extractfile("README.txt").read().decode()
+            package_readme = archive.extractfile("README.txt").read().decode()
+            assert "SENSITIVE" in package_readme
+            assert "UNVALIDATED on hardware" in package_readme
             assert "payload/emmc-full.bin" in names
             assert "payload/rollback-plan.py" in names and "payload/rollback-plan.txt" in names
             script = archive.extractfile("scripts/restore.py").read().decode()
@@ -722,7 +724,7 @@ def run():
             raise AssertionError("symlinked archive path accepted")
 
         # Current M4 build format is GPT-T boot.img + userdata rootfs.img and
-        # cannot be passed to GPT-B boot.bin/rootfs.bin first-install consumer.
+        # cannot be passed to the legacy GPT-B boot.bin/rootfs.bin first-install consumer.
         m4 = root / "m4-build"
         m4.mkdir(); (m4 / "boot.img").write_bytes(b"synthetic boot container")
         (m4 / "rootfs.img").write_bytes(b"synthetic ext4 rootfs")
@@ -777,6 +779,9 @@ def run():
         (install_race / boot_rel).write_bytes(b"changed-after-validation")
         assert (install_snapshot / boot_rel).read_bytes() == before
         install_script = clean_install / "scripts/install.py"
+        install_help = subprocess.run([sys.executable, str(install_script), "--help"],
+                                      env=dict(os.environ, PATH="/usr/bin:/bin"), capture_output=True, text=True)
+        assert "UNVALIDATED on hardware" in install_help.stdout
         wrong_device = subprocess.run([sys.executable, str(install_script), "--device", "cafebabe", "--edl", "/missing/edl",
                                        "--loader", str(loader), "--state-dir", str(root / "install-state")],
                                       env=dict(os.environ, PATH="/usr/bin:/bin"), capture_output=True, text=True)
@@ -859,6 +864,9 @@ def run():
         transition_loader = root / "transition-loader"; transition_loader.write_bytes(loader.read_bytes())
         transition_args = [sys.executable, str(restore_script), "--device", "deadbeef", "--edl", str(transition_edl),
                            "--loader", str(transition_loader)]
+        restore_help = subprocess.run(transition_args + ["--help"], env=transition_env,
+                                      capture_output=True, text=True)
+        assert "UNVALIDATED on hardware" in restore_help.stdout
         inspect = subprocess.run(transition_args, env=transition_env, capture_output=True, text=True)
         assert inspect.returncode == 0 and "Ordered restore phases" in inspect.stdout, (inspect.returncode, inspect.stdout, inspect.stderr)
         restore_phases = re.search(r"Ordered restore phases: (.+)", inspect.stdout).group(1).split(", ")
