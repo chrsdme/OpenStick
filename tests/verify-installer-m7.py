@@ -309,6 +309,35 @@ class WizardTests(unittest.TestCase):
             self.assertTrue(store._inside_git(link / "a" / "b" / "future"))
         self.assertFalse(git_log.exists(), "inside-git check must not call git")
 
+    def test_git_ceiling_allows_private_store_above_foreign_marker(self):
+        parent = self.tmp.parent
+        with mock.patch.dict(os.environ, {"GIT_CEILING_DIRECTORIES": str(parent)}):
+            path = self.tmp / "ceiling-store"
+            self.assertFalse(store._inside_git(path))
+            self.assertEqual(store.ensure_store(path), path)
+
+    def test_git_ceiling_still_blocks_markers_inside_walk_and_symlink_into_repo(self):
+        ceiling = self.tmp.parent
+        repo = self.tmp / "nested-repo"
+        repo.mkdir()
+        (repo / ".git").mkdir()
+        nested = repo / "child"
+        nested.mkdir()
+        link = self.tmp / "repo-link"
+        link.symlink_to(repo, target_is_directory=True)
+        marker_file_repo = self.tmp / "marker-file-repo"
+        marker_file_repo.mkdir()
+        (marker_file_repo / ".git").write_text("gitdir: /synthetic\n")
+        with mock.patch.dict(os.environ, {"GIT_CEILING_DIRECTORIES": str(ceiling)}):
+            self.assertTrue(store._inside_git(nested / "future"))
+            self.assertTrue(store._inside_git(marker_file_repo / "future"))
+            self.assertTrue(store._inside_git(link / "child" / "future"))
+
+    def test_git_ceiling_without_environment_keeps_foreign_marker_fail_closed(self):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("GIT_CEILING_DIRECTORIES", None)
+            self.assertTrue(store._inside_git(self.tmp / "future"))
+
     def test_wizard_failed_stage_can_be_retried(self):
         state_args = args("doctor", wizard_id="retry-doctor")
         first = wizard.run(state_args, self.home, self.repo)

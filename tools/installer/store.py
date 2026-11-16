@@ -30,9 +30,18 @@ def _has_symlink_component(path):
 def _inside_git(path):
     try:
         current = Path(path).resolve(strict=False)
+        ceilings = {
+            Path(item).resolve(strict=False)
+            for item in os.environ.get("GIT_CEILING_DIRECTORIES", "").split(os.pathsep)
+            if item
+        }
     except (OSError, RuntimeError):
         return True
     while True:
+        # Git stops its repository search before examining a ceiling directory.
+        # Keep that boundary while remaining fail-closed on markers above it.
+        if current in ceilings:
+            return False
         marker = current / ".git"
         try:
             os.lstat(marker)
