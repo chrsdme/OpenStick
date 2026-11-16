@@ -379,8 +379,11 @@ class M4Tests(unittest.TestCase):
         shutil.copytree(ROOT / "boards", self.repo / "boards", dirs_exist_ok=True)
         shutil.copyfile(ROOT / "scripts/common.sh", self.repo / "scripts/common.sh")
         cmd = ["/bin/sh", "-c", '. "$OPENSTICK_ROOT/scripts/common.sh"; printf "%s" "${WIFI_PSK:-}"']
+        generic_out = self.tmp / "generic-out"
+        generic_out.mkdir()
         base_env = {"OPENSTICK_ROOT": str(self.repo), "BOARD": "ufi103s", "PATH": "/usr/bin:/bin"}
-        generic = subprocess.run(cmd, env=dict(base_env, OPENSTICK_CONFIG_MODE="generic"), text=True, capture_output=True, check=True)
+        generic = subprocess.run(cmd, env=dict(base_env, OPENSTICK_CONFIG_MODE="generic",
+                                              OPENSTICK_OUT=str(generic_out)), text=True, capture_output=True, check=True)
         base_env["WIFI_PSK"] = "INHERITED_FAKE"
         legacy = subprocess.run(cmd, env=dict(base_env, OPENSTICK_CONFIG_MODE="legacy"), text=True, capture_output=True, check=True)
         self.assertEqual(generic.stdout, "")

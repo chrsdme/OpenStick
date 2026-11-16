@@ -712,7 +712,7 @@ def _verify_final_disk(edl, env, loader, work, manifest, state):
     if not matched:
         print("FAIL final full-disk readback failed or SHA-256 mismatched; do not boot", file=sys.stderr)
         state["status"] = "final-readback-failed"
-        raise ValueError("final full-disk readback failed size or SHA-256 comparison")
+        raise common.VerificationError("final full-disk readback failed size or SHA-256 comparison")
     print("PASS final full-disk readback exactly matches the verified backup SHA-256")
 
 

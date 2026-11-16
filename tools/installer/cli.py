@@ -25,7 +25,7 @@ EXIT_OK = 0
 EXIT_ERROR = 1
 EXIT_REFUSED = 2
 EXIT_VERIFY = 3
-class VerificationError(Exception):
+class VerificationError(ValueError):
     """A concrete integrity or read-back verification failure."""
 
 LOADER_SHA256 = "959439aa5864685999b713c3ed12ad5fa408149648b670a9a9ef77bcc9dcab14"

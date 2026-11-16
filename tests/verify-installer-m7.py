@@ -513,7 +513,8 @@ class WizardTests(unittest.TestCase):
         # A valid seed and registered generic build are fixture inputs; the
         # wizard still calls the real parser/manifest validators and injector.
         seed_path = self.home / "seeds" / "synthetic.seed"
-        store._atomic_private_write(seed_path, seed_format.serialize({"SEED_VERSION": "1", "HOSTNAME": "synthetic-stick"}).encode())
+        store._atomic_private_write(seed_path, seed_format.serialize({"SEED_VERSION": "1", "PROFILE": "prod",
+                                                                       "HOSTNAME": "synthetic-stick"}).encode())
         build_id = "fixture-build"
         build_dir = self.home / "builds" / build_id
         build_dir.mkdir(mode=0o700)

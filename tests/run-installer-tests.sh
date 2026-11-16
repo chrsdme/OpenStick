@@ -5,6 +5,7 @@ PYTHON=${PYTHON:-python3}
 TMP=$(mktemp -d)
 trap 'rm -rf -- "$TMP"' EXIT
 export TMPDIR="$TMP"
+export GIT_CEILING_DIRECTORIES="$(dirname "$TMP")"
 export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"
 shopt -s nullglob
 m4_tmp_before=("$TMP"/openstick-m4-test-*)

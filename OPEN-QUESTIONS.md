@@ -1,60 +1,22 @@
-# Open questions and specification differences
+# Open questions and owner decisions
 
-M0 defaults are recorded as recommendations, not verified device behavior. Hardware-only questions remain unverified.
+The installer work is verified with shims only unless explicitly stated. No hardware, sudo, network, device dump, or real production image was used.
 
-## Existing tree versus specification
+## Owner decisions
 
-| Spec area | Observed tree | Recommended default / question |
-|---|---|---|
-| §3 build outputs | ROLLBACK.md describes GPT-T and verified `boot.img` plus rootfs in `userdata`; remaining GPT-B references in README and FLASH-PLAN are historical and labeled as such. | Current README and `docs/INSTALLER.md` distinguish the GPT-T path; retain FLASH-PLAN's GPT-B details as historical evidence. |
-| §3 scripts | Existing Path A and flash-board engines remain unchanged. M4 wraps them with verification and typed-confirmation gates. | Hardware execution remains forbidden and unverified here. |
-| §3 profile | Tree has dev/prod behavior. M3 configure records the dev/prod account policy in the seed. M4 generic mode omits personal settings and allows an unseeded prod rootfs for later injection. | Generic prod behavior is covered by wrapper tests; image assembly was not run. |
-| §4 commands | `./openstick` includes M1-M7 command interfaces, including verify/restore, package, image-set and wizard commands. | M5-M7 code and tests are present in this worktree but uncommitted; GPT-T first-install remains hardware-required and fail-closed. |
-| §5 store/registry | The implemented layout is a root-level `registry.json` and append-only `events.jsonl`, rather than per-device registry files. Seed application history is recorded in the registry. `OPENSTICK_HOME` now participates in the documented precedence. | Keep this layout for this repair round; a future migration to `devices/<id>/device.json` would need a schema and migration plan. Registry paths are absolute and need re-verification after moving the store. |
-| §6 seed | M3 strict parser, configurator, apply utility/service, injection and push exist. | Seed encoding and deletion choice are resolved below and in DESIGN.md. Hardware behavior remains unverified. |
-| §6.6 baseline | No generated images/artifacts/caches in sanitized workspace; image hashes unavailable without external inputs/build. | Keep this explicit limitation; before first installer build, capture hashes only if reproducible inputs are already present. Do not run an external build to fabricate baseline. |
-| §7 restore package | M6 packaging code and synthetic checks exist. | Package fixtures do not prove real backup provenance or physical restore behavior; preserve the full verified backup and all identity/calibration data required by the selected restore plan. |
-| §8 gates | M4 implements flash backup, live identity, input hash, typed confirmation, non-interactive and interrupted-state gates. | Real EDL, firmware provenance and hardware readback remain unverified. |
-| §9 docs | `docs/INSTALLER.md` and README quickstart updates are present in the worktree. | Documentation is uncommitted and must not imply hardware validation. |
-| §10 dashboard | No dashboard should be implemented. | Keep out of scope. |
-| Test sandbox store path | This sandbox exposes an empty read-only `/tmp/.git` marker. Literal fail-closed marker walking therefore treats `/tmp` as inside a Git worktree, and the CLI cannot initialize a private store there. | Keep the required fail-closed behavior. Repeat the CLI wizard doctor/backup path from an approved writable directory outside all `.git` marker ancestors. |
+1. **GPT-T first install:** Keep the current refusal. The adapter verifies and stages synthetic GPT-T inputs, but bootloader-mode identity, write ordering, and complete boot plus userdata readback have not been validated on hardware. Do not remove the refusal without supervised device acceptance.
+2. **Post-GPT identity ranges:** The installer stops after the GPT phase because new `fsg`, `sec`, and `fsc` LBAs have not been established on hardware. Keep this guard until those ranges are measured and validated.
+3. **Path A firmware provenance:** The sanitized checkout contains no Path A firmware/GPT/rollback blobs. The wrapper verifies hashes for supplied inputs, but an owner must provide and establish provenance for any future image set.
+4. **Prepared base image:** `build` starts from an existing `out/base-bookworm-arm64.tar.gz`; it does not run `10-base.sh`. An owner must prepare and verify this base before a real build.
+5. **Image baseline:** The original boot and rootfs images and pinned build inputs are unavailable, so byte-for-byte comparison with the M0 images cannot be done. Keep the report's baseline comparison as unavailable unless those inputs are supplied.
+6. **Reset and boot:** The installer does not issue the final EDL reset or claim boot success. An owner must review phase evidence and perform any later reset or boot step explicitly.
+7. **End-to-end acceptance:** F-01 remains UNFIXED because doctor fails on this host's missing pinned loader and USB access, so the required real CLI doctor-then-backup flow cannot complete. M4 and M7 remain PARTIAL until non-mock end-to-end evidence exists; hardware actions remain outside this work.
 
-## Decision questions
+## Recorded behavior to retain
 
-1. **M0 commit ancestry:** The clean copy had no Git history. A new repo was initialized and the source snapshot committed as root commit `e4cf01b` labeled `M0: import clean builder snapshot`. The acceptance wording expects `baseline..installer`, but no baseline exists. The installer branch preserves this root commit; no baseline was invented or rewritten.
-2. **SSH keys in seed, resolved in M3:** `SSH_AUTHORIZED_KEYS` is a base64 value carrying newline-separated public-key lines. The public key file is imported during configure; no private key data is accepted. SHA-256 applies to the complete seed file.
-3. **`seed push` transport, resolved in M3:** Require explicit `USER@HOST` and verify batch SSH access before transfer. No default gadget address is assumed. If SSH access fails, production recovery is to flash an image containing the seed.
-4. **USB identity aliases:** Which exact EDL/Android/Debian serial fields are available via the installed EDL client and USB tools? Fake shims cover the interface; hardware capture remains hardware-only.
-5. **Seed APN application, resolved in M3:** Apply APN and optional credentials by writing the existing NetworkManager GSM keyfile format. No modem writes are performed.
-6. **Feature scope conflict:** Installer specs require later flash/restore work, while global rules prohibit real hardware. M1-M3 test through offline fixtures and shims only; actual board operation remains hardware-only.
-
-7. **M2 EDL identity fields:** The fake client exposes `serial`, `hwid`, `msm_id` and `pk_hash` as simple key/value text. The installed real EDL client may report these through different output or flags. Recommended: keep serial as the stable registry key and record only fields the client reports; confirm output parsing on hardware before relying on optional identifiers.
-
-8. **M4 prepared base image:** The requested wrapper order starts at `20-rootfs.sh`, but that script requires `out/base-bookworm-arm64.tar.gz`, which is produced by `10-base.sh`. M4 accepts only an already prepared base artifact and deliberately does not run `10-base.sh`; no real build was run. Recommended: prepare and verify the base explicitly before using `openstick build`.
-9. **M4 build output versus first-install input:** The M4 build emits an Android boot-v0 `boot.img` and ext4 `rootfs.img` for GPT-T boot and userdata. The existing `flash-board.sh first-install` expects Android sparse GPT-B `boot.bin` and `rootfs.bin`; those formats and target partitions are not interchangeable. `openstick image-set prepare` now creates a hash-bound GPT-T image set from a registered `ufi103s` build and paired GPT-T tables, checks boot-v0/ext4 metadata, and maps exact-byte copies to boot/userdata. `flash` recognizes and re-verifies that manifest, then refuses with `HARDWARE_REQUIRED`: there is no validated live-identity-preserving GPT-T write/readback path in this workspace. Adapter mapping is synthetic/offline evidence only; M4 flash integration is incomplete.
-10. **M4 Path A firmware provenance:** No Path A firmware/GPT/rollback blobs or package checksum file are present in the sanitized tree. The wrapper requires all assets in the selected private image set with SHA256SUMS and checks the pinned Firehose loader, but cannot establish the historical provenance of newly supplied Path A blobs offline. The wrapper refuses missing or mismatched entries. Hardware and provenance review remain required before using such a set.
-11. **M4 reset/final behavior:** `pathA-flash.sh final write` sends EDL reset. To honor the no-automatic-reset requirement, M4 runs `final` dry-only and then invokes first-install. Recommended: leave device reset/boot to an explicit later manual step after reviewing the phase report.
-12. **M4 image baseline:** The sanitized workspace has no M0 boot/rootfs images or pinned kernel/BusyBox artifacts. The build manifest records baseline comparison as unavailable and names the documented seed hook; a reproducible byte comparison remains open until a complete pinned input set exists.
-
-13. **Installer specification inputs are absent:** `spec/INSTALLER-SPEC.md` and `spec/ACCEPTANCE.md` are not present in the clean copy. The canonical G1-G9 definitions and any requirements only present there could not be checked. Recover those files before claiming full spec acceptance; no G1-G9 mapping was inferred from filenames or prior reports.
-14. **M5/M6/M7 offline versus device acceptance:** M5 synthetic restore and M6 package fixture results do not prove EDL client behavior or hardware writes. D reviewed the corrected synthetic install-package test and the full offline runner passed. Production package creation still lacks the real, verified build/image/backup inputs and external firmware provenance. M7 unit/contract tests do not establish the requested complete stock-to-install-to-verify-and-restore cycle; image build inputs and device behavior remain unavailable/forbidden.
-15. **M4 GPT-T flash path:** The synthetic GPT-T adapter is tested: it validates the build manifest, boot-v0 boot.img, ext4 rootfs.img, board/profile/build IDs and hashes, GPT geometry, and stages byte-identical boot/userdata payloads. The flash wrapper revalidates then fails closed with HARDWARE_REQUIRED because bootloader-mode identity binding across EDL/fastboot and complete boot plus userdata write/readback semantics remain unvalidated. Next safe action is owner-supervised hardware acceptance using known board provenance; do not remove the fail-closed flash gate based on the offline adapter.
-
-16. **Unattended session evidence and repository state (2026-11-15):** On launch, `installer` pointed at the accepted M4 SHA, but the worktree already contained uncommitted M4–M7 changes; it was not a clean launch state. Focused M4/M5/M7 results were 22/22, 22/22, and 14/14; the full permitted runner passed 26/26 with no failures or top-level skips. M6's focused synthetic suite passed, but its numeric test count was not captured. Project Python compile, applicable `bash -n`/`sh -n`, and `git diff --check` passed; ShellCheck was unavailable. B independently accepted the corrected wizard change. The local Git metadata is read-only in this environment, so no local milestone commits could be made; M5–M7 remain uncommitted and overall release status is PARTIAL_OFFLINE. `spec/INSTALLER-SPEC.md` and `spec/ACCEPTANCE.md` are absent, preventing canonical G1–G9 mapping. No device flash or hardware verification occurred.
-
-## M0 legacy test failures
-
-See INSTALLER-REPORT.md for exact assertion, exit code, confirmed cause and classification. No legacy script was changed to make these tests pass. They are baseline exceptions only when demonstrably unrelated; an installer regression must still block its milestone.
-
-## Resumed M6 audit correction (2026-11-15)
-
-The canonical spec files were recovered at `../spec/INSTALLER-SPEC.md` and `../spec/ACCEPTANCE.md`, outside the builder subdirectory. Decision question 13 and the earlier claim that G1-G9 cannot be mapped are superseded. See the G1-G9 source/test mapping in INSTALLER-REPORT.md.
-
-M6 review confirmed the state path is pinned per device and backup, and the alternate-path negative test is effective. The completed data-partition integrity gap has been addressed by hashing each completed full partition against the verified backup before a later phase. A synthetic corrupted-`userdata` regression confirms the next phase refuses before an actual write. Hardware-only restore behavior and real package provenance remain unverified by design.
-
-17. **M6 resumed repair and gate evidence:** Completed restore data ranges are now fully hashed against the verified backup before a later standalone restore phase. Independent review accepted the implementation and adversarial fake-disk test. Package output in a real temporary Git worktree is refused and SENSITIVE README marking is tested. Remaining offline work is complete for this resumed pass; hardware execution and Git commits remain unavailable under the explicit constraints.
-
-18. **Post-GPT identity layout (F-03):** The Path A GPT phase can change the partition map, but post-GPT LBAs for `fsg`, `sec`, and `fsc` have not been established on hardware. The installer stops after the GPT phase and refuses later flash writes until those ranges are verified. Default: keep this refusal; do not infer new LBAs from the image set.
-19. **Board support bypass (F-11):** `--i-accept-untested` does not exist. Non-`ufi103s` boards are always refused, including when the flag is supplied. Default: keep refusing unsupported boards until a separate hardware acceptance exists.
-
-17. **M6 resumed repair and gate evidence:** Completed restore data ranges are now fully hashed against the verified backup before a later standalone restore phase. Independent review accepted the implementation and adversarial fake-disk test. Package output in a real temporary Git worktree is refused and SENSITIVE README marking is tested. Remaining offline work is complete for this resumed pass; hardware execution and Git commits remain unavailable under the explicit constraints.
+- The registry is a root-level `registry.json` with append-only `events.jsonl`. Registry paths are absolute, so moving a store requires path review.
+- `seed push` requires an explicit `USER@HOST`; no default device address is assumed.
+- `--i-accept-untested` does not exist. Non-`ufi103s` boards are always refused.
+- M3 writes Wi-Fi and APN values using base64 seed fields and NetworkManager keyfile escaping. Real NetworkManager acceptance remains unverified.
+- M6 standalone install and restore scripts are explicitly marked UNVALIDATED on hardware and require typed confirmation for writes.
+- F-22 is closed: the owner-private deny-list stays outside the repository and is not part of installer integration.

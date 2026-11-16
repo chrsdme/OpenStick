@@ -367,16 +367,14 @@ def make_legacy_image_set(root, loader, loader_hash, backup_path, live_path, sec
     (root / "SHA256SUMS").write_text("".join(sums))
 
 
-def make_install_tools(directory, live_path):
+def make_install_tools(directory, live_path, log_path):
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     edl = directory / "fake-install-edl"
     edl.write_text('''#!/usr/bin/env python3
 import errno, os, shutil, sys
 from pathlib import Path
 disk=Path(%r); a=sys.argv[1:]; op=a[0]
-log=os.environ.get('OPENSTICK_INSTALL_EDL_LOG')
-if log:
- with Path(log).open('a') as f: f.write(' '.join(a)+'\\n')
+with Path(%r).open('a') as f: f.write(' '.join(a)+'\\n')
 if op=='getstorageinfo': print('serial=DEADBEEF'); raise SystemExit(0)
 if op=='rf':
  out=Path(next(x for x in a[1:] if not x.startswith('--')))
@@ -409,7 +407,7 @@ if op=='ws':
   shutil.copyfileobj(src,dst,1048576)
  raise SystemExit(0)
 raise SystemExit(2)
-''' % str(live_path), encoding="utf-8")
+''' % (str(live_path), str(log_path)), encoding="utf-8")
     os.chmod(edl, 0o700)
     simg2img = directory / "simg2img"
     simg2img.write_text("#!/bin/sh\ncp -- \"$1\" \"$2\"\n", encoding="utf-8")
@@ -806,10 +804,9 @@ def run():
             archive.extractall(accepted_package)
         accepted_script = accepted_package / "scripts/install.py"
         fake_tools = root / "install-fake-tools"
-        install_edl, fastboot_log = make_install_tools(fake_tools, install_live)
-        accepted_env = dict(os.environ, PATH=str(fake_tools) + ":/usr/bin:/bin")
         install_edl_log = root / "install-edl.log"
-        accepted_env["OPENSTICK_INSTALL_EDL_LOG"] = str(install_edl_log)
+        install_edl, fastboot_log = make_install_tools(fake_tools, install_live, install_edl_log)
+        accepted_env = dict(os.environ, PATH=str(fake_tools) + ":/usr/bin:/bin")
         assert shutil.which("fastboot", path=accepted_env["PATH"]) == str(fake_tools / "fastboot")
         assert shutil.which("sudo", path=accepted_env["PATH"]) == str(fake_tools / "sudo")
         assert shutil.which("simg2img", path=accepted_env["PATH"]) == str(fake_tools / "simg2img")
@@ -821,7 +818,8 @@ def run():
         assert confirmations == {"flash deadbeef gpt"}, confirmations
         actual_writes = [line.split() for line in install_edl_log.read_text().splitlines()
                          if line.startswith("ws ") and "--skipwrite" not in line]
-        assert {int(row[1]) for row in actual_writes} == {0, 4096 - 33} and len(actual_writes) == 2, actual_writes
+        target_gpt_secondary = install_live.stat().st_size // 512 - 33
+        assert {int(row[1]) for row in actual_writes} == {0, target_gpt_secondary} and len(actual_writes) == 2, actual_writes
 
         # A standalone restore package carries hashed state evidence from a
         # registered legacy GPT-B Path A image set. The fake target starts with that
@@ -887,7 +885,7 @@ def run():
             assert rc == 0, (phase, rc, output_text[-1000:])
             assert "UNVALIDATED on hardware" in output_text
         assert transition_disk.read_bytes() == (home / "backups" / "deadbeef" / "synthetic-backup" / "emmc-full.bin").read_bytes()
-        assert "first-install" in install_output and "readback pass" in install_output.lower()
+        assert "stopped after GPT" in install_output and "first-install" not in install_output
     print("M6 synthetic package checks PASS")
 
 
