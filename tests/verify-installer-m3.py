@@ -493,9 +493,11 @@ def push_test(tmp):
 def installation_test(_tmp):
     service = (ROOT / "configs/system/openstick-seed.service").read_text()
     hook = (ROOT / "scripts/20-rootfs.sh").read_text()
+    setup = (ROOT / "scripts/setup.sh").read_text()
     assert "Before=network-pre.target NetworkManager.service systemd-networkd.service" in service
     assert "enable_unit network-pre.target openstick-seed.service" in hook
     assert "usr/lib/openstick/apply-seed" in hook
+    assert 'printf \'%s\\n\' "$PROFILE" > /etc/openstick/image-profile' in setup
     p = subprocess.run(["bash", "-n", str(ROOT / "scripts/20-rootfs.sh")], capture_output=True)
     assert p.returncode == 0
     p = subprocess.run(["sh", "-n", str(ROOT / "configs/apply-seed")], capture_output=True)
