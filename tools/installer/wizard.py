@@ -352,11 +352,12 @@ def _require(state, stage):
             raise store.RefusedError("install package stage requires a completed build or verified image-set selection")
 
 
-def _args_for(args, stage, state):
+def _args_for(args, stage, state, home=None):
     """Build a minimal namespace for the existing public module APIs."""
     from argparse import Namespace
     chosen = state["selection"]
-    common = {"dry_run": bool(getattr(args, "dry_run", False)),
+    common = {"home": str(home) if home is not None else getattr(args, "home", None),
+              "dry_run": bool(getattr(args, "dry_run", False)),
               "board": chosen.get("board"), "device": chosen.get("device_id")}
     if stage == "backup":
         return Namespace(**common, paranoid=bool(getattr(args, "paranoid", False)),
@@ -394,13 +395,13 @@ def _args_for(args, stage, state):
 def _execute(args, home, repo, stage, state):
     if stage == "doctor":
         from . import cli
-        return cli.doctor(_args_for(args, stage, state))
+        return cli.doctor(_args_for(args, stage, state, home))
     if stage == "backup":
         from . import cli
         if state["selection"].get("backup_id"):
             _device_and_backup(home, state["selection"])
             return EXIT_OK
-        return cli.backup_command(_args_for(args, stage, state), home)
+        return cli.backup_command(_args_for(args, stage, state, home), home)
     if stage == "configure":
         from . import configure
         selected = state["selection"]
@@ -419,20 +420,20 @@ def _execute(args, home, repo, stage, state):
         if selected.get("image_set"):
             from . import imageset
             return imageset.verify_command(selected["image_set"])
-        return build.build_command(_args_for(args, stage, state), home, repo)
+        return build.build_command(_args_for(args, stage, state, home), home, repo)
     if stage == "inject":
         from . import cli
-        return cli.inject_seed(_args_for(args, stage, state), home)
+        return cli.inject_seed(_args_for(args, stage, state, home), home)
     if stage == "flash":
         from . import flash
-        return flash.flash_command(_args_for(args, stage, state), home, repo)
+        return flash.flash_command(_args_for(args, stage, state, home), home, repo)
     if stage in ("verify", "restore"):
         from . import verify_restore
         function = verify_restore.verify_command if stage == "verify" else verify_restore.restore_command
-        return function(_args_for(args, stage, state), home, repo)
+        return function(_args_for(args, stage, state, home), home, repo)
     if stage == "package":
         from . import packages
-        return packages.package_command(_args_for(args, stage, state), home, repo)
+        return packages.package_command(_args_for(args, stage, state, home), home, repo)
     raise store.RefusedError("unknown wizard stage")
 
 
@@ -525,7 +526,7 @@ def _stage_evidence(stage, home, state):
 
 
 def run(args, home, repo):
-    """Run one named workflow stage, persisting redacted evidence and history.
+    """Run one named workflow stage, persisting sanitized evidence and history.
 
     CLI integrations should set ``args.stage`` and may set ``args.wizard_id``.
     ``args.resume`` loads that run; it never automatically retries a write.
