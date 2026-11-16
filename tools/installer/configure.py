@@ -35,7 +35,7 @@ def password_hash(password):
 
 def _ask(prompt, default=""):
     suffix = " [%s]" % default if default else ""
-    value = input(prompt + suffix + ": ").strip()
+    value = input(prompt + suffix + ": ")
     return value or default
 
 
@@ -72,14 +72,14 @@ def _public_keys():
         raise StoreError("private key files are never accepted")
     lines = [line.strip() for line in content.splitlines() if line.strip() and not line.lstrip().startswith("#")]
     encoded = base64.b64encode(("\n".join(lines) + "\n").encode("ascii")).decode("ascii")
-    seed.validate({"SEED_VERSION": "1", "SSH_AUTHORIZED_KEYS": encoded})
+    seed.validate({"SEED_VERSION": "1", "PROFILE": "dev", "SSH_AUTHORIZED_KEYS": encoded})
     return encoded
 
 
 def configure(root, name, profile="dev"):
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", name):
         raise RefusedError("seed name must use letters, digits, dot, underscore or dash")
-    data = {"SEED_VERSION": "1"}
+    data = {"SEED_VERSION": "1", "PROFILE": profile}
     for key, prompt, default in (("HOSTNAME", "Hostname", "openstick"), ("TIMEZONE", "Timezone", "Etc/UTC")):
         value = _ask(prompt, default)
         if value: data[key] = value
@@ -100,16 +100,20 @@ def configure(root, name, profile="dev"):
             if user_pass: data["USER_PASSWORD_HASH"] = password_hash(user_pass)
     wifi_ssid = _ask("Wi-Fi SSID (blank to skip)")
     if wifi_ssid:
-        data["WIFI_SSID"] = wifi_ssid
+        data["WIFI_SSID_B64"] = base64.b64encode(wifi_ssid.encode("utf-8")).decode("ascii")
         psk = _ask_secret("Wi-Fi password (PSK)")
-        if psk: data["WIFI_PSK"] = psk
+        if psk: data["WIFI_PSK_B64"] = base64.b64encode(psk.encode("utf-8")).decode("ascii")
         country = _ask("Wi-Fi country code (optional)")
         if country: data["WIFI_COUNTRY"] = country.upper()
-    for key, prompt, default in (("APN", "Cellular APN", "internet"), ("APN_USER", "APN username", ""), ("USB_NET_ADDR", "USB network address in CIDR form", ""), ("NTP_SERVERS", "NTP servers, comma separated", "")):
+    for key, prompt, default in (("APN", "Cellular APN", "internet"), ("USB_NET_ADDR", "USB network address in CIDR form", ""), ("NTP_SERVERS", "NTP servers, comma separated", "")):
         value = _ask(prompt, default)
-        if value: data[key] = value
+        if value:
+            if key == "APN": data["APN_B64"] = base64.b64encode(value.encode("utf-8")).decode("ascii")
+            else: data[key] = value
+    apn_user = _ask_secret("APN username")
+    if apn_user: data["APN_USER_B64"] = base64.b64encode(apn_user.encode("utf-8")).decode("ascii")
     ap = _ask_secret("APN password")
-    if ap: data["APN_PASSWORD"] = ap
+    if ap: data["APN_PASSWORD_B64"] = base64.b64encode(ap.encode("utf-8")).decode("ascii")
     seed.validate(data)
     path = root / "seeds" / (name + ".seed")
     _atomic_private_write(path, seed.serialize(data).encode("utf-8"))
@@ -128,6 +132,7 @@ def show(root, name):
     for key in sorted(data):
         value = data[key]
         if key in seed.SECRET_FIELDS: value = "[REDACTED]"
+        elif key.endswith("_B64") and key in seed.NETWORK_FIELDS: value = "[ENCODED PRIVATE VALUE]"
         elif key == "SSH_AUTHORIZED_KEYS": value = "[public key data]"
         elif key.startswith("LED_"): value = "[reserved, ignored]"
         print("%s=%s" % (key, value))

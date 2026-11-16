@@ -3,18 +3,23 @@ import base64
 import binascii
 import ipaddress
 import re
+import unicodedata
 
 FIELDS = {
-    "SEED_VERSION", "HOSTNAME", "TIMEZONE", "SSH_AUTHORIZED_KEYS",
+    "SEED_VERSION", "PROFILE", "HOSTNAME", "TIMEZONE", "SSH_AUTHORIZED_KEYS",
     "ROOT_PASSWORD_HASH", "DEFAULT_USER", "USER_PASSWORD_HASH",
     "WIFI_SSID", "WIFI_PSK", "WIFI_COUNTRY", "APN", "APN_USER",
     "APN_PASSWORD", "USB_NET_ADDR", "NTP_SERVERS",
+    "WIFI_SSID_B64", "WIFI_PSK_B64", "APN_B64", "APN_USER_B64", "APN_PASSWORD_B64",
 }
-SECRET_FIELDS = {"ROOT_PASSWORD_HASH", "USER_PASSWORD_HASH", "WIFI_PSK", "APN_USER", "APN_PASSWORD"}
+SECRET_FIELDS = {"ROOT_PASSWORD_HASH", "USER_PASSWORD_HASH", "WIFI_PSK_B64", "APN_USER_B64", "APN_PASSWORD_B64"}
+NETWORK_FIELDS = {
+    "WIFI_SSID_B64": "WIFI_SSID", "WIFI_PSK_B64": "WIFI_PSK", "APN_B64": "APN",
+    "APN_USER_B64": "APN_USER", "APN_PASSWORD_B64": "APN_PASSWORD",
+}
 HASH_RE = re.compile(r"^\$(?:6|5|y)\$[A-Za-z0-9./$=_-]{20,200}$")
 HOST_RE = re.compile(r"^(?=.{1,253}$)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)(?:\.(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?))*$")
 USER_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
-SAFE_RE = re.compile(r"^[A-Za-z0-9_.:+/@ -]{1,128}$")
 
 
 class SeedError(ValueError):
@@ -24,6 +29,8 @@ class SeedError(ValueError):
 def validate(data):
     if data.get("SEED_VERSION") != "1":
         raise SeedError("SEED_VERSION must be 1")
+    if data.get("PROFILE") not in ("dev", "prod"):
+        raise SeedError("PROFILE must be dev or prod")
     for key in data:
         if key not in FIELDS and not key.startswith("LED_"):
             raise SeedError("unknown seed field: " + key)
@@ -40,12 +47,32 @@ def validate(data):
         raise SeedError("invalid DEFAULT_USER")
     if data.get("DEFAULT_USER") == "root":
         raise SeedError("DEFAULT_USER cannot be root")
+    if data.get("PROFILE") == "prod" and "DEFAULT_USER" in data:
+        raise SeedError("prod seeds cannot define DEFAULT_USER")
     if "USER_PASSWORD_HASH" in data and "DEFAULT_USER" not in data:
         raise SeedError("USER_PASSWORD_HASH requires DEFAULT_USER")
-    if "APN_USER" in data and "APN" not in data or "APN_PASSWORD" in data and "APN" not in data:
+    decoded = {}
+    for encoded_key, key in NETWORK_FIELDS.items():
+        if encoded_key not in data:
+            continue
+        try:
+            raw = base64.b64decode(data[encoded_key], validate=True)
+            value = raw.decode("utf-8")
+        except (binascii.Error, UnicodeDecodeError):
+            raise SeedError("invalid " + encoded_key)
+        if not value or any(unicodedata.category(char).startswith("C") for char in value):
+            raise SeedError("invalid " + encoded_key)
+        decoded[key] = value
+    if "APN_USER_B64" in data and "APN_B64" not in data or "APN_PASSWORD_B64" in data and "APN_B64" not in data:
         raise SeedError("APN credentials require APN")
-    if "WIFI_COUNTRY" in data and "WIFI_SSID" not in data:
+    if "WIFI_COUNTRY" in data and "WIFI_SSID_B64" not in data:
         raise SeedError("WIFI_COUNTRY requires WIFI_SSID")
+    if "WIFI_SSID_B64" in data and len(decoded["WIFI_SSID"].encode("utf-8")) > 32:
+        raise SeedError("invalid WIFI_SSID length")
+    if "WIFI_PSK_B64" in data and not (8 <= len(decoded["WIFI_PSK"].encode("utf-8")) <= 63):
+        raise SeedError("invalid WIFI_PSK length")
+    if "WIFI_PSK_B64" in data and "WIFI_SSID_B64" not in data:
+        raise SeedError("WIFI_PSK requires WIFI_SSID")
     if "SSH_AUTHORIZED_KEYS" in data:
         try:
             keys = base64.b64decode(data["SSH_AUTHORIZED_KEYS"], validate=True).decode("ascii")
@@ -88,15 +115,6 @@ def validate(data):
                 curve = key_type.removeprefix("ecdsa-sha2-")
                 if len(fields) != 2 or fields[0].decode("ascii", "ignore") != curve:
                     raise SeedError("invalid SSH public key list")
-    if "WIFI_PSK" in data and (len(data["WIFI_PSK"]) < 8 or len(data["WIFI_PSK"]) > 63):
-        raise SeedError("invalid WIFI_PSK length")
-    if "WIFI_SSID" in data and len(data["WIFI_SSID"].encode("utf-8")) > 32:
-        raise SeedError("invalid WIFI_SSID length")
-    for key in ("WIFI_SSID", "WIFI_PSK", "APN", "APN_USER", "APN_PASSWORD"):
-        if key in data and (not data[key] or not SAFE_RE.fullmatch(data[key]) or any(c in data[key] for c in "|&\\\n\r")):
-            raise SeedError("invalid " + key)
-    if "WIFI_PSK" in data and not data.get("WIFI_SSID"):
-        raise SeedError("WIFI_PSK requires WIFI_SSID")
     if "WIFI_COUNTRY" in data and not re.fullmatch(r"[A-Z]{2}", data["WIFI_COUNTRY"]):
         raise SeedError("invalid WIFI_COUNTRY")
     if "USB_NET_ADDR" in data:

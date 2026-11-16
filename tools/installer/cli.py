@@ -412,6 +412,18 @@ def inject_seed(args, root):
     original = build_dir / "rootfs.img"
     if build_dir.is_symlink() or not original.is_file() or original.is_symlink():
         raise store.StoreError("generic build rootfs.img not found")
+    manifest_path = build_dir / "build.json"
+    if manifest_path.is_symlink() or not manifest_path.is_file():
+        raise store.StoreError("build profile marker is missing")
+    try:
+        build_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        seed_profile = seed_format.parse(content).get("PROFILE")
+    except (OSError, UnicodeError, json.JSONDecodeError, seed_format.SeedError):
+        raise store.StoreError("build profile marker or seed is invalid")
+    if build_manifest.get("build_id") != args.build or build_manifest.get("profile") not in ("dev", "prod"):
+        raise store.StoreError("build profile marker is invalid")
+    if seed_profile != build_manifest["profile"]:
+        raise store.RefusedError("seed profile does not match the image build profile")
     debugfs, e2fsck = shutil.which("debugfs"), shutil.which("e2fsck")
     if not debugfs or not e2fsck:
         raise store.StoreError("debugfs and e2fsck are required")
@@ -464,6 +476,21 @@ def inject_seed(args, root):
         out.write_text(json.dumps(manifest, sort_keys=True, indent=2) + "\n", encoding="utf-8")
         os.chmod(out, 0o600)
         os.replace(staging, target_dir)
+        registry = store.load_registry(root)
+        entry = {"seed_name": args.seed, "seed_sha256": _sha_file(seed_path), "method": "inject",
+                 "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(), "target": "build:" + args.build}
+        registry.setdefault("seeds_applied", []).append(entry)
+        try:
+            store.save_registry(root, registry)
+            store.append_event(root, {"at": entry["ts"], "type": "seed.applied", "seed_name": args.seed,
+                                      "seed_sha256": entry["seed_sha256"], "method": "inject", "target": entry["target"]})
+        except Exception:
+            os.chmod(target_dir, 0o700)
+            for path in target_dir.rglob("*"):
+                if path.is_file(): os.chmod(path, 0o600)
+                elif path.is_dir(): os.chmod(path, 0o700)
+            shutil.rmtree(target_dir, ignore_errors=True)
+            raise
         print("Sensitive personalized rootfs created and verified by SHA-256 read-back.")
         return EXIT_OK
     except BaseException:
@@ -493,16 +520,32 @@ def push_seed(args, root):
         print("REFUSED: SSH access is unavailable. An unseeded production image cannot be provisioned remotely; recovery requires flashing a seeded image.", file=sys.stderr)
         return EXIT_REFUSED
     wanted_hash = _sha_file(seed_path)
-    remote_tmp = "/tmp/openstick-seed-%s.env" % wanted_hash[:16]
+    privileged = "" if args.host.startswith("root@") else "sudo "
+    prepare = 'set -eu; umask 077; d=$(mktemp -d /run/openstick-seed.XXXXXX 2>/dev/null || mktemp -d /var/tmp/openstick-seed.XXXXXX); [ ! -L "$d" ]; chmod 700 "$d"; printf "%s\\n" "$d"'
+    prepare_args = [ssh, "-o", "BatchMode=yes", args.host, prepare] if not privileged else [ssh, "-t", args.host, prepare]
+    prepared = subprocess.run(prepare_args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    remote_dir = prepared.stdout.strip()
+    if prepared.returncode or not re.fullmatch(r"/(?:run|var/tmp)/openstick-seed\.[A-Za-z0-9]+", remote_dir):
+        print("REFUSED: could not create a private remote seed directory.", file=sys.stderr)
+        return EXIT_REFUSED
+    remote_tmp = remote_dir + "/seed.env"
     copied = subprocess.run([scp, "-q", str(seed_path), args.host + ":" + remote_tmp], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     if copied.returncode:
+        cleanup = "rm -rf -- " + remote_dir
+        subprocess.run(prepare_args[:-1] + [cleanup], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         raise store.StoreError("could not transfer seed over SSH")
-    privileged = "" if args.host.startswith("root@") else "sudo "
-    remote = "%sinstall -o root -g root -m 600 %s /etc/openstick/seed.env && %ssystemctl start openstick-seed.service && %sgrep -qx %s /etc/openstick/seed.applied; rc=$?; rm -f %s; exit $rc" % (privileged, remote_tmp, privileged, privileged, wanted_hash, remote_tmp)
+    remote = "set -eu; d=%s; trap 'rm -rf -- \"$d\"' EXIT HUP INT TERM; [ ! -L \"$d\" ] && [ ! -L \"$d/seed.env\" ]; %sinstall -o root -g root -m 600 \"$d/seed.env\" /etc/openstick/seed.env; %ssystemctl start openstick-seed.service; %sgrep -qx %s /etc/openstick/seed.applied" % (remote_dir, privileged, privileged, privileged, wanted_hash)
     ssh_args = [ssh, "-o", "BatchMode=yes", args.host, remote] if not privileged else [ssh, "-t", args.host, remote]
     started = subprocess.run(ssh_args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     if started.returncode:
         raise store.StoreError("remote seed application failed")
+    registry = store.load_registry(root)
+    entry = {"seed_name": args.seed, "seed_sha256": wanted_hash, "method": "push",
+             "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(), "target": "host:" + args.host}
+    registry.setdefault("seeds_applied", []).append(entry)
+    store.save_registry(root, registry)
+    store.append_event(root, {"at": entry["ts"], "type": "seed.applied", "seed_name": args.seed,
+                              "seed_sha256": wanted_hash, "method": "push", "target": entry["target"]})
     print("Seed transferred to the reachable stick; application service completed.")
     return EXIT_OK
 

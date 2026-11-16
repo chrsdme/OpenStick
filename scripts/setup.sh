@@ -45,6 +45,7 @@ esac
 # dev:  root has an empty password (serial console / ADB; sshd refuses it) and a test user with a documented password.
 # prod: no default credentials. root is locked unless ROOT_PASSWORD_HASH is given; no test user.
 install -d -m 755 /etc/openstick
+printf '%s\n' "$PROFILE" > /etc/openstick/image-profile
 if [ "$PROFILE" = prod ]; then
     if [ -n "$ROOT_PASSWORD_HASH" ]; then usermod -p "$ROOT_PASSWORD_HASH" root; else passwd -l root; fi
     # optional named user, only when explicitly set to something other than the dev test name; key-only, no sudo
