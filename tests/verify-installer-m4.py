@@ -250,7 +250,7 @@ class M4Tests(unittest.TestCase):
         self.assertEqual((output / "payload/boot.img").read_bytes(), (self.home / "builds/fixture-build/boot.img").read_bytes())
         self.assertEqual((output / "payload/rootfs.img").read_bytes(), (self.home / "builds/fixture-build/rootfs.img").read_bytes())
         self.assertEqual(imageset_module.verify_command(str(output)), 0)
-        with self.assertRaisesRegex(store.RefusedError, "HARDWARE_REQUIRED"):
+        with self.assertRaisesRegex(store.RefusedError, "GPT-T first-install is not hardware-validated.*docs/INSTALLER.md"):
             flash_module.flash_command(types.SimpleNamespace(image_set=str(output)), self.home, self.repo)
         manifest["format"] = "unknown-mixed-format"
         (output / "manifest.json").chmod(0o600)
@@ -438,16 +438,27 @@ class M4Tests(unittest.TestCase):
         (self.repo / "tools/flash").mkdir(parents=True, exist_ok=True)
         args = types.SimpleNamespace(image_set=str(image), flash_device=device_id, board=None,
                                      i_accept_untested=False, dry_run=True, reconcile_state=False)
-        env = dict(os.environ, PATH=str(ROOT / "tests/shims/bin") + ":/usr/bin:/bin")
+        fakebin = self.tmp / "fake-edl-bin"; fakebin.mkdir(exist_ok=True)
+        byte_log = self.tmp / "edl-read-bytes.log"
+        exec_log = self.tmp / "edl-executions.log"
+        edl_wrapper = fakebin / "edl"
+        edl_wrapper.write_text("#!/bin/sh\nprintf '%%s %%s\\n' \"$0\" \"$*\" >> %s\nOPENSTICK_FAKE_EMMC=%s OPENSTICK_EDL_BYTES_FILE=%s OPENSTICK_EDL_CALL_FILE=%s exec %s \"$@\"\n" %
+                               (exec_log, disk, byte_log, self.tmp / "edl-calls", ROOT / "tests/shims/bin/edl"))
+        edl_wrapper.chmod(0o700)
+        env = dict(os.environ, PATH=str(fakebin) + ":" + str(ROOT / "tests/shims/bin") + ":/usr/bin:/bin")
         args.fake_disk = str(disk)
+        args.edl_bytes_file = str(byte_log)
+        args.edl_exec_log = str(exec_log)
+        args.edl_dir = str(fakebin)
         return args, dev, identity, env
 
-    def _fake_live(self, args):
-        original = flash_module._live_identity
-        def call(edl, env, temp):
-            test_env = dict(env, OPENSTICK_FAKE_EMMC=args.fake_disk)
-            return original(edl, test_env, temp)
-        return call
+    def _install_fake_flash_engines(self):
+        patha = self.repo / "tools/pathA/pathA-flash.sh"
+        patha.write_text("#!/bin/sh\n$EDL_CMD getstorageinfo >/dev/null\n")
+        patha.chmod(0o700)
+        fastboot = self.repo / "tools/flash/flash-board.sh"
+        fastboot.write_text("#!/bin/sh\n$EDL_CMD getstorageinfo >/dev/null\n")
+        fastboot.chmod(0o700)
 
     def test_flash_refusals_and_input_hashes(self):
         args, dev, identity, env = self._flash_fixture(with_backup=False)
@@ -460,9 +471,9 @@ class M4Tests(unittest.TestCase):
                                "--image-set", args.image_set], env=dict(env, OPENSTICK_HOME=""), capture_output=True, text=True)
         self.assertEqual(proc.returncode, 2, (proc.stdout, proc.stderr))
         args, dev, identity, env = self._flash_fixture(board="mf800", with_backup=False)
-        with mock.patch.dict(os.environ, env, clear=True), self.assertRaisesRegex(store.RefusedError, "untested board"):
+        with mock.patch.dict(os.environ, env, clear=True), self.assertRaisesRegex(store.RefusedError, "only ufi103s.*always refused.*--i-accept-untested does not exist"):
             flash_module.flash_command(args, self.home, self.repo)
-        with mock.patch.dict(os.environ, env, clear=True), self.assertRaisesRegex(store.RefusedError, "untested board refused"):
+        with mock.patch.dict(os.environ, env, clear=True), self.assertRaisesRegex(store.RefusedError, "only ufi103s.*always refused.*--i-accept-untested does not exist"):
             flash_module.flash_command(args, self.home, self.repo)
         args, dev, identity, env = self._flash_fixture()
         image = pathlib.Path(args.image_set) / "files-ufi103s/boot.bin"
@@ -479,9 +490,49 @@ class M4Tests(unittest.TestCase):
         # Mutate the live fake fsg bytes; the registered backup remains intact.
         disk = self.tmp / "fake-emmc.bin"
         with disk.open("r+b") as stream: stream.seek(34 * 512); stream.write(b"X")
-        with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(flash_module, "_live_identity", side_effect=self._fake_live(args)):
+        with mock.patch.dict(os.environ, env, clear=True):
             with self.assertRaisesRegex(store.RefusedError, "identity fingerprints"):
                 flash_module.flash_command(args, self.home, self.repo)
+
+    def test_flash_identity_check_reads_only_backup_identity_ranges(self):
+        args, dev, identity, env = self._flash_fixture()
+        self._install_fake_flash_engines()
+        byte_log = pathlib.Path(args.edl_bytes_file)
+        env["OPENSTICK_EDL_DIR"] = args.edl_dir
+        from contextlib import redirect_stdout
+        captured = io.StringIO()
+        with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(flash_module.common, "LOADER_SHA256", digest(pathlib.Path(args.image_set) / "loader/prog_emmc_firehose_8916.mbn")), redirect_stdout(captured):
+            self.assertEqual(flash_module.flash_command(args, self.home, self.repo), 0)
+        rows = byte_log.read_text().splitlines()
+        reads = [row for row in rows if row.startswith("rs ")]
+        self.assertEqual(len(reads), 3, rows)
+        self.assertTrue(all(row.startswith(("getstorageinfo ", "rs ")) for row in rows), rows)
+        self.assertFalse(any(row.startswith("rf ") for row in rows), rows)
+        total = sum(int(row.rsplit(" ", 1)[-1]) for row in reads)
+        self.assertLessEqual(total, 2 * 1024 * 1024)
+        manifest = json.loads((self.home / "backups/deadbeef/fake-backup/manifest.json").read_text())
+        expected = ["rs %d %d %d" % (manifest["partitions"][name]["start_lba"],
+                                      manifest["partitions"][name]["end_lba"] - manifest["partitions"][name]["start_lba"] + 1,
+                                      (manifest["partitions"][name]["end_lba"] - manifest["partitions"][name]["start_lba"] + 1) * 512)
+                    for name in flash_module.IDENTITY_PARTS]
+        self.assertEqual(reads, expected)
+
+    def test_flash_uses_one_edl_command_for_identity_and_engine(self):
+        args, dev, identity, env = self._flash_fixture()
+        self._install_fake_flash_engines()
+        env["OPENSTICK_EDL_DIR"] = args.edl_dir
+        edl = str(pathlib.Path(args.edl_dir) / "edl")
+        from contextlib import redirect_stdout
+        captured = io.StringIO()
+        with mock.patch.dict(os.environ, env, clear=True), \
+             mock.patch.object(flash_module.common, "LOADER_SHA256", digest(pathlib.Path(args.image_set) / "loader/prog_emmc_firehose_8916.mbn")), \
+             redirect_stdout(captured):
+            self.assertEqual(flash_module.flash_command(args, self.home, self.repo), 0)
+        calls = pathlib.Path(args.edl_exec_log).read_text().splitlines()
+        self.assertTrue(any(line.endswith(" getstorageinfo") for line in calls), calls)
+        self.assertTrue(any(" rs " in line for line in calls), calls)
+        self.assertTrue(all(line.startswith(edl + " ") for line in calls), calls)
+        self.assertIn("EDL command: " + edl, captured.getvalue())
 
     def test_flash_dry_confirmation_protocol_and_failure_stop(self):
         args, dev, identity, env = self._flash_fixture()
@@ -491,7 +542,7 @@ class M4Tests(unittest.TestCase):
             commands.append((pathlib.Path(command[0]).name, command[-2], command[-1], phase_env.get("COMMIT"), phase_env.get("CONFIRM")))
             if command[-1] == "write" and command[-2] == "gpt": return 47
             return 0
-        with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(flash_module, "_live_identity", side_effect=self._fake_live(args)), mock.patch.object(flash_module.common, "LOADER_SHA256", digest(fake_loader)), \
+        with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(flash_module.common, "LOADER_SHA256", digest(fake_loader)), \
              mock.patch.object(flash_module, "_invoke", side_effect=invoke), mock.patch.object(flash_module.sys, "stdin", FakeTTY()), \
              mock.patch.object(flash_module.sys, "stdout", FakeTTY()), mock.patch("builtins.input", return_value="flash deadbeef gpt"):
             args.dry_run = False
@@ -509,7 +560,7 @@ class M4Tests(unittest.TestCase):
         args, dev, identity, env = self._flash_fixture()
         fake_loader = pathlib.Path(args.image_set) / "loader/prog_emmc_firehose_8916.mbn"
         calls = []
-        with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(flash_module, "_live_identity", side_effect=self._fake_live(args)), mock.patch.object(flash_module.common, "LOADER_SHA256", digest(fake_loader)), \
+        with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(flash_module.common, "LOADER_SHA256", digest(fake_loader)), \
              mock.patch.object(flash_module, "_invoke", side_effect=lambda c, e: calls.append((c[-1], e.get("COMMIT"))) or 0), \
              mock.patch.object(flash_module.sys, "stdin", FakeTTY()), mock.patch.object(flash_module.sys, "stdout", FakeTTY()), \
              mock.patch("builtins.input", return_value="wrong"):
@@ -521,7 +572,7 @@ class M4Tests(unittest.TestCase):
         args, dev, identity, env = self._flash_fixture()
         fake_loader = pathlib.Path(args.image_set) / "loader/prog_emmc_firehose_8916.mbn"
         calls = []
-        with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(flash_module, "_live_identity", side_effect=self._fake_live(args)), mock.patch.object(flash_module.common, "LOADER_SHA256", digest(fake_loader)), \
+        with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(flash_module.common, "LOADER_SHA256", digest(fake_loader)), \
              mock.patch.object(flash_module, "_invoke", side_effect=lambda c, e: calls.append((c[-1], e.get("COMMIT"))) or 0), \
              mock.patch.object(flash_module.sys, "stdin", mock.Mock(isatty=lambda: False)), mock.patch.object(flash_module.sys, "stdout", mock.Mock(isatty=lambda: False)):
             args.dry_run = False
@@ -532,7 +583,7 @@ class M4Tests(unittest.TestCase):
         args, dev, identity, env = self._flash_fixture()
         fake_loader = pathlib.Path(args.image_set) / "loader/prog_emmc_firehose_8916.mbn"
         calls = []
-        with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(flash_module, "_live_identity", side_effect=self._fake_live(args)), \
+        with mock.patch.dict(os.environ, env, clear=True), \
              mock.patch.object(flash_module.common, "LOADER_SHA256", digest(fake_loader)), \
              mock.patch.object(flash_module, "_invoke", side_effect=lambda c, e: calls.append((c[-1], e.get("COMMIT"))) or 0), \
              mock.patch.object(flash_module.sys, "stdin", FakeTTY()), mock.patch.object(flash_module.sys, "stdout", FakeTTY()):
@@ -565,20 +616,21 @@ class M4Tests(unittest.TestCase):
             calls.append((command[-2], command[-1], phase_env.get("COMMIT"), phase_env.get("CONFIRM")))
             return 0
         confirmations = ["flash deadbeef " + phase for phase in ("gpt", "tz", "rpm", "sbl1", "hyp", "aboot", "first-install")]
-        with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(flash_module, "_live_identity", side_effect=self._fake_live(args)), \
+        with mock.patch.dict(os.environ, env, clear=True), \
              mock.patch.object(flash_module.common, "LOADER_SHA256", digest(fake_loader)), mock.patch.object(flash_module, "_invoke", side_effect=invoke), \
              mock.patch.object(flash_module.sys, "stdin", FakeTTY()), mock.patch.object(flash_module.sys, "stdout", FakeTTY()), \
              mock.patch("builtins.input", side_effect=confirmations):
             args.dry_run = False
-            self.assertEqual(flash_module.flash_command(args, self.home, self.repo), 0)
-        self.assertEqual([phase for phase, mode, _, _ in calls if mode == "write"], ["gpt", "tz", "rpm", "sbl1", "hyp", "aboot", "first-install"])
-        self.assertEqual([phase for phase, mode, _, _ in calls if mode == "dry"], ["pre", "gpt", "tz", "rpm", "sbl1", "hyp", "aboot", "final", "first-install"])
+            with self.assertRaisesRegex(store.RefusedError, "stopped after GPT"):
+                flash_module.flash_command(args, self.home, self.repo)
+        self.assertEqual([phase for phase, mode, _, _ in calls if mode == "write"], ["gpt"])
+        self.assertEqual([phase for phase, mode, _, _ in calls if mode == "dry"], ["pre", "gpt"])
         writes = [(phase, confirm) for phase, mode, commit, confirm in calls if mode == "write"]
-        self.assertEqual(writes, [(p, ("flash-ufi103s-first-install" if p == "first-install" else "da-flashez-" + p))
-                                  for p in ("gpt", "tz", "rpm", "sbl1", "hyp", "aboot", "first-install")])
+        self.assertEqual(writes, [("gpt", "da-flashez-gpt")])
         self.assertTrue(all(commit == "1" for _, mode, commit, _ in calls if mode == "write"))
         self.assertFalse(any(commit == "1" for phase, mode, commit, _ in calls if phase == "final"))
-        self.assertEqual(store.load_registry(self.home)["devices"][0]["flashes"][0]["outcome"], "engine-reported-pass-not-boot-verified")
+        self.assertEqual(store.load_registry(self.home)["devices"][0]["flashes"][0]["phases"],
+                         [{"name": "gpt", "result": "engine-reported-pass", "verified": True}])
 
     def test_interrupted_write_requires_reconciliation_and_is_not_retried(self):
         args, dev, identity, env = self._flash_fixture()
@@ -588,7 +640,7 @@ class M4Tests(unittest.TestCase):
             calls.append((command[-2], command[-1]))
             if command[-1] == "write": raise KeyboardInterrupt()
             return 0
-        with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(flash_module, "_live_identity", side_effect=self._fake_live(args)), \
+        with mock.patch.dict(os.environ, env, clear=True), \
              mock.patch.object(flash_module.common, "LOADER_SHA256", digest(fake_loader)), mock.patch.object(flash_module, "_invoke", side_effect=interrupt), \
              mock.patch.object(flash_module.sys, "stdin", FakeTTY()), mock.patch.object(flash_module.sys, "stdout", FakeTTY()), \
              mock.patch("builtins.input", return_value="flash deadbeef gpt"):
@@ -597,7 +649,7 @@ class M4Tests(unittest.TestCase):
         state = json.loads((self.home / "devices/deadbeef/flash-state.json").read_text())
         self.assertEqual(state["status"], "interrupted")
         before = len(calls)
-        with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(flash_module, "_live_identity", side_effect=self._fake_live(args)), \
+        with mock.patch.dict(os.environ, env, clear=True), \
              mock.patch.object(flash_module.common, "LOADER_SHA256", digest(fake_loader)), mock.patch.object(flash_module, "_invoke", side_effect=interrupt):
             with self.assertRaisesRegex(store.RefusedError, "unresolved"):
                 flash_module.flash_command(args, self.home, self.repo)
@@ -605,7 +657,7 @@ class M4Tests(unittest.TestCase):
         device = store.load_registry(self.home)["devices"][0]
         self.assertEqual(device["flashes"][0]["outcome"], "partial-failure-reconciliation-required")
         args.reconcile_state = True
-        with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(flash_module, "_live_identity", side_effect=self._fake_live(args)), \
+        with mock.patch.dict(os.environ, env, clear=True), \
              mock.patch.object(flash_module.common, "LOADER_SHA256", digest(fake_loader)), mock.patch.object(flash_module, "_invoke", side_effect=AssertionError("reconciliation must not execute scripts")), \
              mock.patch.object(flash_module.sys, "stdin", FakeTTY()), mock.patch.object(flash_module.sys, "stdout", FakeTTY()), \
              mock.patch("builtins.input", return_value="reconcile deadbeef gpt"):

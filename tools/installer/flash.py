@@ -17,6 +17,7 @@ from . import cli as common
 PHASES = ("pre", "gpt", "tz", "rpm", "sbl1", "hyp", "aboot", "final", "first-install")
 WRITE_PHASES = PHASES[1:]
 IDENTITY_PARTS = ("fsg", "sec", "fsc")
+IDENTITY_READ_TIMEOUT_SECONDS = 30
 
 
 def _hash(path):
@@ -49,20 +50,52 @@ def _checked_sum_file(root, filename="SHA256SUMS", require_all=False):
     return seen
 
 
-def _live_identity(edl, env, temp):
-    result = subprocess.run([edl, "getstorageinfo"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env, timeout=30)
+def _resolve_edl_command():
+    edl_dir = os.environ.get("OPENSTICK_EDL_DIR")
+    if edl_dir:
+        directory = Path(edl_dir)
+        executable = directory / "edl"
+        script = directory / "edl.py"
+        if executable.is_file() and os.access(executable, os.X_OK):
+            command = [str(executable.resolve())]
+        elif script.is_file():
+            command = [sys.executable, str(script.resolve())]
+        else:
+            raise store.RefusedError("OPENSTICK_EDL_DIR must contain an executable edl or edl.py")
+    else:
+        executable = shutil.which("edl")
+        if not executable:
+            raise store.RefusedError("EDL client not found; set OPENSTICK_EDL_DIR or add edl to PATH")
+        command = [str(Path(executable).resolve())]
+    if any(not re.fullmatch(r"/[A-Za-z0-9._/-]+", item) for item in command):
+        raise store.RefusedError("EDL command path contains unsupported characters")
+    return command
+
+
+def _live_identity(edl_command, env, temp, recorded_parts):
+    result = subprocess.run(edl_command + ["getstorageinfo"], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, env=env, timeout=IDENTITY_READ_TIMEOUT_SECONDS)
     if result.returncode:
         raise store.RefusedError("could not read live EDL identity")
     combined = result.stdout + "\n" + result.stderr
     serial = re.search(r"serial\s*=\s*([0-9a-fA-F]+)", combined)
     if not serial:
         raise store.RefusedError("EDL did not report a live device identity")
-    dump = Path(temp) / "live-emmc.bin"
-    result = subprocess.run([edl, "rf", str(dump)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, timeout=300)
-    if result.returncode or not dump.is_file():
-        raise store.RefusedError("could not read live EDL partition fingerprints")
-    parts = common._parse_gpt(dump)
-    return serial.group(1).lower(), {name: common._hash_range(dump, *parts[name]) for name in IDENTITY_PARTS}
+    observed = {}
+    for name in IDENTITY_PARTS:
+        row = recorded_parts.get(name, {})
+        start, end = row.get("start_lba"), row.get("end_lba")
+        if not isinstance(start, int) or not isinstance(end, int) or start < 0 or end < start:
+            raise store.RefusedError("verified backup has invalid identity partition geometry for " + name)
+        target = Path(temp) / ("live-identity-" + name + ".bin")
+        count = end - start + 1
+        result = subprocess.run(edl_command + ["rs", str(start), str(count), str(target), "--memory=emmc"],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env,
+                                timeout=IDENTITY_READ_TIMEOUT_SECONDS)
+        if result.returncode or not target.is_file() or target.stat().st_size != count * 512:
+            raise store.RefusedError("could not read live EDL identity partition " + name)
+        observed[name] = _hash(target)
+    return serial.group(1).lower(), observed
 
 
 def _verified_backup(home, device):
@@ -132,6 +165,8 @@ def _write_state(path, status, phase):
 
 def _invoke(command, env):
     print("Executing: " + " ".join(command))
+    if env.get("EDL_CMD"):
+        print("EDL command: " + env["EDL_CMD"])
     return subprocess.run(command, env=env).returncode
 
 
@@ -153,7 +188,7 @@ def flash_command(args, home, repo):
         if manifest.get("format") == "openstick-gpt-t-image-set":
             from . import imageset
             imageset._verify_set(image_set)
-            raise store.RefusedError("HARDWARE_REQUIRED: GPT-T images are mapped and verified offline, but no safe live-identity-preserving boot/userdata write and read-back path is validated")
+            raise store.RefusedError("HARDWARE_REQUIRED: GPT-T first-install is not hardware-validated. See docs/INSTALLER.md for the GPT-T status and required acceptance. Refusing to write.")
         raise store.RefusedError("unsupported image-set manifest format")
     if any((image_set / rel).exists() for rel in ("boot.img", "rootfs.img", "payload/boot.img", "payload/rootfs.img",
                                                    "layout/gpt-T-primary.bin", "layout/gpt-T-secondary.bin")):
@@ -173,7 +208,7 @@ def flash_command(args, home, repo):
         raise store.RefusedError("board profile is missing")
     tested = board == "ufi103s"
     if not tested:
-        raise store.RefusedError("untested board refused; this installer has no verified flash path for the selected board")
+        raise store.RefusedError("only ufi103s is supported; non-ufi103s boards are always refused. --i-accept-untested does not exist")
     backup_dir, backup_manifest = _verified_backup(home, device)
     checked = _checked_sum_file(image_set, require_all=True)
     image_manifest_hash = _hash(image_set / "SHA256SUMS")
@@ -181,9 +216,7 @@ def flash_command(args, home, repo):
     if not args.dry_run and (not sys.stdin.isatty() or not sys.stdout.isatty()):
         print("REFUSED: non-interactive flash is read-only; use --dry-run to inspect phases.", file=sys.stderr)
         args.dry_run = True
-    edl = shutil.which("edl")
-    if not edl:
-        raise store.RefusedError("EDL client not found; no hardware command will be substituted")
+    edl_command = _resolve_edl_command()
 
     with tempfile.TemporaryDirectory(prefix="openstick-flash-") as temp:
         os.chmod(temp, 0o700)
@@ -195,9 +228,9 @@ def flash_command(args, home, repo):
                "PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(Path(temp) / "home"),
                "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "TERM": "dumb",
                "PYTHONDONTWRITEBYTECODE": "1", "LDR": str(image_set / "loader" / "prog_emmc_firehose_8916.mbn"),
-               "EDL_CMD": "sudo .venv/bin/python edl/edl.py"}
+               "EDL_CMD": " ".join(edl_command)}
         env["BACKUP_DIR"] = str(flash_backup)
-        serial, identity = _live_identity(edl, env, temp)
+        serial, identity = _live_identity(edl_command, env, temp, backup_manifest.get("partitions", {}))
         if serial != device_id or identity != backup_manifest.get("identity") or identity != device.get("identity"):
             raise store.RefusedError("live EDL identity fingerprints do not match the registered verified backup")
         print("Live EDL identity and fsg/sec/fsc fingerprints match the verified backup.")
@@ -276,7 +309,10 @@ def flash_command(args, home, repo):
         elif args.reconcile_state:
             raise store.RefusedError("there is no unresolved flash state to reconcile")
         flash_entry = None
+        gpt_phase_completed = False
         for phase, command, writes in sequence:
+            if gpt_phase_completed and writes:
+                raise store.RefusedError("flash stopped after GPT because post-GPT fsg/sec/fsc LBAs are not hardware-validated; see OPEN-QUESTIONS.md")
             if _hash(profile_path) != profile_hash or _hash(image_set / "SHA256SUMS") != image_manifest_hash:
                 raise store.RefusedError("board profile or image-set manifest changed during flash")
             current_backup, current_manifest = _verified_backup(home, device)
@@ -287,10 +323,6 @@ def flash_command(args, home, repo):
                 raise store.RefusedError("image-set manifest changed during flash")
             if _hash(loader) != common.LOADER_SHA256:
                 raise store.RefusedError("pinned Firehose loader changed during flash")
-            serial, identity = _live_identity(edl, env, temp)
-            if serial != device_id or identity != backup_manifest.get("identity") or identity != device.get("identity"):
-                raise store.RefusedError("live EDL identity fingerprints do not match the registered verified backup")
-            print("Live EDL identity and fsg/sec/fsc fingerprints match the verified backup.")
             if _hash(data_patha / "SHA256SUMS") != patha_manifest_hash:
                 raise store.RefusedError("Path A artifact manifest changed during flash")
             patha_current = _checked_sum_file(data_patha, "SHA256SUMS")
@@ -335,7 +367,7 @@ def flash_command(args, home, repo):
             patha_current = _checked_sum_file(data_patha, "SHA256SUMS")
             if not patha_required.issubset(patha_current):
                 raise store.RefusedError("Path A firmware/GPT/rollback hashes are incomplete")
-            serial, identity = _live_identity(edl, env, temp)
+            serial, identity = _live_identity(edl_command, env, temp, backup_manifest.get("partitions", {}))
             if serial != device_id or identity != backup_manifest.get("identity") or identity != device.get("identity"):
                 raise store.RefusedError("live EDL identity fingerprints changed after confirmation")
             phase_env["COMMIT"] = "1"
@@ -367,6 +399,8 @@ def flash_command(args, home, repo):
             flash_entry["phases"].append({"name": phase, "result": "engine-reported-pass", "verified": True})
             store.save_registry(home, registry)
             state_file.unlink(missing_ok=True)
+            if phase == "gpt":
+                gpt_phase_completed = True
         if flash_entry is not None:
             flash_entry["outcome"] = "engine-reported-pass-not-boot-verified"
             store.save_registry(home, registry)

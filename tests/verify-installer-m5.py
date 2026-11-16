@@ -364,6 +364,26 @@ exec /usr/bin/sha256sum "$@"
         self.assertFalse(self.write_log.exists())
         self.assertFalse((self.home / "devices/deadbeef/restore-state.json").exists())
 
+    def test_restore_confirmation_requires_interactive_terminal(self):
+        with mock.patch.object(m5.sys, "stdin", io.StringIO("restore deadbeef gpt\n")), \
+             mock.patch.object(m5.sys, "stdout", io.StringIO()):
+            with self.assertRaisesRegex(store.RefusedError, "non-interactive restore is read-only"):
+                m5._confirm("gpt", "deadbeef")
+
+    def test_restore_confirmation_does_not_strip_typed_text(self):
+        with mock.patch.object(m5.sys, "stdin", FakeTTY()), mock.patch.object(m5.sys, "stdout", FakeTTY()), \
+             mock.patch("builtins.input", return_value=" restore deadbeef gpt "):
+            with self.assertRaisesRegex(store.RefusedError, "confirmation did not match"):
+                m5._confirm("gpt", "deadbeef")
+
+    def test_restore_final_read_checks_size_even_when_hash_matches(self):
+        target_size = self.disk.stat().st_size
+        manifest = {"size": target_size + 512, "sha256": hashlib.sha256(self.disk.read_bytes()).hexdigest()}
+        state = {}
+        with self.assertRaises(ValueError):
+            m5._verify_final_disk(str(self.fake_edl_path), self.env, self.loader, self.tmp, manifest, state)
+        self.assertEqual(state["status"], "final-readback-failed")
+
     def test_fwlib_refuses_shell_syntax_in_edl_path(self):
         engine = m5._make_fwlib_engine(ROOT, self.tmp / "hostile-engine")
         source = self.tmp / "safe-source.bin"; source.write_bytes(b"x" * 512)
@@ -426,7 +446,7 @@ exec /usr/bin/sha256sum "$@"
         fake_loader = self.tmp / "loader.mbn"; fake_loader.write_bytes(b"synthetic loader")
         args = types.SimpleNamespace(restore_device="deadbeef", restore_backup="synthetic", dry_run=False)
         fake_live = lambda edl, env, loader, directory, ident: ("deadbeef", self.identity, self.disk, self.parts)
-        def bad_final(edl, edl_args, env):
+        def bad_final(edl, edl_args, env, **kwargs):
             self.fake_edl(edl, edl_args, env)
             if edl_args[0] == "rf":
                 target = pathlib.Path(edl_args[1])
@@ -453,7 +473,7 @@ exec /usr/bin/sha256sum "$@"
         fake_loader = self.tmp / "loader.mbn"; fake_loader.write_bytes(b"synthetic loader")
         fake_live = lambda edl, env, loader, directory, ident: ("deadbeef", self.identity, self.disk, self.parts)
         real_edl = m5._edl
-        def timeout_final(edl, edl_args, env):
+        def timeout_final(edl, edl_args, env, **kwargs):
             if edl_args[0] == "rf":
                 raise subprocess.TimeoutExpired([edl] + edl_args, 600)
             return real_edl(edl, edl_args, env)
