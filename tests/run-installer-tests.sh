@@ -82,6 +82,7 @@ assert a.read_bytes()[512:520] == b"EFI PART"
 assert "userdata".encode("utf-16le") in a.read_bytes()
 PY
 run m2-backup-edl-runner python3 "$ROOT/tests/verify-installer-m2.py"
+run m2-doctor-edl-usb python3 "$ROOT/tests/verify-installer-doctor.py"
 run shim-edl-read-and-failure-injection python3 - "$ROOT" "$TMP" <<'PY'
 import os, pathlib, subprocess, sys
 root, tmp = sys.argv[1:]
