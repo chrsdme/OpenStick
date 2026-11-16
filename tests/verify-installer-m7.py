@@ -501,6 +501,8 @@ class WizardTests(unittest.TestCase):
         edl = bin_dir / "edl"
         edl.write_bytes((ROOT / "tests/shims/bin/edl").read_bytes())
         edl.chmod(0o700)
+        loader = bin_dir / "prog_emmc_firehose_8916.mbn"
+        loader.write_bytes(b"synthetic pinned loader fixture for the M7 integration test")
         ssh = bin_dir / "ssh"
         ssh.write_text("#!/bin/sh\ncat >/dev/null\n" + "".join(
             "printf '%s\\t%s\\t%s\\n'\n" % ("PASS", key, "synthetic evidence")
@@ -508,6 +510,7 @@ class WizardTests(unittest.TestCase):
         ssh.chmod(0o700)
         env = dict(os.environ, OPENSTICK_FAKE_EMMC=str(disk),
                    OPENSTICK_EDL_CALL_FILE=str(self.tmp / "edl-calls"),
+                   OPENSTICK_EDL_DIR=str(bin_dir),
                    PATH=str(bin_dir) + ":" + str(ROOT / "tests/shims/bin") + ":/usr/bin:/bin")
 
         # A valid seed and registered generic build are fixture inputs; the
@@ -542,7 +545,11 @@ class WizardTests(unittest.TestCase):
         selections = dict(wizard_device=None, wizard_backup=None, wizard_build=build_id,
                           wizard_seed="synthetic", wizard_image_set=None, wizard_board="ufi103s",
                           wizard_profile="prod", wizard_host=None, package_type=None, package_output=None)
-        with mock.patch.dict(os.environ, env, clear=True), mock.patch("tools.installer.cli.doctor", return_value=0):
+        from tools.installer import edl_runner
+        fixture_pin = hashlib.sha256(loader.read_bytes()).hexdigest()
+        with mock.patch.dict(os.environ, env, clear=True), \
+             mock.patch.object(edl_runner, "PINNED_LOADER_SHA256", fixture_pin), \
+             mock.patch("tools.installer.cli.doctor", return_value=0):
             self.assertEqual(wizard.run(args("doctor", wizard_id="fake-install", **selections), self.home, ROOT), 0)
             self.assertEqual(wizard.run(args("backup", wizard_id="fake-install", resume=True, **selections), self.home, ROOT), 0)
             state = json.loads((self.home / "wizard/fake-install.json").read_text())

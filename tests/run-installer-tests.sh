@@ -81,72 +81,18 @@ assert hashlib.sha256(a.read_bytes()).digest() == hashlib.sha256(b.read_bytes())
 assert a.read_bytes()[512:520] == b"EFI PART"
 assert "userdata".encode("utf-16le") in a.read_bytes()
 PY
-run backup-success-and-integrity python3 - "$ROOT" "$TMP" <<'PY'
-import hashlib,json,os,pathlib,subprocess,sys
-root,tmp=pathlib.Path(sys.argv[1]),pathlib.Path(sys.argv[2]); disk=tmp/'backup-disk'; home=tmp/'backup-home'
-subprocess.check_call([sys.executable,str(root/'tests/make-fake-emmc.py'),str(disk),'--mib','2'])
-env=dict(os.environ,OPENSTICK_FAKE_EMMC=str(disk),PATH=str(root/'tests/shims/bin')+':/usr/bin:/bin')
-cmd=[str(root/'openstick'),'--home',str(home),'backup']
-p=subprocess.run(cmd,env=env,text=True,capture_output=True); assert p.returncode==0,(p.stdout,p.stderr)
-dev=json.loads((home/'registry.json').read_text())['devices'][0]; b=home/'backups'/'deadbeef'/dev['backups'][0]['id']; m=json.loads((b/'manifest.json').read_text())
-assert m['size']==disk.stat().st_size and m['sha256']==hashlib.sha256(disk.read_bytes()).hexdigest()
-assert m['identity']=={n:hashlib.sha256(disk.read_bytes()[s*512:(e+1)*512]).hexdigest() for n,(s,e) in {'fsg':(34,35),'sec':(36,37),'fsc':(38,39)}.items()}
-assert (b/'SHA256SUMS').read_text().startswith(m['sha256'])
-assert (home/'events.jsonl').read_text().count('backup.verified')==1
-assert (home.stat().st_mode&0o777)==0o700 and (b/'emmc-full.bin').stat().st_mode&0o777==0o600
-PY
-run backup-duplicate-and-again python3 - "$ROOT" "$TMP" <<'PY'
-import os,pathlib,subprocess,sys
-root,tmp=pathlib.Path(sys.argv[1]),pathlib.Path(sys.argv[2]); disk=tmp/'again-disk'; home=tmp/'again-home'
-subprocess.check_call([sys.executable,str(root/'tests/make-fake-emmc.py'),str(disk),'--mib','2'])
-env=dict(os.environ,OPENSTICK_FAKE_EMMC=str(disk),PATH=str(root/'tests/shims/bin')+':/usr/bin:/bin')
-base=[str(root/'openstick'),'--home',str(home),'backup']
-assert subprocess.run(base,env=env,capture_output=True).returncode==0
-assert subprocess.run(base,env=env,capture_output=True).returncode==2
-assert subprocess.run(base+['--again'],env=env,capture_output=True).returncode==0
-PY
-run backup-paranoid-success python3 - "$ROOT" "$TMP" <<'PY'
-import os,pathlib,subprocess,sys
-root,tmp=pathlib.Path(sys.argv[1]),pathlib.Path(sys.argv[2]); disk=tmp/'paranoid-disk'; home=tmp/'paranoid-home'
-subprocess.check_call([sys.executable,str(root/'tests/make-fake-emmc.py'),str(disk),'--mib','2'])
-env=dict(os.environ,OPENSTICK_FAKE_EMMC=str(disk),PATH=str(root/'tests/shims/bin')+':/usr/bin:/bin')
-p=subprocess.run([str(root/'openstick'),'--home',str(home),'backup','--paranoid'],env=env,capture_output=True)
-assert p.returncode==0,p.stderr
-assert 'paranoid-second-read' in (home/'backups'/'deadbeef'/next((home/'backups'/'deadbeef').iterdir()).name/'manifest.json').read_text()
-PY
-run backup-failures-cleanup python3 - "$ROOT" "$TMP" <<'PY'
-import json,os,pathlib,subprocess,sys
-root,tmp=pathlib.Path(sys.argv[1]),pathlib.Path(sys.argv[2]); shims=str(root/'tests/shims/bin')+':/usr/bin:/bin'
-for case,extra,want in [('truncated',{'OPENSTICK_EDL_SHORT_READ':'1'},3),('midread',{'OPENSTICK_EDL_FAIL_AT':'2'},1)]:
- disk=tmp/(case+'-disk'); home=tmp/(case+'-home'); subprocess.check_call([sys.executable,str(root/'tests/make-fake-emmc.py'),str(disk),'--mib','2'])
- env=dict(os.environ,OPENSTICK_FAKE_EMMC=str(disk),PATH=shims,OPENSTICK_EDL_CALL_FILE=str(tmp/(case+'-calls')));env.update(extra)
- p=subprocess.run([str(root/'openstick'),'--home',str(home),'backup'],env=env,capture_output=True)
- assert p.returncode==want,(case,p.returncode,p.stderr)
- assert not (home/'registry.json').exists() or not json.loads((home/'registry.json').read_text())['devices']
- assert not list((home/'backups'/'deadbeef').glob('*/manifest.json')) if (home/'backups'/'deadbeef').exists() else True
-PY
-run backup-gpt-corruption-and-paranoid-mismatch python3 - "$ROOT" "$TMP" <<'PY'
-import json,os,pathlib,subprocess,sys
-root,tmp=pathlib.Path(sys.argv[1]),pathlib.Path(sys.argv[2]); shims=str(root/'tests/shims/bin')+':/usr/bin:/bin'
-for label,offset in [('primary',512+16),('backup',2*1024*1024-512+16)]:
- disk=tmp/(label+'-gpt-disk');home=tmp/(label+'-gpt-home');subprocess.check_call([sys.executable,str(root/'tests/make-fake-emmc.py'),str(disk),'--mib','2'])
- env=dict(os.environ,OPENSTICK_FAKE_EMMC=str(disk),PATH=shims,OPENSTICK_EDL_CORRUPT_OFFSET=str(offset))
- p=subprocess.run([str(root/'openstick'),'--home',str(home),'backup'],env=env,capture_output=True);assert p.returncode==3,(label,p.returncode,p.stderr)
- assert not (home/'registry.json').exists() or not json.loads((home/'registry.json').read_text())['devices']
-disk=tmp/'mismatch-disk';home=tmp/'mismatch-home';subprocess.check_call([sys.executable,str(root/'tests/make-fake-emmc.py'),str(disk),'--mib','2'])
-env=dict(os.environ,OPENSTICK_FAKE_EMMC=str(disk),PATH=shims,OPENSTICK_EDL_CALL_FILE=str(tmp/'mismatch-calls'),OPENSTICK_EDL_CORRUPT_OFFSET='0',OPENSTICK_EDL_CORRUPT_AT_CALL='3')
-p=subprocess.run([str(root/'openstick'),'--home',str(home),'backup','--paranoid'],env=env,capture_output=True);assert p.returncode==3
-PY
+run m2-backup-edl-runner python3 "$ROOT/tests/verify-installer-m2.py"
 run shim-edl-read-and-failure-injection python3 - "$ROOT" "$TMP" <<'PY'
 import os, pathlib, subprocess, sys
 root, tmp = sys.argv[1:]
 tmp = pathlib.Path(tmp); disk = tmp / "disk.img"; out = tmp / "read.bin"
 subprocess.check_call([sys.executable, str(pathlib.Path(root)/"tests/make-fake-emmc.py"), str(disk), "--mib", "2"])
+loader = tmp / "synthetic-loader.mbn"; loader.write_bytes(b"test-only shim loader")
 env = dict(os.environ, OPENSTICK_FAKE_EMMC=str(disk), PATH=str(pathlib.Path(root)/"tests/shims/bin") + ":/usr/bin:/bin")
-subprocess.check_call(["edl", "rs", "0", "2", str(out)], env=env)
+subprocess.check_call(["edl", "rs", "0", "2", str(out), "--loader=" + str(loader), "--memory=emmc"], env=env)
 assert out.stat().st_size == 1024
 env["OPENSTICK_EDL_CALL_FILE"] = str(tmp / "calls"); env["OPENSTICK_EDL_FAIL_AT"] = "1"
-p = subprocess.run(["edl", "rs", "0", "2", str(tmp / "failed.bin")], env=env, capture_output=True)
+p = subprocess.run(["edl", "rs", "0", "2", str(tmp / "failed.bin"), "--loader=" + str(loader), "--memory=emmc"], env=env, capture_output=True)
 assert p.returncode == 90 and b"injected failure" in p.stderr
 PY
 
