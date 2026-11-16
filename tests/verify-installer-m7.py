@@ -294,7 +294,8 @@ class WizardTests(unittest.TestCase):
         # unavailable EDL/loader/USB prerequisites; backup correctly depends
         # on a successful doctor and is not dispatched yet.
         self.assertEqual(result.returncode, 1)
-        self.assertIn("FAIL EDL client", result.stdout)
+        self.assertIn("PASS EDL client", result.stdout)
+        self.assertIn("FAIL Firehose loader", result.stdout)
         self.assertNotIn("AttributeError", result.stderr)
         backup = subprocess.run([str(ROOT / "openstick"), "--home", str(home), "wizard",
                                  "--id", run_id, "--stage", "backup", "--resume",
@@ -377,6 +378,15 @@ class WizardTests(unittest.TestCase):
         self.assertEqual(help_result.returncode, 0)
         self.assertIn("--out", help_result.stdout)
         self.assertIn("--output", help_result.stdout)
+        package_help = subprocess.run([str(ROOT / "openstick"), "package", "--help"],
+                                      text=True, capture_output=True)
+        self.assertIn("write scripts", package_help.stdout)
+        self.assertIn("UNVALIDATED on hardware", package_help.stdout)
+        for package_type in ("install", "restore"):
+            type_help = subprocess.run([str(ROOT / "openstick"), "package", package_type, "--help"],
+                                       text=True, capture_output=True)
+            self.assertIn("UNVALIDATED on hardware", type_help.stdout)
+            self.assertIn("require typed confirmation", type_help.stdout)
         help_result = subprocess.run([str(ROOT / "openstick"), "package", "restore", "--help"],
                                      text=True, capture_output=True)
         self.assertIn("--out", help_result.stdout)
