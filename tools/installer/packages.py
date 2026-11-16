@@ -559,6 +559,7 @@ PINNED_LOADER_SHA256="959439aa5864685999b713c3ed12ad5fa408149648b670a9a9ef77bcc9
 IDENTITY_READ_TIMEOUT_SECONDS=20
 INTERRUPT_GRACE_SECONDS=10
 POWER_CYCLE_HINT='The board may be in a half-open EDL session. Unplug USB for 30 s and reconnect WITHOUT the button, then re-enter EDL.'
+EDL_FAILURE_HINT='Hint: verify EDL mode and the USB connection, confirm the pinned loader, correct the reported issue, and re-enter EDL before retrying.'
 def sha(path):
     h=hashlib.sha256()
     with open(path,'rb') as f:
@@ -578,6 +579,13 @@ def resolve_client(requested):
     found=shutil.which(requested or 'edl')
     if found: return [str(Path(found).resolve())]
     raise RuntimeError('EDL client unavailable; set OPENSTICK_EDL_DIR or provide an executable path')
+def edl_failure(message,out='',err='',verbose=False,debug=False):
+    detail=message
+    if 'Hint:' not in detail: detail+=' '+EDL_FAILURE_HINT
+    if (verbose or debug) and 'EDL client output (last lines):' not in detail:
+        tail='\n'.join((str(out or '')+'\n'+str(err or '')).splitlines()[-12:])
+        if tail: detail+='\nEDL client output (last lines):\n'+tail
+    return detail
 def run_edl(client,operation,loader,timeout,verbose=False,debug=False):
     cmd=client+operation+['--loader='+str(loader),'--memory=emmc']
     print('EDL command: '+shlex.join(cmd))
@@ -590,14 +598,13 @@ def run_edl(client,operation,loader,timeout,verbose=False,debug=False):
         except subprocess.TimeoutExpired:
             p.terminate()
             try: out,err=p.communicate(timeout=INTERRUPT_GRACE_SECONDS)
-            except subprocess.TimeoutExpired: raise RuntimeError('EDL client ignored SIGINT and terminate. '+POWER_CYCLE_HINT)
-            raise RuntimeError('EDL client timed out after SIGINT. '+POWER_CYCLE_HINT)
-        raise RuntimeError('EDL client timed out. '+POWER_CYCLE_HINT)
+            except subprocess.TimeoutExpired as final:
+                raise RuntimeError(edl_failure('EDL client ignored SIGINT and terminate. '+POWER_CYCLE_HINT,
+                                               final.stdout,final.stderr,verbose,debug))
+            raise RuntimeError(edl_failure('EDL client timed out after SIGINT. '+POWER_CYCLE_HINT,out,err,verbose,debug))
+        raise RuntimeError(edl_failure('EDL client timed out. '+POWER_CYCLE_HINT,out,err,verbose,debug))
     if p.returncode:
-        if verbose or debug:
-            tail='\n'.join((out+'\n'+err).splitlines()[-12:])
-            if tail: print('EDL client output (last lines):\n'+tail,file=sys.stderr)
-        raise RuntimeError('EDL client exited unsuccessfully. Hint: verify EDL mode, USB connection, and pinned loader. '+POWER_CYCLE_HINT)
+        raise RuntimeError(edl_failure('EDL client exited unsuccessfully. '+POWER_CYCLE_HINT,out,err,verbose,debug))
     return out,err
 def parse_sahara(text):
     serial=re.search(r'(?m)^Serial:\s*0x([0-9a-fA-F]{8,16})\s*$',text)
@@ -656,8 +663,9 @@ def main():
         with tempfile.TemporaryDirectory(prefix='openstick-package-inspect-') as td:
             target=Path(td)/'primary-gpt.bin'
             out,err=run_edl(client,['rs','0','34',str(target)],loader,IDENTITY_READ_TIMEOUT_SECONDS,a.verbose,a.debug)
-            if not target.is_file() or target.stat().st_size!=34*512: raise RuntimeError('primary GPT identity range was incomplete')
-            identity=parse_sahara(out+'\n'+err)
+            if not target.is_file() or target.stat().st_size!=34*512: raise RuntimeError(edl_failure('primary GPT identity range was incomplete',out,err,a.verbose,a.debug))
+            try: identity=parse_sahara(out+'\n'+err)
+            except RuntimeError as exc: raise RuntimeError(edl_failure(str(exc),out,err,a.verbose,a.debug))
             if identity['serial']!=m['device_id'].lower(): raise RuntimeError('live EDL serial mismatch')
     except (OSError,RuntimeError) as exc:
         print('REFUSED: '+str(exc),file=sys.stderr); return 2
@@ -805,13 +813,28 @@ FULL_READ_TIMEOUT_SECONDS=3600
 WRITE_TIMEOUT_SECONDS=600
 INTERRUPT_GRACE_SECONDS=10
 POWER_CYCLE_HINT='The board may be in a half-open EDL session. Unplug USB for 30 s and reconnect WITHOUT the button, then re-enter EDL.'
+EDL_FAILURE_HINT='Hint: verify EDL mode and the USB connection, confirm the pinned loader, correct the reported issue, and re-enter EDL before retrying.'
 EDL_CLIENT=[]; EDL_LOADER=None; VERBOSE=False; DEBUG=False
+EDL_LAST_OUT=''; EDL_LAST_ERR=''
 def sha(p):
  h=hashlib.sha256()
  with open(p,'rb') as f:
   for b in iter(lambda:f.read(CHUNK),b''): h.update(b)
  return h.hexdigest()
 def call(cmd,timeout=300): return subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,timeout=timeout)
+def edl_failure(message,out=None,err=None):
+ detail=message
+ if 'Hint:' not in detail: detail+=' '+EDL_FAILURE_HINT
+ if out is None: out=EDL_LAST_OUT
+ if err is None: err=EDL_LAST_ERR
+ if (VERBOSE or DEBUG) and 'EDL client output (last lines):' not in detail:
+  tail='\n'.join((str(out or '')+'\n'+str(err or '')).splitlines()[-12:])
+  if tail: detail+='\nEDL client output (last lines):\n'+tail
+ return detail
+def edl_refusal(message,result=None):
+ out=result.stdout if result is not None else None
+ err=result.stderr if result is not None else None
+ print('REFUSED: '+edl_failure(message,out,err),file=sys.stderr)
 def resolve_client(requested=None):
  directory=os.environ.get('OPENSTICK_EDL_DIR')
  if directory:
@@ -827,6 +850,7 @@ def resolve_client(requested=None):
  if found: return [str(Path(found).resolve())]
  raise RuntimeError('EDL client unavailable; set OPENSTICK_EDL_DIR or provide an executable path')
 def edl_call(operation,timeout=300,allow_failure=False):
+ global EDL_LAST_OUT, EDL_LAST_ERR
  cmd=EDL_CLIENT+operation+['--loader='+str(EDL_LOADER),'--memory=emmc']
  print('EDL command: '+shlex.join(cmd))
  p=subprocess.Popen(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,start_new_session=True)
@@ -839,15 +863,16 @@ def edl_call(operation,timeout=300,allow_failure=False):
    try: os.killpg(p.pid,signal.SIGTERM)
    except ProcessLookupError: pass
    try: out,err=p.communicate(timeout=INTERRUPT_GRACE_SECONDS)
-   except subprocess.TimeoutExpired: raise RuntimeError('EDL client ignored SIGINT and terminate. '+POWER_CYCLE_HINT)
-   raise RuntimeError('EDL client timed out after SIGINT. '+POWER_CYCLE_HINT)
-  raise RuntimeError('EDL client timed out. '+POWER_CYCLE_HINT)
- if p.returncode:
-  if VERBOSE or DEBUG:
-   tail='\n'.join((out+'\n'+err).splitlines()[-12:])
-   if tail: print('EDL client output (last lines):\n'+tail,file=sys.stderr)
-  if not allow_failure:
-   raise RuntimeError('EDL client exited unsuccessfully. Hint: verify EDL mode, USB connection, and pinned loader. '+POWER_CYCLE_HINT)
+   except subprocess.TimeoutExpired as final:
+    EDL_LAST_OUT=final.stdout or ''; EDL_LAST_ERR=final.stderr or ''
+    raise RuntimeError(edl_failure('EDL client ignored SIGINT and terminate. '+POWER_CYCLE_HINT,EDL_LAST_OUT,EDL_LAST_ERR))
+   EDL_LAST_OUT=out; EDL_LAST_ERR=err
+   raise RuntimeError(edl_failure('EDL client timed out after SIGINT. '+POWER_CYCLE_HINT,out,err))
+  EDL_LAST_OUT=out; EDL_LAST_ERR=err
+  raise RuntimeError(edl_failure('EDL client timed out. '+POWER_CYCLE_HINT,out,err))
+ EDL_LAST_OUT=out; EDL_LAST_ERR=err
+ if p.returncode and not allow_failure:
+  raise RuntimeError(edl_failure('EDL client exited unsuccessfully. '+POWER_CYCLE_HINT,out,err))
  return subprocess.CompletedProcess(cmd,p.returncode,out,err)
 def parse_sahara(text):
  serial=re.search(r'(?m)^Serial:\s*0x([0-9a-fA-F]{8,16})\s*$',text)
@@ -858,13 +883,14 @@ def parse_sahara(text):
 def read_identity(directory,expected_id):
  target=Path(directory)/'identity-primary-gpt.bin'
  result=edl_call(['rs','0','34',str(target)],IDENTITY_READ_TIMEOUT_SECONDS)
- if not target.is_file() or target.stat().st_size!=34*512: raise RuntimeError('EDL primary GPT identity range was incomplete. Hint: verify EDL mode and reconnect USB.')
- identity=parse_sahara(result.stdout+'\n'+result.stderr)
+ if not target.is_file() or target.stat().st_size!=34*512: raise RuntimeError(edl_failure('EDL primary GPT identity range was incomplete',result.stdout,result.stderr))
+ try: identity=parse_sahara(result.stdout+'\n'+result.stderr)
+ except RuntimeError as exc: raise RuntimeError(edl_failure(str(exc),result.stdout,result.stderr))
  if expected_id and identity['serial']!=expected_id.lower(): raise RuntimeError('live EDL serial mismatch. Hint: reconnect the intended board in EDL mode.')
  return identity
 def read_range(edl,loader,start,count,path):
  r=edl_call(['rs',str(start),str(count),str(path)],RANGE_READ_TIMEOUT_SECONDS)
- if r.returncode or not Path(path).is_file() or Path(path).stat().st_size!=count*512: raise RuntimeError('live EDL range read failed')
+ if r.returncode or not Path(path).is_file() or Path(path).stat().st_size!=count*512: raise RuntimeError(edl_failure('live EDL range read failed',r.stdout,r.stderr))
  return sha(path)
 def live_state(edl,loader,m,p,payload,work,completed,origin=None):
  if origin not in (None,'target','backup'): raise RuntimeError('restore GPT origin is unknown')
@@ -872,7 +898,7 @@ def live_state(edl,loader,m,p,payload,work,completed,origin=None):
  for name in ('fsg','sec','fsc'):
   part=m['partitions'][name]
   got=read_range(edl,loader,int(part['start_lba']),int(part['end_lba'])-int(part['start_lba'])+1,work/('gate-'+name+'.bin'))
-  if got!=m['identity'].get(name): raise RuntimeError('live '+name+' fingerprint mismatch')
+  if got!=m['identity'].get(name): raise RuntimeError(edl_failure('live '+name+' fingerprint mismatch'))
  transition=p.get('transition_state'); backup=payload
  target_primary=transition['gpt']['target_primary_sha256'] if transition else sha(backup/'gpt-primary.bin')
  target_secondary=transition['gpt']['target_secondary_sha256'] if transition else sha(backup/'gpt-secondary.bin')
@@ -1029,7 +1055,7 @@ def main():
    read_identity(work,m['device_id'])
    read=edl_call(['rf',str(live)],FULL_READ_TIMEOUT_SECONDS)
    if read.returncode or not live.is_file() or live.stat().st_size!=m['size']:
-    print('REFUSED: live full-disk identity read unavailable or wrong-sized',file=sys.stderr); return 2
+    edl_refusal('live full-disk identity read unavailable or wrong-sized',read); return 2
    for name in ('fsg','sec','fsc'):
     row=m['partitions'].get(name)
     if not row: print('REFUSED: backup lacks '+name,file=sys.stderr); return 2
@@ -1038,9 +1064,9 @@ def main():
      f.seek(start)
      while left:
       b=f.read(min(CHUNK,left))
-      if not b: print('REFUSED: short identity read '+name,file=sys.stderr); return 2
+      if not b: edl_refusal('short identity read '+name,read); return 2
       h.update(b); left-=len(b)
-    if h.hexdigest()!=m['identity'].get(name): print('REFUSED: live '+name+' fingerprint mismatch',file=sys.stderr); return 2
+    if h.hexdigest()!=m['identity'].get(name): edl_refusal('live '+name+' fingerprint mismatch',read); return 2
    planner=[sys.executable,'-I',str(payload/'rollback-plan.py'),'--dump',str(disk),'--csv',str(payload/'partitions.csv'),
     '--primary',str(payload/'gpt-primary.bin'),'--secondary',str(payload/'gpt-secondary.bin'),'--emmc',str(m['sectors']),
     '--dump-sha',m['sha256'],'--work',str(work),'--loader',str(loader),'--edl',EDL_CLIENT[-1]]
@@ -1134,31 +1160,31 @@ def main():
    # Re-establish physical identity, firmware, and GPT after confirmation.
    try: live_state(a.edl,loader,m,p,payload,work,completed,gpt_origin)
    except (OSError,ValueError,KeyError,RuntimeError,subprocess.TimeoutExpired) as e:
-    print('REFUSED: live identity/firmware/GPT changed before destructive phase: '+str(e),file=sys.stderr); return 2
+    edl_refusal('live identity/firmware/GPT changed before destructive phase: '+str(e)); return 2
    state_data.update({'status':'write-started','phase':a.phase,'at':int(time.time())}); atomic(state,state_data)
    try: written=edl_call(cmd,WRITE_TIMEOUT_SECONDS,allow_failure=True)
    except RuntimeError as e:
     state_data.update({'status':'interrupted','at':int(time.time())}); atomic(state,state_data)
-    print('REFUSED: '+str(e)+' The write state is unresolved and this phase will not be retried.',file=sys.stderr); return 2
+    edl_refusal(str(e)+' The write state is unresolved and this phase will not be retried.'); return 2
    if written.returncode:
     state_data.update({'status':'interrupted','at':int(time.time())}); atomic(state,state_data)
-    print('REFUSED: write failed; state is unresolved and this phase will not be retried',file=sys.stderr); return 2
+    edl_refusal('write failed; state is unresolved and this phase will not be retried',written); return 2
    rb=work/'readback.bin'; rr=edl_call(['rs',str(row['start']),str(row['count']),str(rb)],RANGE_READ_TIMEOUT_SECONDS,allow_failure=True)
    if rr.returncode or not rb.is_file() or sha(rb)!=sha(slice_path):
     state_data.update({'status':'failed-write','at':int(time.time())}); atomic(state,state_data)
-    print('REFUSED: phase readback failed; state is unresolved',file=sys.stderr); return 2
+    edl_refusal('phase readback failed; state is unresolved',rr); return 2
    state_data.setdefault('completed',[]).append(a.phase); state_data.update({'status':'ready','phase':a.phase,'at':int(time.time())}); atomic(state,state_data)
    if all(r['name'] in state_data['completed'] for r in rows):
     final=work/'final-emmc.bin'; r=edl_call(['rf',str(final)],FULL_READ_TIMEOUT_SECONDS,allow_failure=True)
     if r.returncode or not final.is_file() or final.stat().st_size!=m['size'] or sha(final)!=m['sha256']:
      state_data.update({'status':'failed-verify','phase':'final','at':int(time.time())}); atomic(state,state_data)
-     print('VERIFY FAILED: complete full-disk readback differs. Do not boot.',file=sys.stderr); return 3
+     print('VERIFY FAILED: '+edl_failure('complete full-disk readback differs. Do not boot.',r.stdout,r.stderr),file=sys.stderr); return 3
     state_data.update({'status':'verified','phase':'final','final_sha256':m['sha256'],'at':int(time.time())}); atomic(state,state_data)
     print('PASS: all planned writes and complete full-disk readback match. Boot is not verified.')
    else: print('Phase readback verified; no reset or boot recommendation was made.')
    return 0
  except (OSError,ValueError,KeyError,TypeError,RuntimeError,subprocess.TimeoutExpired) as e:
-  print('REFUSED: '+str(e),file=sys.stderr); return 2
+  edl_refusal(str(e)); return 2
  finally:
   if lock_fd is not None: os.close(lock_fd)
 if __name__=='__main__': raise SystemExit(main())

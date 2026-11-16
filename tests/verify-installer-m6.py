@@ -250,7 +250,7 @@ def run_flash_session(command, env):
 
 def make_fake_edl(path):
     path.write_text('''#!/usr/bin/env python3
-import os, shutil, sys
+import os, shutil, signal, sys, time
 from pathlib import Path
 a=sys.argv[1:]; op=a[0]; disk=Path(os.environ['OPENSTICK_FAKE_EMMC'])
 with Path(os.environ['OPENSTICK_EDL_LOG']).open('a') as log: log.write(' '.join(a)+'\\n')
@@ -270,7 +270,8 @@ if op=='rf':
 if op=='ws':
  lba=int(a[1]); src=Path(a[2])
  if '--skipwrite' in a: raise SystemExit(0)
- if os.environ.get('FAIL_WRITE_LBA')==str(lba): raise SystemExit(91)
+ if os.environ.get('FAIL_WRITE_LBA')==str(lba):
+  print('SYNTHETIC EDL WRITE FAILURE DETAIL',file=sys.stderr); raise SystemExit(91)
  if os.environ.get('PARTIAL_WRITE_LBA')==str(lba):
   data=src.read_bytes()
   with disk.open('r+b') as f: f.seek(lba*512); f.write(data[:max(1,len(data)//2)])
@@ -279,6 +280,11 @@ if op=='ws':
  raise SystemExit(0)
 if op=='rs':
  lba,count=int(a[1]),int(a[2]); out=Path(next(x for x in a[3:] if not x.startswith('--')))
+ if lba==0 and os.environ.get('HANG_IDENTITY'):
+  def interrupted(signum,frame):
+   print('SYNTHETIC EDL SIGINT OUTPUT TAIL',flush=True); raise SystemExit(130)
+  signal.signal(signal.SIGINT,interrupted)
+  while True: time.sleep(1)
  if lba==0 and count==34 and os.environ.get('RACE_PACKAGE_ROOT'):
   (Path(os.environ['RACE_PACKAGE_ROOT'])/'payload/emmc-full.bin').write_bytes(b'changed-after-validation')
  with disk.open('rb') as f: f.seek(lba*512); data=f.read(count*512)
@@ -592,11 +598,15 @@ def run():
         fail_log = root / "failed-edl.log"; fail_state = root / "failed-state.json"
         fail_env = dict(no_tty, OPENSTICK_FAKE_EMMC=str(failed_disk), OPENSTICK_EDL_LOG=str(fail_log),
                         PARTIAL_WRITE_LBA=str(userdata["start_lba"]))
-        rc, output_text = run_typed(args + ["--phase", "userdata", "--state", str(fail_state)], fail_env, token)
+        fail_env.pop("PARTIAL_WRITE_LBA")
+        fail_env["FAIL_WRITE_LBA"] = str(userdata["start_lba"])
+        rc, output_text = run_typed(args + ["--verbose", "--phase", "userdata", "--state", str(fail_state)], fail_env, token)
         assert rc == 2 and "will not be retried" in output_text
+        assert "SYNTHETIC EDL WRITE FAILURE DETAIL" in output_text
+        assert "Hint:" in output_text and "re-enter EDL" in output_text
         pinned_fail_state = canonical_restore_state(fail_state, base_env["OPENSTICK_TEST_BACKUP_SHA"])
         assert json.loads(pinned_fail_state.read_text())["status"] == "interrupted"
-        fail_env.pop("PARTIAL_WRITE_LBA")
+        fail_env.pop("FAIL_WRITE_LBA")
         rc, output_text = run_typed(args + ["--phase", "userdata", "--state", str(fail_state)], fail_env, token)
         assert rc == 2 and "unresolved" in output_text
         # A caller cannot bypass the unresolved write-ahead record by choosing
@@ -609,6 +619,29 @@ def run():
         assert alternate.returncode == 2 and "state path is pinned" in alternate.stderr, (alternate.returncode, alternate.stderr)
         writes = [line for line in fail_log.read_text().splitlines() if line.startswith("ws ") and "--skipwrite" not in line]
         assert len(writes) == 1, writes
+
+        # A timed-out standalone EDL call must preserve the client's captured
+        # SIGINT tail when verbose output is requested.
+        timeout_copy = root / "timeout-elsewhere"
+        shutil.copytree(standalone, timeout_copy)
+        timeout_script = timeout_copy / "scripts/restore.py"
+        timeout_text = timeout_script.read_text().replace("IDENTITY_READ_TIMEOUT_SECONDS=20", "IDENTITY_READ_TIMEOUT_SECONDS=0.5")
+        timeout_script.write_text(timeout_text)
+        timeout_manifest_path = timeout_copy / "manifest.json"
+        timeout_manifest = json.loads(timeout_manifest_path.read_text())
+        timeout_manifest["files"]["scripts/restore.py"] = {
+            "sha256": hashlib.sha256(timeout_script.read_bytes()).hexdigest(),
+            "size": timeout_script.stat().st_size}
+        timeout_manifest_path.write_text(json.dumps(timeout_manifest, sort_keys=True, indent=2) + "\n")
+        timeout_sums = timeout_copy / "SHA256SUMS"
+        timeout_sums.write_text("".join("%s  %s\n" % (timeout_manifest["files"][n]["sha256"], n)
+                                         for n in sorted(timeout_manifest["files"])))
+        timeout_args = [sys.executable, str(timeout_script), "--device", "deadbeef", "--edl", str(fake_edl),
+                        "--loader", str(loader), "--verbose"]
+        timeout_result = subprocess.run(timeout_args, env=dict(base_env, HANG_IDENTITY="1"), capture_output=True, text=True)
+        assert timeout_result.returncode == 2
+        assert "SYNTHETIC EDL SIGINT OUTPUT TAIL" in timeout_result.stderr, timeout_result.stderr
+        assert "Hint:" in timeout_result.stderr and "re-enter EDL" in timeout_result.stderr
 
         # Even if a ready state claims the prior data phase completed, a
         # partial live partition must be detected before the next phase can
