@@ -20,6 +20,7 @@ from pathlib import Path
 from . import store
 from . import seed as seed_format
 from . import configure as configure_module
+from . import edl_runner
 
 EXIT_OK = 0
 EXIT_ERROR = 1
@@ -282,18 +283,22 @@ def _debugfs_quote(path):
 
 def backup_command(args, root):
     print("WARNING: this backup contains IMEI, calibration and persist data. Keep it private and make an independent offline recovery copy.")
-    edl = shutil.which("edl")
-    if not edl: raise store.StoreError("EDL client is missing")
     env=os.environ.copy()
-    # The shim's identity response is metadata only; real clients report Sahara serial on stderr.
-    try:
-        ident_run=subprocess.run([edl,"getstorageinfo"],stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,env=env,timeout=30)
-    except (OSError,subprocess.TimeoutExpired): raise store.StoreError("could not read EDL identity")
-    text=ident_run.stdout+"\n"+ident_run.stderr
-    match=re.search(r"serial\s*=\s*([0-9a-fA-F]+)",text)
-    if not match: raise store.StoreError("EDL client did not report a device serial")
-    device_id=match.group(1).lower()
-    hwid_match=re.search(r"(?:hwid|msm_id|pk_hash)\s*[=:]\s*([0-9a-fA-Fx]+)",text,re.I)
+    # Sahara identity is printed before Firehose setup. A short primary-GPT
+    # range read triggers that block without using unsupported getstorageinfo.
+    with tempfile.TemporaryDirectory(prefix="openstick-edl-identity-") as identity_dir:
+        identity_path = Path(identity_dir) / "primary-gpt.bin"
+        ident_run = edl_runner.run(
+            ["rs", "0", "34", str(identity_path)],
+            timeout=edl_runner.IDENTITY_READ_TIMEOUT_SECONDS,
+            env=env, verbose=getattr(args, "verbose", False), debug=getattr(args, "debug", False),
+        )
+        if not identity_path.is_file() or identity_path.stat().st_size != 34 * 512:
+            raise store.StoreError(
+                "EDL identity range read was incomplete. Hint: confirm the device is in EDL mode and reconnect USB before retrying."
+            )
+        identity = edl_runner.parse_sahara_info(ident_run.stdout + "\n" + ident_run.stderr)
+    device_id=identity["serial"]
     existing=store.load_registry(root); device=_find_device(existing,device_id)
     if args.device and args.device.lower()!=device_id: raise store.RefusedError("connected EDL identity does not match --device")
     if device and device.get("edl",{}).get("serial",device_id).lower()!=device_id: raise store.RefusedError("EDL identity conflicts with registry")
@@ -308,8 +313,10 @@ def backup_command(args, root):
     try:
         dump=staging/"emmc-full.bin"
         def read_to(dest):
-            p=subprocess.run([edl,"rf",str(dest)],stdout=subprocess.PIPE,stderr=subprocess.PIPE,env=env)
-            if p.returncode: raise store.StoreError("EDL full read failed")
+            edl_runner.run(["rf", str(dest)], timeout=edl_runner.FULL_READ_TIMEOUT_SECONDS,
+                           env=env, verbose=getattr(args, "verbose", False), debug=getattr(args, "debug", False))
+            if not dest.is_file():
+                raise store.StoreError("EDL client completed without creating the full read. Hint: check the output path and retry after confirming EDL mode.")
         read_to(dump)
         if args.paranoid:
             second=staging/"comparison.bin"; read_to(second)
@@ -324,13 +331,13 @@ def backup_command(args, root):
         old=device.get("identity",{}) if device else {}
         if old and old != fingerprints:
             raise store.RefusedError("EDL identity fingerprints conflict with registered device")
-        manifest={"schema_version":1,"id":backup_id,"device_id":device_id,"edl":{"serial":device_id,"hwid":hwid_match.group(1) if hwid_match else None},"size":dump.stat().st_size,"sectors":dump.stat().st_size//512,"sha256":image_hash.hexdigest(),"identity":fingerprints,"partitions":{n:{"start_lba":s,"end_lba":e} for n,(s,e) in parts.items()},"verified_by":["full-read-size","gpt-primary-and-backup-crc","sha256"]+( ["paranoid-second-read"] if args.paranoid else []),"created":backup_id}
+        manifest={"schema_version":1,"id":backup_id,"device_id":device_id,"edl":identity,"size":dump.stat().st_size,"sectors":dump.stat().st_size//512,"sha256":image_hash.hexdigest(),"identity":fingerprints,"partitions":{n:{"start_lba":s,"end_lba":e} for n,(s,e) in parts.items()},"verified_by":["full-read-size","gpt-primary-and-backup-crc","sha256"]+( ["paranoid-second-read"] if args.paranoid else []),"created":backup_id}
         (staging/"manifest.json").write_text(json.dumps(manifest,sort_keys=True,indent=2)+"\n")
         (staging/"SHA256SUMS").write_text("%s  emmc-full.bin\n"%manifest["sha256"])
         for f in staging.iterdir(): os.chmod(f,0o600)
         os.replace(staging,final); os.chmod(final,0o700)
         if device is None:
-            device={"id":device_id,"label":"","board":args.board or "ufi103s","pcb_label":"","notes":"","edl":{"serial":device_id,"hwid":manifest["edl"]["hwid"]},"usb_aliases":[],"identity":fingerprints,"backups":[],"builds":[],"flashes":[],"seeds_applied":[],"packages":[],"created":backup_id}
+            device={"id":device_id,"label":"","board":args.board or "ufi103s","pcb_label":"","notes":"","edl":identity,"usb_aliases":[],"identity":fingerprints,"backups":[],"builds":[],"flashes":[],"seeds_applied":[],"packages":[],"created":backup_id}
             existing["devices"].append(device)
         else:
             device["identity"]=fingerprints
