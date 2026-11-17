@@ -64,8 +64,8 @@ def parser():
     p.add_argument("--show-serial", action="store_true", help="show the full device serial in console output")
     p.add_argument("--board", metavar="NAME", help="select a board class")
     p.add_argument("--device", metavar="ID", help="select a registered device")
-    p.add_argument("--usb-sysfs-root", default=os.environ.get("OPENSTICK_USB_SYSFS_ROOT", "/sys/bus/usb/devices"), help=argparse.SUPPRESS)
-    p.add_argument("--usb-device-root", default=os.environ.get("OPENSTICK_USB_DEVICE_ROOT", "/dev/bus/usb"), help=argparse.SUPPRESS)
+    p.add_argument("--usb-sysfs-root", default=edl_runner.default_usb_sysfs_root(), help=argparse.SUPPRESS)
+    p.add_argument("--usb-device-root", default=edl_runner.default_usb_device_root(), help=argparse.SUPPRESS)
     subs = p.add_subparsers(dest="command", required=True)
     subs.add_parser("doctor", help="check local prerequisites and private store")
     device = subs.add_parser("device", help="manage the local device registry")
@@ -193,8 +193,8 @@ def _edl_usb_udev_hint(plugdev_exists=None):
 def _check_edl_usb(sysfs_root=None, usb_device_root=None,
                    access_check=os.access, plugdev_exists=None):
     """Check R/W access to an attached Qualcomm 9008 USB device, if present."""
-    sysfs_root = sysfs_root or os.environ.get("OPENSTICK_USB_SYSFS_ROOT", "/sys/bus/usb/devices")
-    usb_device_root = usb_device_root or os.environ.get("OPENSTICK_USB_DEVICE_ROOT", "/dev/bus/usb")
+    sysfs_root = sysfs_root or edl_runner.default_usb_sysfs_root()
+    usb_device_root = usb_device_root or edl_runner.default_usb_device_root()
     root = Path(sysfs_root)
     try:
         entries = list(root.iterdir())
@@ -229,8 +229,8 @@ def _check_edl_usb(sysfs_root=None, usb_device_root=None,
 
 def doctor(args, usb_sysfs_root=None, usb_device_root=None,
            access_check=os.access):
-    usb_sysfs_root = usb_sysfs_root or os.environ.get("OPENSTICK_USB_SYSFS_ROOT", "/sys/bus/usb/devices")
-    usb_device_root = usb_device_root or os.environ.get("OPENSTICK_USB_DEVICE_ROOT", "/dev/bus/usb")
+    usb_sysfs_root = usb_sysfs_root or edl_runner.default_usb_sysfs_root()
+    usb_device_root = usb_device_root or edl_runner.default_usb_device_root()
     checks = []
     for name, candidates in (("python3", ("python3",)), ("bash", ("bash",)), ("e2fsprogs", ("debugfs", "e2fsck", "mke2fs")), ("fastboot", ("fastboot",))):
         found = [_which(c) for c in candidates]

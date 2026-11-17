@@ -106,6 +106,7 @@ class M5Tests(unittest.TestCase):
         self.write_log = self.tmp / "fake-edl-writes.log"
         self.call_log = self.tmp / "fake-edl-calls.log"
         self.fail_control = self.tmp / "fake-edl-fail.txt"
+        self.probe_log = self.tmp / "fake-edl-usb-probe.log"
         self.fake_edl_path = self.fakebin / "edl"
         self.fake_edl_path.write_text(self._fake_edl_script())
         self.fake_edl_path.chmod(0o700)
@@ -119,6 +120,10 @@ class M5Tests(unittest.TestCase):
         self.env = dict(os.environ, OPENSTICK_FAKE_EMMC=str(self.disk),
                         OPENSTICK_EDL_DIR=str(self.fakebin),
                         PATH=str(self.fakebin) + ":/usr/bin:/bin")
+        # R-5.7: roots handed to helper children through the gated R-5.5 mechanism.
+        self.child_usb_env = {"OPENSTICK_TEST_USB_ROOTS_DIR": str(self.tmp),
+                              "OPENSTICK_USB_SYSFS_ROOT": str(self.sysfs),
+                              "OPENSTICK_PROBE_REPO": str(ROOT)}
         self._register_patha_fixture()
 
     def _fake_edl_script(self):
@@ -130,6 +135,9 @@ for arg in "$@"; do
   case "$arg" in --loader=*) loader=${arg#--loader=};; --memory=*) memory=${arg#--memory=};; esac
 done
 if [[ -z $loader || $loader != /* || $memory != emmc ]]; then echo 'FAKE EDL ASSERTION FAILED: required loader and memory flags missing' >&2; exit 91; fi
+if [[ -n ${OPENSTICK_PROBE_REPO-} ]]; then
+  python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); from tools.installer import edl_runner; print(edl_runner.preflight().state)' "$OPENSTICK_PROBE_REPO" >> __PROBE__ 2>/dev/null || printf 'PROBE-ERROR\n' >> __PROBE__
+fi
 printf 'Qualcomm Sahara / Firehose Client V3.62 (c) B.Kerler 2018-2025.\n'
 printf 'main - Mode detected: sahara\nsahara -\n\nVersion 0x2\n------------------------\n'
 printf 'HWID:              0x007050e100000000 (MSM_ID:0x007050e1,OEM_ID:0x0000,MODEL_ID:0x0000)\n'
@@ -163,6 +171,7 @@ esac
 '''
         return (template.replace("__LOG__", shlex.quote(str(self.write_log)))
                 .replace("__CALLS__", shlex.quote(str(self.call_log)))
+                .replace("__PROBE__", shlex.quote(str(self.probe_log)))
                 .replace("__FAIL__", shlex.quote(str(self.fail_control)))
                 .replace("__DISK__", shlex.quote(str(self.disk))))
 
@@ -443,6 +452,78 @@ exec /usr/bin/sha256sum "$@"
         self.assertNotIn("0xdeadbeef", message)
         self.assertNotIn("/tmp/private-helper.log", message)
 
+    def test_helper_stderr_masks_serials_and_paths_in_every_shape(self):
+        # R-5.6: every shape from review finding M1 (all values synthetic).
+        cases = [
+            ("device serial 0x1a2b3c4d5e6f7a8b not ready", ["1a2b3c4d5e6f7a8b"], None),
+            ("SERIAL=1a2b3c4d5e6f7a8b", ["1a2b3c4d5e6f7a8b"], None),
+            ("msm serial: 0x1a2b3c4d5e6f7a8b", ["1a2b3c4d5e6f7a8b"], None),
+            ("bare 1A2B3C4D5E6F7A8B in text", ["1A2B3C4D5E6F7A8B"], None),
+            ("failed on ./store/x/y", ["store", "x/y"], "[path]"),
+            ("failed on ../other/x", ["other", "../"], "[path]"),
+            ("failed on 'rel/dir/f'", ["rel", "dir"], "[path]"),
+            ('failed on "rel/dir/f"', ["rel", "dir"], "[path]"),
+            ("failed on /home/my user/secret dir/f.bin", ["home", "my user", "secret", "f.bin"], "[path]"),
+            ("Serial: 0xdeadbeef synthetic failure at /tmp/private-helper.log",
+             ["0xdeadbeef", "private-helper"], "[path]"),
+        ]
+        for text, forbidden, expected in cases:
+            out = m5._safe_helper_stderr_line("first line\n" + text + "\n")
+            for bad in forbidden:
+                self.assertNotIn(bad, out, (text, out))
+            self.assertNotIn("/", out, (text, out))
+            if expected:
+                self.assertIn(expected, out, (text, out))
+        self.assertEqual(m5._safe_helper_stderr_line(""), "")
+        self.assertIn("synthetic failure at [path]",
+                      m5._safe_helper_stderr_line("Serial: 0xdeadbeef synthetic failure at /tmp/private-helper.log"))
+
+    def test_usb_root_env_is_gated_by_second_marker_and_temp_dir(self):
+        # R-5.5: a plain exported root is ignored; marker plus inside-temp-dir is honoured.
+        import tools.installer.cli as cli_mod
+        real = m5.edl_runner.REAL_USB_SYSFS_ROOT
+        inside = str(self.sysfs)
+        outside = tempfile.mkdtemp(prefix="openstick-m5-outside-")
+        try:
+            marker = "OPENSTICK_TEST_USB_ROOTS_DIR"
+            base = {k: v for k, v in os.environ.items()
+                    if k not in (marker, "OPENSTICK_USB_SYSFS_ROOT", "OPENSTICK_USB_DEVICE_ROOT")}
+            cases = [
+                ({"OPENSTICK_USB_SYSFS_ROOT": inside}, real),                       # hostile, no marker
+                ({"OPENSTICK_USB_SYSFS_ROOT": outside, marker: str(self.tmp)}, real),   # marker, root outside
+                ({"OPENSTICK_USB_SYSFS_ROOT": inside + "/../../" + os.path.basename(outside),
+                  marker: str(self.tmp)}, real),                                   # traversal out
+                ({"OPENSTICK_USB_SYSFS_ROOT": inside, marker: "relative/dir"}, real),
+                ({"OPENSTICK_USB_SYSFS_ROOT": inside, marker: "/"}, real),
+                ({"OPENSTICK_USB_SYSFS_ROOT": inside, marker: str(self.tmp)}, inside),  # honoured
+                ({marker: str(self.tmp)}, real),
+            ]
+            for extra, want in cases:
+                with mock.patch.dict(os.environ, dict(base, **extra), clear=True):
+                    self.assertEqual(m5.edl_runner.default_usb_sysfs_root(), want, extra)
+                    self.assertEqual(cli_mod.parser().parse_args(["doctor"]).usb_sysfs_root, want, extra)
+                    state = m5.edl_runner.preflight().state
+                    self.assertEqual(state == "EDL-PRESENT", want == inside, (extra, state))
+                    self.assertEqual(m5.edl_runner.Session().sysfs_root, want, extra)
+            # Device root follows the same rule.
+            with mock.patch.dict(os.environ, dict(base, OPENSTICK_USB_DEVICE_ROOT=inside), clear=True):
+                self.assertEqual(m5.edl_runner.default_usb_device_root(), m5.edl_runner.REAL_USB_DEVICE_ROOT)
+            with mock.patch.dict(os.environ, dict(base, OPENSTICK_USB_DEVICE_ROOT=inside, **{marker: str(self.tmp)}), clear=True):
+                self.assertEqual(m5.edl_runner.default_usb_device_root(), inside)
+            # Generated helper script applies the same gate (standalone code, exec'd in isolation).
+            from tools.installer import packages
+            src = packages._RESTORE_RUNNER
+            start = src.index("def usb_sysfs_root_default")
+            end = src.index("EDL_SYSFS_ROOT=usb_sysfs_root_default()")
+            for extra, want in cases:
+                ns = {}
+                exec("import os\n" + src[start:end], ns)
+                with mock.patch.dict(os.environ, dict(base, **extra), clear=True):
+                    self.assertEqual(ns["usb_sysfs_root_default"](), want, extra)
+        finally:
+            import shutil
+            shutil.rmtree(outside, ignore_errors=True)
+
     def test_verify_reports_each_check_and_does_not_claim_absent_services(self):
         stdout = "".join("%s\t%s\tevidence\n" % ("SKIP" if key in ("modem", "wifi") else "PASS", key)
                           for key in sorted({"firewall_state", "firewall_syntax", "watchdog", "modem", "ntp", "wifi", "versions"}))
@@ -528,10 +609,19 @@ exec /usr/bin/sha256sum "$@"
         fake_live = lambda edl, env, loader, directory, ident, session=None: (
             seed_fake_session_identity(session) or ("deadbeef", self.identity, self.disk, self.parts))
         real_edl = m5._edl
+        timeouts_raised = []
         def timeout_final(edl, edl_args, env, loader=None, **kwargs):
             if edl_args[0] == "rf":
+                timeouts_raised.append(edl_args[0])
                 raise subprocess.TimeoutExpired([edl] + edl_args, 600)
             return real_edl(edl, edl_args, env, loader)
+        real_phase = m5._run_fwlib_phase
+        def phase_with_usb_roots(engine, edl, env, loader, prepared, work, write, **kwargs):
+            session = kwargs.get("session")
+            self.assertIsNotNone(session)
+            # Existing forwarding path: session.env items reach the helper child.
+            session.env = dict(session.env or {}, **self.child_usb_env)
+            return real_phase(engine, edl, env, loader, prepared, work, write, **kwargs)
         argv = ["--home", str(self.home), "restore", "--device", "deadbeef", "--backup", "synthetic"]
         with mock.patch.dict(os.environ, self.env, clear=True), \
              mock.patch.object(m5, "_live", side_effect=fake_live), \
@@ -541,11 +631,20 @@ exec /usr/bin/sha256sum "$@"
              mock.patch.object(m5, "_fwlib_path", return_value=str(self.fakebin) + ":/usr/bin:/bin"), \
              mock.patch.object(m5, "_live_identity_only"), \
              mock.patch.object(m5, "_confirm", side_effect=lambda phase, ident: "restore %s %s" % (ident[-8:], phase)), \
+             mock.patch.object(m5, "_run_fwlib_phase", side_effect=phase_with_usb_roots), \
              mock.patch.object(m5, "_edl", side_effect=timeout_final):
             self.assertEqual(m5.common.main(argv, usb_sysfs_root=self.sysfs), m5.common.EXIT_VERIFY)
         state = json.loads((self.home / "devices/deadbeef/restore-state.json").read_text())
         self.assertEqual(state["status"], "final-readback-failed")
         self.assertIn("full-disk readback failed", state["failure"])
+        # R-5.8: the expected failure must come from the injected timeout itself.
+        self.assertEqual(timeouts_raised, ["rf"])
+        # R-5.7: the child processes spawned with this env must have seen the
+        # present-9008 fixture through the gated env mechanism, never an empty root.
+        probes = self.probe_log.read_text().split() if self.probe_log.exists() else []
+        self.assertTrue(probes, "fake EDL child never ran its USB probe")
+        self.assertNotIn("ABSENT", probes, "child saw an empty USB root")
+        self.assertEqual(set(probes), {"EDL-PRESENT"}, probes)
         with self.assertRaises(store.RefusedError):
             m5.restore_command(types.SimpleNamespace(restore_device="deadbeef", restore_backup="synthetic",
                                                      dry_run=False, restore_reconcile_state=False), self.home, ROOT)

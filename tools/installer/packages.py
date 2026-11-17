@@ -831,7 +831,16 @@ EDL_LAST_OUT=''; EDL_LAST_ERR=''
 EDL_SESSION_IDENTITY=None
 EDL_SESSION_CALLS=0
 EDL_SESSION_USED_NOTE='EDL session used. Before the next command that talks to the board: unplug USB for 30 s, reconnect WITHOUT the button, re-enter EDL. Never use "edl reset".'
-EDL_SYSFS_ROOT=os.environ.get('OPENSTICK_USB_SYSFS_ROOT','/sys/bus/usb/devices')
+def usb_sysfs_root_default():
+ value=os.environ.get('OPENSTICK_USB_SYSFS_ROOT'); marker=os.environ.get('OPENSTICK_TEST_USB_ROOTS_DIR')
+ real='/sys/bus/usb/devices'
+ if not value or not marker: return real
+ try:
+  base=os.path.realpath(marker); resolved=os.path.realpath(value)
+  if not os.path.isabs(marker) or not os.path.isabs(value) or base==os.sep or not os.path.isdir(base) or os.path.commonpath([base,resolved])!=base: return real
+ except (OSError,ValueError): return real
+ return value
+EDL_SYSFS_ROOT=usb_sysfs_root_default()
 EDL_SESSION_BUS_KEY=None
 def sha(p):
  h=hashlib.sha256()
@@ -1091,7 +1100,7 @@ def package_ok(root):
  except (OSError,ValueError,KeyError,TypeError,RuntimeError): return None
 def _run_main(sysfs_root=None):
  global EDL_SYSFS_ROOT, EDL_SESSION_BUS_KEY, EDL_SESSION_IDENTITY, EDL_SESSION_CALLS
- if sysfs_root is None: sysfs_root=os.environ.get('OPENSTICK_USB_SYSFS_ROOT','/sys/bus/usb/devices')
+ if sysfs_root is None: sysfs_root=usb_sysfs_root_default()
  EDL_SYSFS_ROOT=sysfs_root; EDL_SESSION_BUS_KEY=None
  EDL_SESSION_IDENTITY=None; EDL_SESSION_CALLS=0
  ap=argparse.ArgumentParser(description='Portable, fail-closed phased restore from a complete verified backup. UNVALIDATED on hardware; writes require the normal typed restore confirmation.')
