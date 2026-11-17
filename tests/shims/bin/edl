@@ -11,11 +11,6 @@ shift
 session_file=${OPENSTICK_EDL_SESSION_FILE:-}
 session_calls=0
 if [[ -n $session_file && -f $session_file ]]; then read -r session_calls < "$session_file"; fi
-if [[ -n $session_file ]]; then
-  session_calls=$((session_calls + 1))
-  mkdir -p -- "$(dirname -- "$session_file")"
-  printf '%s\n' "$session_calls" > "$session_file"
-fi
 positional=()
 loader=
 memory=
@@ -44,6 +39,11 @@ if [[ -z $loader || $memory != emmc ]]; then
   if [[ ${OPENSTICK_EDL_NO_LOADER_SIM:-0} != 1 ]]; then
     echo 'FAKE EDL ASSERTION FAILED: every call must include --loader=<absolute path> and --memory=emmc' >&2
     exit 91
+  fi
+  if [[ -n $session_file ]]; then
+    session_calls=$((session_calls + 1))
+    mkdir -p -- "$(dirname -- "$session_file")"
+    printf '%s\n' "$session_calls" > "$session_file"
   fi
   printf 'Qualcomm Sahara / Firehose Client V3.62 (c) B.Kerler 2018-2025.\n'
   printf 'main - Trying with no loader given ...\nmain - Waiting for the device\n......\nmain - Device detected :)\n'
@@ -75,6 +75,12 @@ if [[ ${OPENSTICK_EDL_DEVICE_STATE:-present} == absent ]]; then
   exit 0
 fi
 
+if [[ -n $session_file ]]; then
+  session_calls=$((session_calls + 1))
+  mkdir -p -- "$(dirname -- "$session_file")"
+  printf '%s\n' "$session_calls" > "$session_file"
+fi
+
 fresh_session=1
 if [[ -n $session_file && $session_calls -gt 1 ]]; then fresh_session=0; fi
 if (( fresh_session )); then
@@ -93,6 +99,7 @@ if (( fresh_session )); then
     trap handle_interrupt INT
     while :; do sleep 0.1 & wait "$!" || true; done
   fi
+  printf 'main - Trying to connect to firehose loader ...\nfirehose - Running configure...\nfirehose\n'
 else
   printf 'Qualcomm Sahara / Firehose Client V3.62 (c) B.Kerler 2018-2025.\n'
   printf 'main - Waiting for the device\n......\nmain - Device detected :)\n'
