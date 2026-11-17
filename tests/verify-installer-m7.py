@@ -333,9 +333,13 @@ class WizardTests(unittest.TestCase):
         self.assertEqual(state["stages"][0]["status"], "failed")
 
     def test_host_usb_path_guard_blocks_real_sysfs_and_dev(self):
-        for path in ("/sys/bus/usb/devices", "/dev/bus/usb"):
-            with self.subTest(path=path), self.assertRaisesRegex(RuntimeError, "TEST SAFETY GUARD"):
-                os.open(path, os.O_RDONLY)
+        # Deliberate guard hits go to a private file so the runner-wide hit file stays empty.
+        private_hits = self.tmp / "m7-guard-hits"
+        with mock.patch.dict(os.environ, {"OPENSTICK_GUARD_HIT_FILE": str(private_hits)}):
+            for path in ("/sys/bus/usb/devices", "/dev/bus/usb"):
+                with self.subTest(path=path), self.assertRaisesRegex(BaseException, "TEST SAFETY GUARD"):
+                    os.open(path, os.O_RDONLY)
+        self.assertEqual(len(private_hits.read_text().splitlines()), 2)
 
     def test_usb_root_injection_flags_are_hidden_from_public_help(self):
         result = run_test_process([str(ROOT / "openstick"), "--help"], text=True, capture_output=True)
