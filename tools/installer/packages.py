@@ -560,6 +560,8 @@ IDENTITY_READ_TIMEOUT_SECONDS=60
 INTERRUPT_GRACE_SECONDS=10
 POWER_CYCLE_HINT='The board may be in a half-open EDL session. Unplug USB for 30 s and reconnect WITHOUT the button, then re-enter EDL.'
 EDL_FAILURE_HINT='Hint: verify EDL mode and the USB connection, confirm the pinned loader, correct the reported issue, and re-enter EDL before retrying.'
+EDL_SESSION_CALLS=0
+EDL_SESSION_USED_NOTE='EDL session used. Before the next command that talks to the board: unplug USB for 30 s, reconnect WITHOUT the button, re-enter EDL. Never use "edl reset".'
 def sha(path):
     h=hashlib.sha256()
     with open(path,'rb') as f:
@@ -587,6 +589,8 @@ def edl_failure(message,out='',err='',verbose=False,debug=False):
         if tail: detail+='\nEDL client output (last lines):\n'+tail
     return detail
 def run_edl(client,operation,loader,timeout,verbose=False,debug=False):
+    global EDL_SESSION_CALLS
+    EDL_SESSION_CALLS+=1
     cmd=client+operation+['--loader='+str(loader),'--memory=emmc']
     print('EDL command: '+shlex.join(cmd))
     p=subprocess.Popen(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
@@ -626,7 +630,7 @@ def resolve_client(requested=None):
  found=shutil.which(requested or 'edl')
  if found: return [str(Path(found).resolve())]
  raise RuntimeError('EDL client unavailable; set OPENSTICK_EDL_DIR or provide an executable path')
-def main():
+def _run_main():
     p=argparse.ArgumentParser(description='Offline verified OpenStick restore package')
     p.add_argument('--edl', help='explicit EDL client executable')
     p.add_argument('--loader', required=True, help='pinned Firehose loader')
@@ -675,6 +679,14 @@ def main():
         return 0
     print('REFUSED: no destructive restore phase is authorized by this standalone package version',file=sys.stderr)
     return 2
+
+def finish_session():
+    if EDL_SESSION_CALLS: print(EDL_SESSION_USED_NOTE)
+def main():
+    global EDL_SESSION_CALLS
+    EDL_SESSION_CALLS=0
+    try: return _run_main()
+    finally: finish_session()
 
 if __name__=='__main__': raise SystemExit(main())
 '''
@@ -818,6 +830,7 @@ EDL_CLIENT=[]; EDL_LOADER=None; VERBOSE=False; DEBUG=False
 EDL_LAST_OUT=''; EDL_LAST_ERR=''
 EDL_SESSION_IDENTITY=None
 EDL_SESSION_CALLS=0
+EDL_SESSION_USED_NOTE='EDL session used. Before the next command that talks to the board: unplug USB for 30 s, reconnect WITHOUT the button, re-enter EDL. Never use "edl reset".'
 EDL_SYSFS_ROOT='/sys/bus/usb/devices'
 EDL_SESSION_BUS_KEY=None
 def sha(p):
@@ -1076,7 +1089,7 @@ def package_ok(root):
   checked=_snapshot_package(root,'restore')
   return checked if checked and validate_transition(checked[0],checked[1],json.loads((checked[0]/'payload/manifest.json').read_text())) else None
  except (OSError,ValueError,KeyError,TypeError,RuntimeError): return None
-def main(sysfs_root='/sys/bus/usb/devices'):
+def _run_main(sysfs_root='/sys/bus/usb/devices'):
  global EDL_SYSFS_ROOT, EDL_SESSION_BUS_KEY, EDL_SESSION_IDENTITY, EDL_SESSION_CALLS
  EDL_SYSFS_ROOT=sysfs_root; EDL_SESSION_BUS_KEY=None
  EDL_SESSION_IDENTITY=None; EDL_SESSION_CALLS=0
@@ -1241,6 +1254,11 @@ def main(sysfs_root='/sys/bus/usb/devices'):
   edl_refusal(str(e)); return 2
  finally:
   if lock_fd is not None: os.close(lock_fd)
+def finish_session():
+ if EDL_SESSION_CALLS: print(EDL_SESSION_USED_NOTE)
+def main(sysfs_root='/sys/bus/usb/devices'):
+ try: return _run_main(sysfs_root)
+ finally: finish_session()
 if __name__=='__main__': raise SystemExit(main('/sys/bus/usb/devices'))
 '''
 
@@ -1276,7 +1294,7 @@ def acquire_lock(path):
  except BlockingIOError:
   os.close(fd); raise RuntimeError('another package operation is active; no write was attempted')
  return fd
-def main():
+def main(sysfs_root='/sys/bus/usb/devices'):
  p=argparse.ArgumentParser(description='Portable legacy GPT-B install via the bundled OpenStick flash gates. UNVALIDATED on hardware; writes require the normal typed flash confirmation.')
  p.add_argument('--edl',required=True); p.add_argument('--loader',required=True); p.add_argument('--device',required=True)
  p.add_argument('--state-dir',required=True); p.add_argument('--dry-run',action='store_true'); p.add_argument('--reconcile-state',action='store_true')
@@ -1337,12 +1355,15 @@ def main():
     os.chdir(work)
     args=type('Args',(),{'flash_device':m['device_id'],'image_set':str(staged),'board':m['board'],
       'i_accept_untested':False,'dry_run':a.dry_run,'reconcile_state':a.reconcile_state})()
-    return flash.flash_command(args,state,runtime)
+    session=flash.edl_runner.Session(sysfs_root=sysfs_root)
+    try: return flash.flash_command(args,state,runtime,usb_sysfs_root=sysfs_root,session=session)
+    finally:
+     if session.invocation_count: print(flash.edl_runner.EDL_SESSION_USED_NOTE)
   finally:
    os.close(lock_fd)
  except Exception as exc:
   print('REFUSED: '+str(exc),file=sys.stderr); return 2
-if __name__=='__main__': raise SystemExit(main())
+if __name__=='__main__': raise SystemExit(main('/sys/bus/usb/devices'))
 '''
 
 

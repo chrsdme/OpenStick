@@ -646,13 +646,20 @@ def main(argv=None, *, usb_sysfs_root="/sys/bus/usb/devices", usb_device_root="/
             from . import imageset
             return imageset.verify_command(args.path)
         root = store.ensure_store(args.home)
-        if args.command == "backup":
+        if args.command in ("backup", "flash", "restore"):
             session = edl_runner.Session(sysfs_root=usb_sysfs_root)
-            try:
-                return backup_command(args, root, session)
-            finally:
-                if session.invocations:
-                    print("EDL session used. Before the next command that talks to the board: unplug USB for 30 s, reconnect WITHOUT the button, re-enter EDL. Never use \"edl reset\".")
+            with session:
+                if args.command == "backup":
+                    return backup_command(args, root, session)
+                if args.command == "flash":
+                    from . import flash as flash_module
+                    return flash_module.flash_command(args, root, repo,
+                                                      usb_sysfs_root=usb_sysfs_root,
+                                                      session=session)
+                from . import verify_restore
+                return verify_restore.restore_command(args, root, repo,
+                                                      usb_sysfs_root=usb_sysfs_root,
+                                                      session=session)
         if args.command == "configure":
             if args.show: configure_module.show(root, args.seed); return EXIT_OK
             configure_module.configure(root, args.seed, args.profile); return EXIT_OK
@@ -662,14 +669,6 @@ def main(argv=None, *, usb_sysfs_root="/sys/bus/usb/devices", usb_device_root="/
         if args.command == "build":
             from . import build as build_module
             return build_module.build_command(args, root, Path(__file__).resolve().parents[2])
-        if args.command == "flash":
-            from . import flash as flash_module
-            return flash_module.flash_command(args, root, Path(__file__).resolve().parents[2],
-                                              usb_sysfs_root=usb_sysfs_root)
-        if args.command == "restore":
-            from . import verify_restore
-            return verify_restore.restore_command(args, root, Path(__file__).resolve().parents[2],
-                                                  usb_sysfs_root=usb_sysfs_root)
         if args.command == "package":
             from . import packages
             return packages.package_command(args, root, Path(__file__).resolve().parents[2])
