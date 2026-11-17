@@ -2,10 +2,24 @@
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 PYTHON=${PYTHON:-python3}
-TMP=$(mktemp -d)
+if [[ -z ${INSTALLER_TEST_TMP-} ]]; then
+  TEST_TMP=$(mktemp -d /tmp/openstick-installer-tests.XXXXXX)
+  mkdir -p "$TEST_TMP/shims/bin"
+  cp "$ROOT"/tests/shims/bin/* "$TEST_TMP/shims/bin/"
+  chmod u+x "$TEST_TMP/shims/bin/"*
+  RUN_HOME=${HOME:-$TEST_TMP/home}
+  RUN_LANG=${LANG:-C.UTF-8}
+  exec /usr/bin/env -i HOME="$RUN_HOME" PATH="$TEST_TMP/shims/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
+    LANG="$RUN_LANG" TMPDIR="$TEST_TMP" INSTALLER_TEST_TMP="$TEST_TMP" \
+    /bin/bash "$0" "$@" </dev/null
+fi
+TMP=$INSTALLER_TEST_TMP
+unset INSTALLER_TEST_TMP
 trap 'rm -rf -- "$TMP"' EXIT
 export TMPDIR="$TMP"
-export GIT_CEILING_DIRECTORIES="$(dirname "$TMP")"
+mkdir -p "$TMP/usb/sys/bus/usb/devices" "$TMP/usb/dev/bus/usb"
+export OPENSTICK_USB_SYSFS_ROOT="$TMP/usb/sys/bus/usb/devices"
+export OPENSTICK_USB_DEVICE_ROOT="$TMP/usb/dev/bus/usb"
 export PYTHONPATH="$ROOT/tests/host-path-guard:$ROOT${PYTHONPATH:+:$PYTHONPATH}"
 export OPENSTICK_EDL_SESSION_FILE="$TMP/edl-session"
 shopt -s nullglob
@@ -14,11 +28,17 @@ m4_tmp_before=("$TMP"/openstick-m4-test-*)
 pass=0 fail=0 skip=0
 run() {
   local name=$1; shift
-  if "$@"; then printf 'PASS %s\n' "$name"; pass=$((pass + 1)); else printf 'FAIL %s\n' "$name"; fail=$((fail + 1)); fi
+  if timeout --signal=TERM --kill-after=5 300 "$@" </dev/null; then printf 'PASS %s\n' "$name"; pass=$((pass + 1)); else printf 'FAIL %s\n' "$name"; fail=$((fail + 1)); fi
 }
 
-run host-usb-path-guard python3 - <<'PY'
-import os
+run host-usb-path-guard python3 - "$ROOT" "$TMP" <<'PY'
+import os, pathlib, subprocess, sys
+root, tmp = sys.argv[1:]
+assert not ("OPENSTICK_EDL_DIR" in os.environ or "OPENSTICK_HOME" in os.environ)
+assert not any(name.startswith("GIT_") for name in os.environ)
+assert os.environ["PATH"].split(os.pathsep)[0].endswith("/shims/bin")
+assert os.environ.get("LANG")
+assert os.environ.get("TMPDIR")
 for path in ("/sys/bus/usb/devices", "/dev/bus/usb"):
     try:
         os.open(path, os.O_RDONLY)
@@ -26,12 +46,47 @@ for path in ("/sys/bus/usb/devices", "/dev/bus/usb"):
         assert "TEST SAFETY GUARD" in str(exc), str(exc)
     else:
         raise AssertionError("host USB path access was not blocked")
+outside_client = pathlib.Path(root) / "tests/shims/bin/edl"
+try:
+    subprocess.run([str(outside_client), "rs", "0", "1", str(pathlib.Path(tmp) / "out.bin")],
+                   stdin=subprocess.DEVNULL, timeout=5)
+except RuntimeError as exc:
+    assert "TEST SAFETY GUARD" in str(exc), str(exc)
+else:
+    raise AssertionError("EDL client outside the test temp directory was allowed")
+child_code = (
+    "import subprocess, sys; "
+    "try: subprocess.run([sys.argv[1], 'rs', '0', '1', sys.argv[2], '--loader=' + sys.argv[3]], "
+    "stdin=subprocess.DEVNULL, timeout=5)\n"
+    "except RuntimeError as exc: sys.exit(0 if 'TEST SAFETY GUARD' in str(exc) else 3)\n"
+    "sys.exit(4)"
+)
+inside_client = pathlib.Path(tmp) / "shims/bin/edl"
+child = subprocess.run([sys.executable, "-c", child_code, str(inside_client), str(pathlib.Path(tmp) / "child.bin"), "/nonexistent/outside-loader"],
+                       stdin=subprocess.DEVNULL, timeout=10, capture_output=True, text=True)
+assert child.returncode == 0, (child.returncode, child.stdout, child.stderr)
+env = dict(os.environ)
+env.pop("OPENSTICK_EDL_DIR", None)
+p = subprocess.run([sys.executable, str(pathlib.Path(root) / "openstick"),
+                    "--home", str(pathlib.Path(tmp) / "default-roots"), "doctor"],
+                   env=env, capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=20)
+assert "TEST SAFETY GUARD" not in p.stdout + p.stderr, (p.stdout, p.stderr)
+assert "no EDL device attached" in p.stdout, p.stdout
+child = subprocess.run([sys.executable, "-c",
+                       "from tools.installer.edl_runner import preflight; assert preflight().state == 'ABSENT'"],
+                      env=env, capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=20)
+assert child.returncode == 0, (child.stdout, child.stderr)
 PY
 
 run store-refuses-git python3 - "$ROOT" "$TMP" <<'PY'
-import subprocess, sys
+import os, pathlib, subprocess, sys
 root, tmp = sys.argv[1:]
-p = subprocess.run([root + "/openstick", "--home", root + "/.m1-test-store", "device", "list"], text=True, capture_output=True)
+repo = pathlib.Path(tmp) / "synthetic-repo"
+(repo / ".git").mkdir(parents=True)
+env = dict(os.environ)
+env.pop("GIT_CEILING_DIRECTORIES", None)
+p = subprocess.run([root + "/openstick", "--home", str(repo / "store"), "device", "list"],
+                   text=True, capture_output=True, env=env, stdin=subprocess.DEVNULL, timeout=20)
 assert p.returncode == 2, (p.returncode, p.stdout, p.stderr)
 assert "REFUSED" in p.stderr
 PY
@@ -66,9 +121,9 @@ from tools.installer.store import ensure_store, save_registry
 ensure_store(home)
 save_registry(home, {"schema": 1, "devices": [{"id": "DEADBEEF", "label": "stick", "note": ""}]})
 for args in (("device", "label", "DEADBEEF", "desk"), ("device", "note", "DEADBEEF", "baseline backup")):
- p = subprocess.run([root + "/openstick", "--home", str(home), *args], capture_output=True, text=True)
+ p = subprocess.run([root + "/openstick", "--home", str(home), *args], capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=20)
  assert p.returncode == 0, (p.stdout, p.stderr)
-p = subprocess.run([root + "/openstick", "--home", str(home), "device", "show", "DEADBEEF"], capture_output=True, text=True)
+p = subprocess.run([root + "/openstick", "--home", str(home), "device", "show", "DEADBEEF"], capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=20)
 d = json.loads(p.stdout)
 assert d["label"] == "desk" and d["note"] == "baseline backup"
 assert (home / "events.jsonl").read_text().count("\n") == 2
@@ -81,7 +136,7 @@ dev = pathlib.Path(tmp) / "dev"; dev.mkdir()
 env = dict(os.environ, PATH="/nonexistent", OPENSTICK_EDL_DIR=str(pathlib.Path(tmp) / "absent"))
 p = subprocess.run([sys.executable, root + "/openstick", "--usb-sysfs-root", str(sysfs),
                     "--usb-device-root", str(dev), "--home", str(pathlib.Path(tmp) / "doctor"), "doctor"],
-                   env=env, capture_output=True, text=True)
+                   env=env, capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=20)
 assert p.returncode == 1
 for term in ("python3", "bash", "e2fsprogs", "fastboot", "EDL client", "Firehose loader"):
  assert "FAIL " + term in p.stdout, (term, p.stdout)
@@ -92,7 +147,7 @@ run fake-emmc-deterministic python3 - "$ROOT" "$TMP" <<'PY'
 import hashlib, pathlib, subprocess, sys
 root, tmp = sys.argv[1:]
 a, b = pathlib.Path(tmp)/"a.img", pathlib.Path(tmp)/"b.img"
-for p in (a, b): subprocess.check_call([sys.executable, str(pathlib.Path(root)/"tests/make-fake-emmc.py"), str(p), "--mib", "2"])
+for p in (a, b): subprocess.check_call([sys.executable, str(pathlib.Path(root)/"tests/make-fake-emmc.py"), str(p), "--mib", "2"], stdin=subprocess.DEVNULL, timeout=20)
 assert hashlib.sha256(a.read_bytes()).digest() == hashlib.sha256(b.read_bytes()).digest()
 assert a.read_bytes()[512:520] == b"EFI PART"
 assert "userdata".encode("utf-16le") in a.read_bytes()
@@ -104,13 +159,13 @@ run shim-edl-read-and-failure-injection python3 - "$ROOT" "$TMP" <<'PY'
 import os, pathlib, subprocess, sys
 root, tmp = sys.argv[1:]
 tmp = pathlib.Path(tmp); disk = tmp / "disk.img"; out = tmp / "read.bin"
-subprocess.check_call([sys.executable, str(pathlib.Path(root)/"tests/make-fake-emmc.py"), str(disk), "--mib", "2"])
+subprocess.check_call([sys.executable, str(pathlib.Path(root)/"tests/make-fake-emmc.py"), str(disk), "--mib", "2"], stdin=subprocess.DEVNULL, timeout=20)
 loader = tmp / "synthetic-loader.mbn"; loader.write_bytes(b"test-only shim loader")
 env = dict(os.environ, OPENSTICK_FAKE_EMMC=str(disk), PATH=str(pathlib.Path(root)/"tests/shims/bin") + ":/usr/bin:/bin")
-subprocess.check_call(["edl", "rs", "0", "2", str(out), "--loader=" + str(loader), "--memory=emmc"], env=env)
+subprocess.check_call(["edl", "rs", "0", "2", str(out), "--loader=" + str(loader), "--memory=emmc"], env=env, stdin=subprocess.DEVNULL, timeout=20)
 assert out.stat().st_size == 1024
 env["OPENSTICK_EDL_CALL_FILE"] = str(tmp / "calls"); env["OPENSTICK_EDL_FAIL_AT"] = "1"
-p = subprocess.run(["edl", "rs", "0", "2", str(tmp / "failed.bin"), "--loader=" + str(loader), "--memory=emmc"], env=env, capture_output=True)
+p = subprocess.run(["edl", "rs", "0", "2", str(tmp / "failed.bin"), "--loader=" + str(loader), "--memory=emmc"], env=env, capture_output=True, stdin=subprocess.DEVNULL, timeout=20)
 assert p.returncode == 90 and b"injected failure" in p.stderr
 PY
 

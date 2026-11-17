@@ -831,7 +831,7 @@ EDL_LAST_OUT=''; EDL_LAST_ERR=''
 EDL_SESSION_IDENTITY=None
 EDL_SESSION_CALLS=0
 EDL_SESSION_USED_NOTE='EDL session used. Before the next command that talks to the board: unplug USB for 30 s, reconnect WITHOUT the button, re-enter EDL. Never use "edl reset".'
-EDL_SYSFS_ROOT='/sys/bus/usb/devices'
+EDL_SYSFS_ROOT=os.environ.get('OPENSTICK_USB_SYSFS_ROOT','/sys/bus/usb/devices')
 EDL_SESSION_BUS_KEY=None
 def sha(p):
  h=hashlib.sha256()
@@ -1089,8 +1089,9 @@ def package_ok(root):
   checked=_snapshot_package(root,'restore')
   return checked if checked and validate_transition(checked[0],checked[1],json.loads((checked[0]/'payload/manifest.json').read_text())) else None
  except (OSError,ValueError,KeyError,TypeError,RuntimeError): return None
-def _run_main(sysfs_root='/sys/bus/usb/devices'):
+def _run_main(sysfs_root=None):
  global EDL_SYSFS_ROOT, EDL_SESSION_BUS_KEY, EDL_SESSION_IDENTITY, EDL_SESSION_CALLS
+ if sysfs_root is None: sysfs_root=os.environ.get('OPENSTICK_USB_SYSFS_ROOT','/sys/bus/usb/devices')
  EDL_SYSFS_ROOT=sysfs_root; EDL_SESSION_BUS_KEY=None
  EDL_SESSION_IDENTITY=None; EDL_SESSION_CALLS=0
  ap=argparse.ArgumentParser(description='Portable, fail-closed phased restore from a complete verified backup. UNVALIDATED on hardware; writes require the normal typed restore confirmation.')
@@ -1256,10 +1257,10 @@ def _run_main(sysfs_root='/sys/bus/usb/devices'):
   if lock_fd is not None: os.close(lock_fd)
 def finish_session():
  if EDL_SESSION_CALLS: print(EDL_SESSION_USED_NOTE)
-def main(sysfs_root='/sys/bus/usb/devices'):
+def main(sysfs_root=None):
  try: return _run_main(sysfs_root)
  finally: finish_session()
-if __name__=='__main__': raise SystemExit(main('/sys/bus/usb/devices'))
+if __name__=='__main__': raise SystemExit(main())
 '''
 
 _INSTALL_RUNNER = r'''#!/usr/bin/env python3
@@ -1294,7 +1295,7 @@ def acquire_lock(path):
  except BlockingIOError:
   os.close(fd); raise RuntimeError('another package operation is active; no write was attempted')
  return fd
-def main(sysfs_root='/sys/bus/usb/devices'):
+def main(sysfs_root=None):
  p=argparse.ArgumentParser(description='Portable legacy GPT-B install via the bundled OpenStick flash gates. UNVALIDATED on hardware; writes require the normal typed flash confirmation.')
  p.add_argument('--edl',required=True); p.add_argument('--loader',required=True); p.add_argument('--device',required=True)
  p.add_argument('--state-dir',required=True); p.add_argument('--dry-run',action='store_true'); p.add_argument('--reconcile-state',action='store_true')
@@ -1363,7 +1364,7 @@ def main(sysfs_root='/sys/bus/usb/devices'):
    os.close(lock_fd)
  except Exception as exc:
   print('REFUSED: '+str(exc),file=sys.stderr); return 2
-if __name__=='__main__': raise SystemExit(main('/sys/bus/usb/devices'))
+if __name__=='__main__': raise SystemExit(main())
 '''
 
 
