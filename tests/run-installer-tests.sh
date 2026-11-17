@@ -17,6 +17,7 @@ TMP=$INSTALLER_TEST_TMP
 unset INSTALLER_TEST_TMP
 trap 'rm -rf -- "$TMP"' EXIT
 export TMPDIR="$TMP"
+export GIT_CEILING_DIRECTORIES="$(dirname "$TMP")"
 mkdir -p "$TMP/usb/sys/bus/usb/devices" "$TMP/usb/dev/bus/usb"
 export OPENSTICK_USB_SYSFS_ROOT="$TMP/usb/sys/bus/usb/devices"
 export OPENSTICK_USB_DEVICE_ROOT="$TMP/usb/dev/bus/usb"
@@ -35,7 +36,8 @@ run host-usb-path-guard python3 - "$ROOT" "$TMP" <<'PY'
 import os, pathlib, subprocess, sys
 root, tmp = sys.argv[1:]
 assert not ("OPENSTICK_EDL_DIR" in os.environ or "OPENSTICK_HOME" in os.environ)
-assert not any(name.startswith("GIT_") for name in os.environ)
+assert os.environ.get("GIT_CEILING_DIRECTORIES") == str(pathlib.Path(tmp).parent)
+assert not any(name.startswith("GIT_") and name != "GIT_CEILING_DIRECTORIES" for name in os.environ)
 assert os.environ["PATH"].split(os.pathsep)[0].endswith("/shims/bin")
 assert os.environ.get("LANG")
 assert os.environ.get("TMPDIR")

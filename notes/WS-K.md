@@ -2,7 +2,7 @@
 
 ## Findings handled
 
-- R-T1: VERIFIED-WITH-SHIMS. The runner re-execs under `env -i` with HOME, PATH, LANG, and a fresh TMPDIR. The harness then sets only its fixture USB roots and test state paths. The hostile run confirmed caller `OPENSTICK_EDL_DIR`, `OPENSTICK_HOME`, `GIT_*`, and PATH entries are discarded.
+- R-T1: VERIFIED-WITH-SHIMS. The runner re-execs under `env -i` with HOME, PATH, LANG, and a fresh TMPDIR. After startup it sets a harness-owned `GIT_CEILING_DIRECTORIES` to the temp directory's parent, along with fixture USB roots and test state paths. The guard confirmed caller `OPENSTICK_EDL_DIR`, `OPENSTICK_HOME`, other `GIT_*`, and PATH entries are discarded while the expected ceiling remains.
 - R-T2: VERIFIED-WITH-SHIMS. The Python host path guard rejects EDL client paths and loader paths outside TMPDIR. The guard runs in child interpreters through `sitecustomize`; its regression check covers an outside client and a child process with an outside loader. The full M2 EDL runner group passed.
 - R-T3: PARTIAL. Each runner group has a 300 second timeout and receives `/dev/null` stdin. Subprocess calls added to the runner's inline cases use explicit stdin and timeout. The remaining test files still need the suite-wide subprocess audit assigned to WS-L.
 - R-T5: VERIFIED-WITH-SHIMS. The runner exports fixture sysfs and USB device roots; CLI, EDL session defaults, and packaged restore entry points use them. The default-root doctor and child preflight checks passed under the host path guard.
