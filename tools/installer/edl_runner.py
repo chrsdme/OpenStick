@@ -16,6 +16,7 @@ from . import store
 
 PINNED_LOADER_SHA256 = "959439aa5864685999b713c3ed12ad5fa408149648b670a9a9ef77bcc9dcab14"
 LOADER_NAME = "prog_emmc_firehose_8916.mbn"
+DEFAULT_USB_SYSFS_ROOT = os.environ.get("OPENSTICK_USB_SYSFS_ROOT", "/sys/bus/usb/devices")
 IDENTITY_READ_TIMEOUT_SECONDS = 60
 RANGE_READ_TIMEOUT_SECONDS = 60
 FULL_READ_TIMEOUT_SECONDS = 3600
@@ -72,7 +73,7 @@ class PreflightResult:
     devnum: str = ""
 
 
-def preflight(sysfs_root="/sys/bus/usb/devices"):
+def preflight(sysfs_root=DEFAULT_USB_SYSFS_ROOT):
     """Inspect fixture-injectable USB sysfs metadata without opening /dev nodes."""
     if sysfs_root is None:
         return PreflightResult("UNKNOWN")
@@ -127,7 +128,7 @@ def _absent_error():
 class Session:
     """Own identity and USB bus/devnum for one top-level installer command."""
 
-    def __init__(self, *, sysfs_root="/sys/bus/usb/devices", client=None,
+    def __init__(self, *, sysfs_root=DEFAULT_USB_SYSFS_ROOT, client=None,
                  loader=None, env=None):
         self.sysfs_root = sysfs_root
         self.client = client
