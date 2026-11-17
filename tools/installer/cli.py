@@ -61,6 +61,7 @@ def parser():
     p.add_argument("--verbose", action="store_true", help="show diagnostic details")
     p.add_argument("--debug", action="store_true", help="show a traceback for unexpected errors")
     p.add_argument("--no-color", action="store_true", help="disable colored output")
+    p.add_argument("--show-serial", action="store_true", help="show the full device serial in console output")
     p.add_argument("--board", metavar="NAME", help="select a board class")
     p.add_argument("--device", metavar="ID", help="select a registered device")
     subs = p.add_subparsers(dest="command", required=True)
@@ -341,14 +342,21 @@ def _debugfs_quote(path):
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
-def backup_command(args, root):
+def _display_serial(serial, show=False):
+    if show or len(serial) <= 4:
+        return serial
+    return serial[:2] + "*" * (len(serial) - 4) + serial[-2:]
+
+
+def backup_command(args, root, session=None):
     print("WARNING: this backup contains IMEI, calibration and persist data. Keep it private and make an independent offline recovery copy.")
     env=os.environ.copy()
     # Sahara identity is printed before Firehose setup. A short primary-GPT
     # range read triggers that block without using unsupported getstorageinfo.
     with tempfile.TemporaryDirectory(prefix="openstick-edl-identity-") as identity_dir:
         identity_path = Path(identity_dir) / "primary-gpt.bin"
-        ident_run = edl_runner.run(
+        session = session or edl_runner.Session()
+        session.run(
             ["rs", "0", "34", str(identity_path)],
             timeout=edl_runner.IDENTITY_READ_TIMEOUT_SECONDS,
             env=env, verbose=getattr(args, "verbose", False), debug=getattr(args, "debug", False),
@@ -357,14 +365,15 @@ def backup_command(args, root):
             raise store.StoreError(
                 "EDL identity range read was incomplete. Hint: confirm the device is in EDL mode and reconnect USB before retrying."
             )
-        identity = edl_runner.parse_sahara_info(ident_run.stdout + "\n" + ident_run.stderr)
+        identity = session.identity
     device_id=identity["serial"]
     existing=store.load_registry(root); device=_find_device(existing,device_id)
     if args.device and args.device.lower()!=device_id: raise store.RefusedError("connected EDL identity does not match --device")
     if device and device.get("edl",{}).get("serial",device_id).lower()!=device_id: raise store.RefusedError("EDL identity conflicts with registry")
     if device and device.get("backups") and not args.again: raise store.RefusedError("a verified backup already exists; use --again for another")
     if args.dry_run:
-        print("DRY RUN: would read and verify eMMC for device %s."%device_id); return EXIT_OK
+        print("DRY RUN: would read and verify eMMC for device %s." %
+              _display_serial(device_id, getattr(args, "show_serial", False))); return EXIT_OK
     backup_id=datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
     parent=root/"backups"/device_id; parent.mkdir(mode=0o700,parents=True,exist_ok=True); os.chmod(parent,0o700)
     final=parent/backup_id
@@ -373,8 +382,8 @@ def backup_command(args, root):
     try:
         dump=staging/"emmc-full.bin"
         def read_to(dest):
-            edl_runner.run(["rf", str(dest)], timeout=edl_runner.FULL_READ_TIMEOUT_SECONDS,
-                           env=env, verbose=getattr(args, "verbose", False), debug=getattr(args, "debug", False))
+            session.run(["rf", str(dest)], timeout=edl_runner.FULL_READ_TIMEOUT_SECONDS, env=env,
+                        verbose=getattr(args, "verbose", False), debug=getattr(args, "debug", False))
             if not dest.is_file():
                 raise store.StoreError("EDL client completed without creating the full read. Hint: check the output path and retry after confirming EDL mode.")
         read_to(dump)
@@ -421,7 +430,8 @@ def backup_command(args, root):
                 store.save_registry(root,original)
             shutil.rmtree(final,ignore_errors=True)
             raise
-        print("Verified backup %s for device %s (%d bytes)."%(backup_id,device_id,manifest["size"]))
+        print("Verified backup %s for device %s (%d bytes)." %
+              (backup_id, _display_serial(device_id, getattr(args, "show_serial", False)), manifest["size"]))
         return EXIT_OK
     except Exception:
         shutil.rmtree(staging,ignore_errors=True)
@@ -617,12 +627,12 @@ def push_seed(args, root):
     return EXIT_OK
 
 
-def main(argv=None):
+def main(argv=None, *, usb_sysfs_root="/sys/bus/usb/devices", usb_device_root="/dev/bus/usb"):
     args = parser().parse_args(argv)
     args.home = str(resolve_home(args.home))
     try:
         if args.command == "doctor":
-            return doctor(args)
+            return doctor(args, usb_sysfs_root=usb_sysfs_root, usb_device_root=usb_device_root)
         repo = Path(__file__).resolve().parents[2]
         if args.command == "verify":
             from . import verify_restore
@@ -636,7 +646,13 @@ def main(argv=None):
             from . import imageset
             return imageset.verify_command(args.path)
         root = store.ensure_store(args.home)
-        if args.command == "backup": return backup_command(args,root)
+        if args.command == "backup":
+            session = edl_runner.Session(sysfs_root=usb_sysfs_root)
+            try:
+                return backup_command(args, root, session)
+            finally:
+                if session.invocations:
+                    print("EDL session used. Before the next command that talks to the board: unplug USB for 30 s, reconnect WITHOUT the button, re-enter EDL. Never use \"edl reset\".")
         if args.command == "configure":
             if args.show: configure_module.show(root, args.seed); return EXIT_OK
             configure_module.configure(root, args.seed, args.profile); return EXIT_OK

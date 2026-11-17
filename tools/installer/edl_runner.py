@@ -6,6 +6,7 @@ import shutil
 import signal
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 from . import store
@@ -13,8 +14,8 @@ from . import store
 
 PINNED_LOADER_SHA256 = "959439aa5864685999b713c3ed12ad5fa408149648b670a9a9ef77bcc9dcab14"
 LOADER_NAME = "prog_emmc_firehose_8916.mbn"
-IDENTITY_READ_TIMEOUT_SECONDS = 20
-RANGE_READ_TIMEOUT_SECONDS = 20
+IDENTITY_READ_TIMEOUT_SECONDS = 60
+RANGE_READ_TIMEOUT_SECONDS = 60
 FULL_READ_TIMEOUT_SECONDS = 3600
 INTERRUPT_GRACE_SECONDS = 10
 POWER_CYCLE_HINT = (
@@ -25,6 +26,174 @@ POWER_CYCLE_HINT = (
 
 class EdlRunnerError(store.StoreError):
     """An EDL invocation failed or exceeded its safe timeout."""
+
+    def __init__(self, message, stdout="", stderr=""):
+        super().__init__(message)
+        self.stdout = stdout or ""
+        self.stderr = stderr or ""
+
+
+class EDLSessionError(store.RefusedError):
+    """The current USB/EDL session cannot safely run the requested command."""
+
+
+class AbsentDeviceError(EDLSessionError):
+    pass
+
+
+class NormalModeError(EDLSessionError):
+    pass
+
+
+class ConsumedSessionError(EDLSessionError):
+    pass
+
+
+class HungSessionError(EDLSessionError):
+    pass
+
+
+class BoardSwapError(EDLSessionError):
+    pass
+
+
+@dataclass(frozen=True)
+class PreflightResult:
+    state: str
+    product_id: str = ""
+    busnum: str = ""
+    devnum: str = ""
+
+
+def preflight(sysfs_root="/sys/bus/usb/devices"):
+    """Inspect fixture-injectable USB sysfs metadata without opening /dev nodes."""
+    root = Path(sysfs_root)
+    try:
+        entries = sorted(root.iterdir(), key=lambda item: item.name)
+    except OSError:
+        return PreflightResult("UNKNOWN")
+    found_normal = None
+    try:
+        for entry in entries:
+            vendor_file = entry / "idVendor"
+            product_file = entry / "idProduct"
+            if not vendor_file.is_file() or not product_file.is_file():
+                continue
+            vendor = vendor_file.read_text(encoding="ascii").strip().lower()
+            product = product_file.read_text(encoding="ascii").strip().lower()
+            if vendor != "05c6":
+                continue
+            if product == "9008":
+                bus_file, dev_file = entry / "busnum", entry / "devnum"
+                busnum = bus_file.read_text(encoding="ascii").strip() if bus_file.is_file() else ""
+                devnum = dev_file.read_text(encoding="ascii").strip() if dev_file.is_file() else ""
+                return PreflightResult("EDL-PRESENT", product, busnum, devnum)
+            if found_normal is None:
+                found_normal = product
+    except (OSError, UnicodeError):
+        return PreflightResult("UNKNOWN")
+    if found_normal is not None:
+        return PreflightResult("NORMAL-MODE", found_normal)
+    return PreflightResult("ABSENT")
+
+
+def _has_sahara(text):
+    return "Mode detected: sahara" in (text or "") and "Serial:" in (text or "")
+
+
+def _has_firehose(text):
+    return "Mode detected: firehose" in (text or "")
+
+
+def _has_device(text):
+    return "Device detected :)" in (text or "")
+
+
+def _absent_error():
+    return AbsentDeviceError(
+        "No Qualcomm EDL device (05c6:9008) is connected. Put the board in EDL mode, then run this command again as the first EDL command of that session."
+    )
+
+
+class Session:
+    """Own identity and USB bus/devnum for one top-level installer command."""
+
+    def __init__(self, *, sysfs_root="/sys/bus/usb/devices", client=None,
+                 loader=None, env=None):
+        self.sysfs_root = sysfs_root
+        self.client = client
+        self.loader = loader
+        self.env = env
+        self.identity = None
+        self._bus_key = None
+        self.invocations = 0
+
+    def _before_call(self):
+        observed = preflight(self.sysfs_root)
+        if self._bus_key is None:
+            if observed.state == "ABSENT":
+                raise _absent_error()
+            if observed.state == "NORMAL-MODE":
+                raise NormalModeError(
+                    "The board is connected in normal mode (05c6:%s), not EDL. Enter EDL mode, then run this command again." % observed.product_id
+                )
+            if observed.state == "EDL-PRESENT" and observed.busnum and observed.devnum:
+                self._bus_key = (observed.busnum, observed.devnum)
+            return observed
+        if observed.state == "EDL-PRESENT" and observed.busnum and observed.devnum:
+            if (observed.busnum, observed.devnum) != self._bus_key:
+                raise BoardSwapError(
+                    "The 05c6:9008 USB bus/device number changed during this command; possible board swap. Stop and reconnect the original board before retrying."
+                )
+        elif observed.state != "UNKNOWN":
+            raise BoardSwapError(
+                "The original 05c6:9008 USB device disappeared during this command; possible board swap. Stop and reconnect the original board before retrying."
+            )
+        return observed
+
+    def run(self, args, timeout, *, env=None, verbose=False, debug=False):
+        self._before_call()
+        self.invocations += 1
+        try:
+            result = run(args, timeout=timeout, env=env if env is not None else self.env, verbose=verbose,
+                         debug=debug, client=self.client, loader=self.loader)
+        except EdlRunnerError as exc:
+            transcript = exc.stdout + "\n" + exc.stderr
+            if self.identity is None and _has_sahara(transcript) and not _has_firehose(transcript):
+                raise HungSessionError(
+                    "The EDL client started the handshake but the board stopped responding (half-open session). Unplug USB for 30 s, reconnect WITHOUT the button, then re-enter EDL."
+                ) from exc
+            if self.identity is None and "Waiting for the device" in transcript and not _has_device(transcript):
+                raise _absent_error() from exc
+            if self.identity is None and _has_firehose(transcript) and not _has_sahara(transcript):
+                raise ConsumedSessionError(
+                    "The board is in EDL, but its Sahara session was already used by an earlier command, so its identity cannot be read again. Unplug USB for 30 s, reconnect WITHOUT the button, re-enter EDL, and run this command first."
+                ) from exc
+            raise
+        transcript = result.stdout + "\n" + result.stderr
+        if self.identity is None:
+            if "Waiting for the device" in transcript and not _has_device(transcript):
+                raise _absent_error()
+            if _has_firehose(transcript) and not _has_sahara(transcript):
+                raise ConsumedSessionError(
+                    "The board is in EDL, but its Sahara session was already used by an earlier command, so its identity cannot be read again. Unplug USB for 30 s, reconnect WITHOUT the button, re-enter EDL, and run this command first."
+                )
+            if not _has_sahara(transcript):
+                raise store.StoreError(
+                    "EDL client output did not identify a fresh Sahara session. Hint: confirm EDL mode and use a client that prints the Sahara information block."
+                )
+            self.identity = parse_sahara_info(transcript)
+        elif _has_firehose(transcript):
+            pass
+        elif _has_sahara(transcript):
+            current = parse_sahara_info(transcript)
+            if current != self.identity:
+                raise BoardSwapError(
+                    "The EDL client reported a different identity during this command; possible board swap. Stop and reconnect the original board before retrying."
+                )
+        else:
+            raise store.StoreError("EDL client did not report firehose mode for a later session invocation")
+        return result
 
 
 def _hash(path):
@@ -86,9 +255,14 @@ def resolve_loader():
     )
 
 
-def _tail(stdout, stderr, limit=12):
+def _tail(stdout, stderr="", limit=12):
     lines = (str(stdout or "") + "\n" + str(stderr or "")).splitlines()
-    return "\n".join(lines[-limit:])
+    tail = lines[-limit:]
+    def mask_serial(match):
+        value = match.group(2)
+        return match.group(1) + value[:2] + "*" * max(0, len(value) - 4) + value[-2:]
+    return "\n".join(re.sub(r"(?m)(^Serial:\s*0x)([0-9a-fA-F]+)", mask_serial, line)
+                     for line in tail)
 
 
 def _failure(message, stdout, stderr, verbose):
@@ -97,7 +271,7 @@ def _failure(message, stdout, stderr, verbose):
         tail = _tail(stdout, stderr)
         if tail:
             detail += "\nEDL client output (last lines):\n" + tail
-    return EdlRunnerError(detail)
+    return EdlRunnerError(detail, stdout, stderr)
 
 
 def _checked_client(client):
@@ -176,15 +350,18 @@ def run(args, timeout, *, env=None, cwd=None, verbose=False, debug=False, client
                     pass
                 raise EdlRunnerError(
                     "EDL client timed out and ignored SIGINT and terminate; " + POWER_CYCLE_HINT +
-                    ("\nEDL client output (last lines):\n" + _tail(stdout, stderr) if (verbose or debug) and _tail(stdout, stderr) else "")
+                    ("\nEDL client output (last lines):\n" + _tail(stdout, stderr) if (verbose or debug) and _tail(stdout, stderr) else ""),
+                    stdout, stderr,
                 )
             raise EdlRunnerError(
                 "EDL client timed out and did not exit after SIGINT; " + POWER_CYCLE_HINT +
-                ("\nEDL client output (last lines):\n" + _tail(stdout, stderr) if (verbose or debug) and _tail(stdout, stderr) else "")
+                ("\nEDL client output (last lines):\n" + _tail(stdout, stderr) if (verbose or debug) and _tail(stdout, stderr) else ""),
+                stdout, stderr,
             )
         raise EdlRunnerError(
             "EDL client timed out. " + POWER_CYCLE_HINT +
-            ("\nEDL client output (last lines):\n" + _tail(stdout, stderr) if (verbose or debug) and _tail(stdout, stderr) else "")
+            ("\nEDL client output (last lines):\n" + _tail(stdout, stderr) if (verbose or debug) and _tail(stdout, stderr) else ""),
+            stdout, stderr,
         )
     if process.returncode != 0:
         raise _failure("EDL client exited with status %d" % process.returncode,
