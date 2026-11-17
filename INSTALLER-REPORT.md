@@ -21,7 +21,7 @@ The pre-hardware-round aggregate runner result was **26 PASS, 0 FAIL, 0 SKIP**. 
 
 ## Test hardening round 4
 
-The round started from `315ab96`. The required EOF-only base commit is `f6284ca`, tagged `round4-base`; the integrated `installer` head is `38bedd3`. All six workstreams below were tested with synthetic fixtures and shims. No real hardware, EDL device, `sudo`, network, production image, or real backup was used.
+The round started from `315ab96`. The required EOF-only base commit is `f6284ca`, tagged `round4-base`; the implementation integration merge is `38bedd3`, followed by this report-only update. All six workstreams below were tested with synthetic fixtures and shims. No real hardware, EDL device, `sudo`, network, production image, or real backup was used.
 
 | Requirement | Status | Evidence |
 |---|---|---|
