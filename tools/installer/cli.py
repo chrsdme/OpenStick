@@ -63,6 +63,8 @@ def parser():
     p.add_argument("--no-color", action="store_true", help="disable colored output")
     p.add_argument("--board", metavar="NAME", help="select a board class")
     p.add_argument("--device", metavar="ID", help="select a registered device")
+    p.add_argument("--usb-sysfs-root", default="/sys/bus/usb/devices", help=argparse.SUPPRESS)
+    p.add_argument("--usb-device-root", default="/dev/bus/usb", help=argparse.SUPPRESS)
     subs = p.add_subparsers(dest="command", required=True)
     subs.add_parser("doctor", help="check local prerequisites and private store")
     device = subs.add_parser("device", help="manage the local device registry")
@@ -622,7 +624,7 @@ def main(argv=None):
     args.home = str(resolve_home(args.home))
     try:
         if args.command == "doctor":
-            return doctor(args)
+            return doctor(args, args.usb_sysfs_root, args.usb_device_root)
         repo = Path(__file__).resolve().parents[2]
         if args.command == "verify":
             from . import verify_restore

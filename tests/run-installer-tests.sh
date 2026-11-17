@@ -6,7 +6,8 @@ TMP=$(mktemp -d)
 trap 'rm -rf -- "$TMP"' EXIT
 export TMPDIR="$TMP"
 export GIT_CEILING_DIRECTORIES="$(dirname "$TMP")"
-export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH="$ROOT/tests/host-path-guard:$ROOT${PYTHONPATH:+:$PYTHONPATH}"
+export OPENSTICK_EDL_SESSION_FILE="$TMP/edl-session"
 shopt -s nullglob
 m4_tmp_before=("$TMP"/openstick-m4-test-*)
 
@@ -15,6 +16,17 @@ run() {
   local name=$1; shift
   if "$@"; then printf 'PASS %s\n' "$name"; pass=$((pass + 1)); else printf 'FAIL %s\n' "$name"; fail=$((fail + 1)); fi
 }
+
+run host-usb-path-guard python3 - <<'PY'
+import os
+for path in ("/sys/bus/usb/devices", "/dev/bus/usb"):
+    try:
+        os.open(path, os.O_RDONLY)
+    except RuntimeError as exc:
+        assert "TEST SAFETY GUARD" in str(exc), str(exc)
+    else:
+        raise AssertionError("host USB path access was not blocked")
+PY
 
 run store-refuses-git python3 - "$ROOT" "$TMP" <<'PY'
 import subprocess, sys
@@ -64,8 +76,12 @@ PY
 run doctor-missing-dependencies python3 - "$ROOT" "$TMP" <<'PY'
 import os, pathlib, subprocess, sys
 root, tmp = sys.argv[1:]
+sysfs = pathlib.Path(tmp) / "sysfs"; sysfs.mkdir()
+dev = pathlib.Path(tmp) / "dev"; dev.mkdir()
 env = dict(os.environ, PATH="/nonexistent", OPENSTICK_EDL_DIR=str(pathlib.Path(tmp) / "absent"))
-p = subprocess.run([sys.executable, root + "/openstick", "--home", str(pathlib.Path(tmp) / "doctor"), "doctor"], env=env, capture_output=True, text=True)
+p = subprocess.run([sys.executable, root + "/openstick", "--usb-sysfs-root", str(sysfs),
+                    "--usb-device-root", str(dev), "--home", str(pathlib.Path(tmp) / "doctor"), "doctor"],
+                   env=env, capture_output=True, text=True)
 assert p.returncode == 1
 for term in ("python3", "bash", "e2fsprogs", "fastboot", "EDL client", "Firehose loader"):
  assert "FAIL " + term in p.stdout, (term, p.stdout)
