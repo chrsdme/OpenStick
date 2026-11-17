@@ -18,7 +18,7 @@ import select
 import time
 import fcntl
 from unittest import mock
-from contextlib import redirect_stdout
+from contextlib import redirect_stdout, contextmanager
 import io
 from functools import wraps
 
@@ -187,21 +187,22 @@ def make_raw_package(path, payload=b"safe"):
 
 def run_typed(command, env, token):
     command, env = prepare_restore_state(command, env)
-    master, slave = pty.openpty()
-    process = subprocess.Popen(command, stdin=slave, stdout=slave, stderr=slave, env=env, close_fds=True)
-    os.close(slave)
-    output = bytearray(); sent = False; deadline = time.time() + 30
-    while process.poll() is None and time.time() < deadline:
-        ready, _, _ = select.select([master], [], [], .2)
-        if ready:
-            try: block = os.read(master, 4096)
-            except OSError: break
-            output.extend(block)
-            if not sent and token.encode() in output:
-                os.write(master, token.encode() + b"\n"); sent = True
-    if process.poll() is None: process.kill()
-    rc = process.wait(); os.close(master)
-    return rc, output.decode(errors="replace")
+    with injected_package_runner(command, env) as (command, env):
+        master, slave = pty.openpty()
+        process = subprocess.Popen(command, stdin=slave, stdout=slave, stderr=slave, env=env, close_fds=True)
+        os.close(slave)
+        output = bytearray(); sent = False; deadline = time.time() + 30
+        while process.poll() is None and time.time() < deadline:
+            ready, _, _ = select.select([master], [], [], .2)
+            if ready:
+                try: block = os.read(master, 4096)
+                except OSError: break
+                output.extend(block)
+                if not sent and token.encode() in output:
+                    os.write(master, token.encode() + b"\n"); sent = True
+        if process.poll() is None: process.kill()
+        rc = process.wait(); os.close(master)
+        return rc, output.decode(errors="replace")
 
 
 def prepare_restore_state(command, env):
@@ -226,27 +227,58 @@ def canonical_restore_state(requested, backup_sha):
 
 def run_restore(command, env, **kwargs):
     command, env = prepare_restore_state(command, env)
-    return subprocess.run(command, env=env, **kwargs)
+    with injected_package_runner(command, env) as (command, env):
+        return subprocess.run(command, env=env, **kwargs)
+
+
+@contextmanager
+def injected_package_runner(command, env):
+    """Call generated package main() with fixture sysfs through its Python API."""
+    command = list(command); env = dict(env)
+    if len(command) < 2 or command[0] != sys.executable or not command[1].endswith(".py"):
+        yield command, env
+        return
+    script = pathlib.Path(command[1])
+    disk = pathlib.Path(env.get("OPENSTICK_FAKE_EMMC", script.parent / "fixture.img"))
+    fixture_root = pathlib.Path(tempfile.mkdtemp(prefix="m6-injected-", dir=os.environ.get("TMPDIR")))
+    sysfs = fixture_root / "sysfs"
+    device = sysfs / "1-1"
+    device.mkdir(parents=True, exist_ok=True)
+    for name, value in (("idVendor", "05c6"), ("idProduct", "9008"), ("busnum", "001"), ("devnum", "009")):
+        (device / name).write_text(value + "\n", encoding="ascii")
+    env["OPENSTICK_EDL_SESSION_FILE"] = str(fixture_root / "session-state")
+    wrapper = fixture_root / "invoke.py"
+    wrapper.write_text(
+        "import runpy, sys\n"
+        "script, sysfs = sys.argv[1:3]\n"
+        "sys.argv = [script] + sys.argv[3:]\n"
+        "ns = runpy.run_path(script, run_name='openstick_test_package_runner')\n"
+        "raise SystemExit(ns['main'](sysfs))\n", encoding="utf-8")
+    try:
+        yield [sys.executable, str(wrapper), str(script), str(sysfs), *command[2:]], env
+    finally:
+        shutil.rmtree(fixture_root, ignore_errors=True)
 
 
 def run_flash_session(command, env):
-    master, slave = pty.openpty()
-    process = subprocess.Popen(command, stdin=slave, stdout=slave, stderr=slave, env=env, close_fds=True)
-    os.close(slave)
-    output = bytearray(); sent = set(); deadline = time.time() + 180
-    pattern = re.compile(rb"Type exactly: (flash [0-9a-f]{8} [a-z0-9-]+)")
-    while process.poll() is None and time.time() < deadline:
-        ready, _, _ = select.select([master], [], [], .2)
-        if ready:
-            try: block = os.read(master, 65536)
-            except OSError: break
-            output.extend(block)
-            for match in pattern.findall(output):
-                if match not in sent:
-                    os.write(master, match + b"\n"); sent.add(match)
-    if process.poll() is None: process.kill()
-    rc = process.wait(); os.close(master)
-    return rc, output.decode(errors="replace"), {item.decode() for item in sent}
+    with injected_package_runner(command, env) as (command, env):
+        master, slave = pty.openpty()
+        process = subprocess.Popen(command, stdin=slave, stdout=slave, stderr=slave, env=env, close_fds=True)
+        os.close(slave)
+        output = bytearray(); sent = set(); deadline = time.time() + 180
+        pattern = re.compile(rb"Type exactly: (flash [0-9a-f]{8} [a-z0-9-]+)")
+        while process.poll() is None and time.time() < deadline:
+            ready, _, _ = select.select([master], [], [], .2)
+            if ready:
+                try: block = os.read(master, 65536)
+                except OSError: break
+                output.extend(block)
+                for match in pattern.findall(output):
+                    if match not in sent:
+                        os.write(master, match + b"\n"); sent.add(match)
+        if process.poll() is None: process.kill()
+        rc = process.wait(); os.close(master)
+        return rc, output.decode(errors="replace"), {item.decode() for item in sent}
 
 
 def make_fake_edl(path):
@@ -255,13 +287,19 @@ import os, shutil, signal, sys, time
 from pathlib import Path
 a=sys.argv[1:]; op=a[0]; disk=Path(os.environ['OPENSTICK_FAKE_EMMC'])
 with Path(os.environ['OPENSTICK_EDL_LOG']).open('a') as log: log.write(' '.join(a)+'\\n')
+session=Path(os.environ['OPENSTICK_EDL_SESSION_FILE'])
 loader=next((x.split('=',1)[1] for x in a if x.startswith('--loader=')), '')
 memory=next((x.split('=',1)[1] for x in a if x.startswith('--memory=')), '')
 if not loader.startswith('/') or memory!='emmc': print('FAKE EDL ASSERTION FAILED: required loader and memory flags missing',file=sys.stderr); raise SystemExit(91)
-print('Qualcomm Sahara / Firehose Client V3.62 (c) B.Kerler 2018-2025.')
-print('HWID:              0x007050e100000000 (MSM_ID:0x007050e1,OEM_ID:0x0000,MODEL_ID:0x0000)')
-print('PK_HASH:           0x0000000000000000000000000000000000000000000000000000000000000000')
-print('Serial:            0xdeadbeef')
+if session.exists(): print('Mode detected: firehose')
+else:
+ session.write_text('used')
+ print('Qualcomm Sahara / Firehose Client V3.62 (c) B.Kerler 2018-2025.')
+ print('Device detected :)')
+ print('Mode detected: sahara')
+ print('HWID:              0x007050e100000000 (MSM_ID:0x007050e1,OEM_ID:0x0000,MODEL_ID:0x0000)')
+ print('PK_HASH:           0x0000000000000000000000000000000000000000000000000000000000000000')
+ print('Serial:            0xdeadbeef')
 if op=='getstorageinfo': print("GetStorageInfo command isn't supported."); raise SystemExit(0)
 if op=='rf':
  out=Path(next(x for x in a[1:] if not x.startswith('--'))); shutil.copyfile(disk,out)
@@ -387,13 +425,19 @@ import errno, os, shutil, sys
 from pathlib import Path
 disk=Path(%r); a=sys.argv[1:]; op=a[0]
 with Path(%r).open('a') as f: f.write(' '.join(a)+'\\n')
+session=Path(os.environ['OPENSTICK_EDL_SESSION_FILE'])
 loader=next((x.split('=',1)[1] for x in a if x.startswith('--loader=')), '')
 memory=next((x.split('=',1)[1] for x in a if x.startswith('--memory=')), '')
 if not loader.startswith('/') or memory!='emmc': print('FAKE EDL ASSERTION FAILED: required loader and memory flags missing',file=sys.stderr); raise SystemExit(91)
-print('Qualcomm Sahara / Firehose Client V3.62 (c) B.Kerler 2018-2025.')
-print('HWID:              0x007050e100000000 (MSM_ID:0x007050e1,OEM_ID:0x0000,MODEL_ID:0x0000)')
-print('PK_HASH:           0x0000000000000000000000000000000000000000000000000000000000000000')
-print('Serial:            0xdeadbeef')
+if session.exists(): print('Mode detected: firehose')
+else:
+ session.write_text('used')
+ print('Qualcomm Sahara / Firehose Client V3.62 (c) B.Kerler 2018-2025.')
+ print('Device detected :)')
+ print('Mode detected: sahara')
+ print('HWID:              0x007050e100000000 (MSM_ID:0x007050e1,OEM_ID:0x0000,MODEL_ID:0x0000)')
+ print('PK_HASH:           0x0000000000000000000000000000000000000000000000000000000000000000')
+ print('Serial:            0xdeadbeef')
 if op=='getstorageinfo': print("GetStorageInfo command isn't supported."); raise SystemExit(0)
 if op=='rf':
  out=Path(next(x for x in a[1:] if not x.startswith('--')))
@@ -541,7 +585,7 @@ def run():
         sums_path = standalone / "SHA256SUMS"
         sums_path.write_text("".join("%s  %s\n" % (outer["files"][n]["sha256"], n) for n in sorted(outer["files"])))
         args = [sys.executable, str(script_path), "--device", "deadbeef", "--edl", str(fake_edl), "--loader", str(loader)]
-        inspect = subprocess.run(args, env=base_env, capture_output=True, text=True)
+        inspect = run_restore(args, env=base_env, capture_output=True, text=True)
         assert inspect.returncode == 0 and "fsg/sec/fsc fingerprints verified" in inspect.stdout, (inspect.returncode, inspect.stdout, inspect.stderr)
         # Deterministically replace a validated member from the fake EDL
         # callback, after the runner has taken its private snapshot. Continued
@@ -551,8 +595,8 @@ def run():
         shutil.copytree(standalone, race_root)
         race_env = dict(base_env, RACE_PACKAGE_ROOT=str(race_root))
         race_script = race_root / "scripts/restore.py"
-        race_result = subprocess.run([sys.executable, str(race_script), "--device", "deadbeef", "--edl", str(fake_edl),
-                                      "--loader", str(loader)], env=race_env, capture_output=True, text=True)
+        race_result = run_restore([sys.executable, str(race_script), "--device", "deadbeef", "--edl", str(fake_edl),
+                                   "--loader", str(loader)], env=race_env, capture_output=True, text=True)
         assert race_result.returncode == 0 and "fingerprints verified" in race_result.stdout, (race_result.returncode, race_result.stdout, race_result.stderr)
         assert (race_root / "payload/emmc-full.bin").read_bytes() == b"changed-after-validation"
         ordered_phases = re.search(r"Ordered restore phases: (.+)", inspect.stdout).group(1).split(", ")
@@ -564,7 +608,8 @@ def run():
         lock_state.parent.mkdir(parents=True, exist_ok=True)
         lock_fd = os.open(str(lock_state) + ".lock", os.O_CREAT | os.O_RDWR, 0o600)
         fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        locked = subprocess.run(locked_command, env=locked_env, capture_output=True, text=True)
+        with injected_package_runner(locked_command, locked_env) as (locked_command, locked_env):
+            locked = subprocess.run(locked_command, env=locked_env, capture_output=True, text=True)
         assert locked.returncode == 2 and "another package operation is active" in locked.stderr, (locked.returncode, locked.stderr)
         lock_log = pathlib.Path(base_env["OPENSTICK_EDL_LOG"])
         assert not lock_log.exists() or not any(line.startswith("ws ") and "--skipwrite" not in line
@@ -579,7 +624,7 @@ def run():
         fsg = json.loads((disk.parent / "manifest.json").read_text())["partitions"]["fsg"]
         with wrong_disk.open("r+b") as stream: stream.seek(fsg["start_lba"] * 512); stream.write(b"WRONG-IDENTITY")
         wrong_identity = dict(base_env, OPENSTICK_FAKE_EMMC=str(wrong_disk), OPENSTICK_EDL_LOG=str(root / "wrong-id.log"))
-        wrong = subprocess.run(args, env=wrong_identity, capture_output=True, text=True)
+        wrong = run_restore(args, env=wrong_identity, capture_output=True, text=True)
         assert wrong.returncode == 2 and "fsg fingerprint mismatch" in wrong.stderr
         wrong_gpt_disk = root / "wrong-gpt-device.img"; wrong_gpt_disk.write_bytes(disk.read_bytes())
         with wrong_gpt_disk.open("r+b") as stream:
@@ -634,7 +679,8 @@ def run():
         alternate = root / "alternate-state.json"
         alternate_command = args + ["--phase", "userdata", "--state", str(alternate)]
         alternate_env = dict(fail_env, HOME=str(pinned_fail_state.parents[3]))
-        alternate = subprocess.run(alternate_command, env=alternate_env, capture_output=True, text=True)
+        with injected_package_runner(alternate_command, alternate_env) as (alternate_command, alternate_env):
+            alternate = subprocess.run(alternate_command, env=alternate_env, capture_output=True, text=True)
         assert alternate.returncode == 2 and "state path is pinned" in alternate.stderr, (alternate.returncode, alternate.stderr)
         writes = [line for line in fail_log.read_text().splitlines() if line.startswith("ws ") and "--skipwrite" not in line]
         assert len(writes) == 1, writes
@@ -657,7 +703,7 @@ def run():
                                          for n in sorted(timeout_manifest["files"])))
         timeout_args = [sys.executable, str(timeout_script), "--device", "deadbeef", "--edl", str(fake_edl),
                         "--loader", str(loader), "--verbose"]
-        timeout_result = subprocess.run(timeout_args, env=dict(base_env, HANG_IDENTITY="1"), capture_output=True, text=True)
+        timeout_result = run_restore(timeout_args, env=dict(base_env, HANG_IDENTITY="1"), capture_output=True, text=True)
         assert timeout_result.returncode == 2
         assert "SYNTHETIC EDL SIGINT OUTPUT TAIL" in timeout_result.stderr, timeout_result.stderr
         assert "Hint:" in timeout_result.stderr and "re-enter EDL" in timeout_result.stderr
@@ -848,18 +894,21 @@ def run():
         install_help = subprocess.run([sys.executable, str(install_script), "--help"],
                                       env=dict(os.environ, PATH="/usr/bin:/bin"), capture_output=True, text=True)
         assert "UNVALIDATED on hardware" in install_help.stdout
-        wrong_device = subprocess.run([sys.executable, str(install_script), "--device", "cafebabe", "--edl", "/missing/edl",
-                                       "--loader", str(loader), "--state-dir", str(root / "install-state")],
-                                      env=dict(os.environ, PATH="/usr/bin:/bin"), capture_output=True, text=True)
+        wrong_device_command = [sys.executable, str(install_script), "--device", "cafebabe", "--edl", "/missing/edl",
+                                "--loader", str(loader), "--state-dir", str(root / "install-state")]
+        with injected_package_runner(wrong_device_command, dict(os.environ, PATH="/usr/bin:/bin")) as (wrong_device_command, wrong_device_env):
+            wrong_device = subprocess.run(wrong_device_command, env=wrong_device_env, capture_output=True, text=True)
         assert wrong_device.returncode == 2 and "selected device" in wrong_device.stderr, (wrong_device.returncode, wrong_device.stdout, wrong_device.stderr)
         wrong_loader = root / "wrong-loader"; wrong_loader.write_bytes(b"not pinned")
-        refuse_loader = subprocess.run([sys.executable, str(install_script), "--device", "deadbeef", "--edl", "/missing/edl",
-                                        "--loader", str(wrong_loader), "--state-dir", str(root / "install-state")],
-                                       env=dict(os.environ, PATH="/usr/bin:/bin"), capture_output=True, text=True)
+        refuse_loader_command = [sys.executable, str(install_script), "--device", "deadbeef", "--edl", "/missing/edl",
+                                 "--loader", str(wrong_loader), "--state-dir", str(root / "install-state")]
+        with injected_package_runner(refuse_loader_command, dict(os.environ, PATH="/usr/bin:/bin")) as (refuse_loader_command, refuse_loader_env):
+            refuse_loader = subprocess.run(refuse_loader_command, env=refuse_loader_env, capture_output=True, text=True)
         assert refuse_loader.returncode == 2 and "hash mismatched" in refuse_loader.stderr
-        no_edl = subprocess.run([sys.executable, str(install_script), "--device", "deadbeef", "--edl", "/missing/edl",
-                                 "--loader", str(loader), "--state-dir", str(root / "install-state")],
-                                env=dict(os.environ, PATH="/usr/bin:/bin"), capture_output=True, text=True)
+        no_edl_command = [sys.executable, str(install_script), "--device", "deadbeef", "--edl", "/missing/edl",
+                          "--loader", str(loader), "--state-dir", str(root / "install-state")]
+        with injected_package_runner(no_edl_command, dict(os.environ, PATH="/usr/bin:/bin")) as (no_edl_command, no_edl_env):
+            no_edl = subprocess.run(no_edl_command, env=no_edl_env, capture_output=True, text=True)
         assert no_edl.returncode == 2 and "live EDL" in no_edl.stderr, (no_edl.returncode, no_edl.stdout, no_edl.stderr)
         # Positive standalone fake-board installation: no builder checkout on
         # PATH, only fake EDL/sudo/simg2img. The package runner delegates to the
@@ -878,7 +927,9 @@ def run():
         rc, install_output, confirmations = run_flash_session(
             [sys.executable, str(accepted_script), "--device", "deadbeef", "--edl", str(install_edl),
              "--loader", str(loader), "--state-dir", str(root / "accepted-install-state")], accepted_env)
-        assert rc == 2 and "stopped after GPT" in install_output, (rc, install_output[-5000:])
+        assert rc == 2 and "stopped after GPT" in install_output, (
+            rc, install_output[-5000:],
+            install_edl_log.read_text(errors="replace")[-5000:] if install_edl_log.exists() else "no fake EDL calls logged")
         assert not fastboot_log.exists() or fastboot_log.read_text(encoding="utf-8") == "", "standalone first-install unexpectedly invoked fastboot"
         assert confirmations == {"flash deadbeef gpt"}, confirmations
         actual_writes = [line.split() for line in install_edl_log.read_text().splitlines()
@@ -938,7 +989,7 @@ def run():
         restore_help = subprocess.run(transition_args + ["--help"], env=transition_env,
                                       capture_output=True, text=True)
         assert "UNVALIDATED on hardware" in restore_help.stdout
-        inspect = subprocess.run(transition_args, env=transition_env, capture_output=True, text=True)
+        inspect = run_restore(transition_args, env=transition_env, capture_output=True, text=True)
         assert inspect.returncode == 0 and "Ordered restore phases" in inspect.stdout, (inspect.returncode, inspect.stdout, inspect.stderr)
         restore_phases = re.search(r"Ordered restore phases: (.+)", inspect.stdout).group(1).split(", ")
         transition_state = root / "transition-restore-state.json"

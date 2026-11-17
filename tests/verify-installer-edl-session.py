@@ -111,6 +111,51 @@ class SessionPreflightTests(unittest.TestCase):
         with self.assertRaises(edl_runner.BoardSwapError):
             session._before_call()
 
+    def test_session_classifies_fresh_sahara_and_captures_identity_once(self):
+        session = self.fresh_edl_session()
+        with self.patch_loader_pin():
+            result = session.run(["rs", "0", "34", str(self.base / "fresh.bin")], timeout=2)
+        self.assertIn("Mode detected: sahara", result.stdout)
+        self.assertEqual(session.identity["serial"], "deadbeef")
+        self.assertEqual(session.invocation_count, 1)
+
+    def test_session_classifies_consumed_firehose_without_identity(self):
+        self.add_usb("1-1", "05c6", "9008", "001", "009")
+        (self.base / "session-state").write_text("1")
+        session = self.make_session()
+        with self.patch_loader_pin(), self.assertRaises(edl_runner.ConsumedSessionError):
+            session.run(["rs", "0", "34", str(self.base / "consumed.bin")], timeout=2)
+        self.assertIsNone(session.identity)
+        self.assertEqual(session.invocation_count, 1)
+
+    def test_session_classifies_sahara_handshake_timeout_as_hung(self):
+        session = self.fresh_edl_session()
+        session.env = dict(self.env, HANG_IDENTITY="1")
+        with self.patch_loader_pin():
+            with self.assertRaises(edl_runner.HungSessionError):
+                session.run(["rs", "0", "34", str(self.base / "hung.bin")], timeout=0.2)
+
+    def test_doctor_makes_zero_edl_client_invocations(self):
+        device = self.add_usb("1-1", "05c6", "9008", "001", "009")
+        (device / "busnum").write_text("001\n")
+        (device / "devnum").write_text("009\n")
+        cli_edl_dir = self.base / "doctor-edl-tools"
+        cli_edl_dir.mkdir()
+        client = cli_edl_dir / "edl"
+        shutil.copy2(self.shim, client)
+        client.chmod(0o700)
+        shutil.copy2(self.loader, cli_edl_dir / edl_runner.LOADER_NAME)
+        output = io.StringIO()
+        environment = dict(self.env, OPENSTICK_EDL_DIR=str(cli_edl_dir))
+        with self.patch_loader_pin(), mock.patch.dict(os.environ, environment, clear=True), \
+                contextlib.redirect_stdout(output):
+            result = cli.doctor(type("Args", (), {"home": str(self.base / "doctor-home")})(),
+                                usb_sysfs_root=self.sysfs, usb_device_root=self.base / "dev-fixture",
+                                access_check=lambda path, mode: True)
+        self.assertEqual(result, cli.EXIT_OK, output.getvalue())
+        self.assertFalse((self.base / "session-state").exists())
+        self.assertNotIn("Mode detected", output.getvalue())
+
     def test_edl_output_tail_masks_serial_by_default(self):
         tail = edl_runner._tail("Serial:            0xdeadbeef\nother output")
         self.assertNotIn("deadbeef", tail)
@@ -253,6 +298,47 @@ class SessionPreflightTests(unittest.TestCase):
         self.assertEqual(output.getvalue().splitlines()[-1], edl_runner.EDL_SESSION_USED_NOTE)
         self.assertIn("a verified backup already exists", errors.getvalue())
 
+    def test_dry_run_refuses_after_a_real_verified_backup_in_a_fresh_fake_session(self):
+        self.add_usb("1-1", "05c6", "9008", "001", "009")
+        cli_edl_dir = self.base / "verified-backup-edl-tools"
+        cli_edl_dir.mkdir()
+        client = cli_edl_dir / "edl"
+        shutil.copy2(self.shim, client)
+        client.chmod(0o700)
+        shutil.copy2(self.loader, cli_edl_dir / edl_runner.LOADER_NAME)
+        home = self.base / "verified-backup-home"
+        environment = dict(self.env, OPENSTICK_EDL_DIR=str(cli_edl_dir),
+                           PATH=str(cli_edl_dir) + os.pathsep + "/usr/bin:/bin")
+        backup_output, backup_error = io.StringIO(), io.StringIO()
+        with self.patch_loader_pin(), mock.patch.dict(os.environ, environment, clear=True), \
+                contextlib.redirect_stdout(backup_output), contextlib.redirect_stderr(backup_error):
+            result = cli.main(["--home", str(home), "backup"], usb_sysfs_root=self.sysfs,
+                              usb_device_root=self.base / "dev-fixture")
+        self.assertEqual(result, cli.EXIT_OK, backup_error.getvalue())
+        self.assertIn("Verified backup", backup_output.getvalue())
+        self.assertIn("de****ef", backup_output.getvalue())
+        self.assertNotIn("deadbeef", backup_output.getvalue())
+        device = store.load_registry(home)["devices"][0]
+        self.assertEqual(device["id"], "deadbeef")
+        manifest_path = home / "backups" / "deadbeef" / device["backups"][0]["id"] / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        self.assertEqual(manifest["verified_by"], ["full-read-size", "gpt-primary-and-backup-crc", "sha256"])
+        self.assertEqual(int((self.base / "session-state").read_text()), 2)
+
+        power_cycle = subprocess.run([str(ROOT / "tests/shims/bin/edl-power-cycle"),
+                                      str(self.base / "session-state")], capture_output=True, text=True)
+        self.assertEqual(power_cycle.returncode, 0, power_cycle.stderr)
+        dry_output, dry_error = io.StringIO(), io.StringIO()
+        with self.patch_loader_pin(), mock.patch.dict(os.environ, environment, clear=True), \
+                contextlib.redirect_stdout(dry_output), contextlib.redirect_stderr(dry_error):
+            result = cli.main(["--home", str(home), "--dry-run", "backup"],
+                              usb_sysfs_root=self.sysfs, usb_device_root=self.base / "dev-fixture")
+        self.assertEqual(result, cli.EXIT_REFUSED)
+        self.assertIn("a verified backup already exists", dry_error.getvalue())
+        self.assertNotIn("DRY RUN", dry_output.getvalue())
+        self.assertEqual(dry_output.getvalue().splitlines()[-1], edl_runner.EDL_SESSION_USED_NOTE)
+        self.assertEqual(int((self.base / "session-state").read_text()), 1)
+
     def test_cli_restore_refusal_after_edl_emits_exact_session_note(self):
         import importlib.util
         spec = importlib.util.spec_from_file_location(
@@ -279,7 +365,7 @@ class SessionPreflightTests(unittest.TestCase):
 
 
 STATEFUL_EDL_SHIM = r'''#!/usr/bin/env python3
-import os, pathlib, shutil, sys
+import os, pathlib, shutil, signal, sys, time
 args = sys.argv[1:]
 operation = args[0]
 positionals = [arg for arg in args[1:] if not arg.startswith("--")]
@@ -294,6 +380,13 @@ if calls == 1:
     print("PK_HASH:           0x" + "0" * 64)
     print("Serial:            0xdeadbeef")
     print("sahara - Loader successfully uploaded.")
+    if os.environ.get("HANG_IDENTITY"):
+        def interrupted(signum, frame):
+            print("[!] Exiting cleanly…", flush=True)
+            raise SystemExit(130)
+        signal.signal(signal.SIGINT, interrupted)
+        while True:
+            time.sleep(1)
 else:
     print("main - Device detected :)")
     print("main - Mode detected: firehose")
