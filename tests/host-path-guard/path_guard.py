@@ -28,8 +28,7 @@ def _check(value):
         raise RuntimeError("TEST SAFETY GUARD blocked host USB path access")
 
 
-def _inside_test_tmp(path, env):
-    root = env.get("TMPDIR")
+def _inside_test_tmp(path, root):
     if not root:
         return False
     try:
@@ -38,7 +37,7 @@ def _inside_test_tmp(path, env):
         return False
 
 
-def _guard_edl_process(command, env):
+def _guard_edl_process(command, env, temp_root=None):
     if isinstance(command, (str, bytes, os.PathLike)):
         try:
             argv = shlex.split(os.fsdecode(command))
@@ -63,16 +62,25 @@ def _guard_edl_process(command, env):
     is_edl = client is not None or loader is not None
     if not is_edl:
         return
+    temp_root = temp_root if temp_root is not None else env.get("TMPDIR")
     if client is not None:
         resolved = client if os.path.sep in client else shutil.which(client, path=env.get("PATH"))
-        if not resolved or not _inside_test_tmp(resolved, env):
+        if not resolved or not _inside_test_tmp(resolved, temp_root):
             raise RuntimeError("TEST SAFETY GUARD blocked EDL client outside the test temp directory")
-    if loader and not _inside_test_tmp(loader, env):
+    if loader and not _inside_test_tmp(loader, temp_root):
         raise RuntimeError("TEST SAFETY GUARD blocked EDL loader outside the test temp directory")
 
 
 def _guarded_popen(command, *args, **kwargs):
-    _guard_edl_process(command, kwargs.get("env") or os.environ)
+    runner_tmp = os.environ.get("TMPDIR")
+    child_env = dict(os.environ if kwargs.get("env") is None else kwargs["env"])
+    if runner_tmp:
+        child_env["TMPDIR"] = runner_tmp
+    guard_path = os.path.dirname(os.path.abspath(__file__))
+    existing_pythonpath = child_env.get("PYTHONPATH", "")
+    child_env["PYTHONPATH"] = guard_path + (os.pathsep + existing_pythonpath if existing_pythonpath else "")
+    kwargs["env"] = child_env
+    _guard_edl_process(command, child_env, temp_root=runner_tmp)
     return _REAL_POPEN(command, *args, **kwargs)
 
 
@@ -80,7 +88,7 @@ def guard_current_edl_script():
     script = sys.argv[0] if sys.argv else ""
     name = os.path.basename(script).lower()
     if (name.startswith("edl") and name != "edl-power-cycle") or name == "edl.py":
-        if not _inside_test_tmp(script, os.environ):
+        if not _inside_test_tmp(script, os.environ.get("TMPDIR")):
             raise RuntimeError("TEST SAFETY GUARD blocked EDL client outside the test temp directory")
         _guard_edl_process([script, *sys.argv[1:]], os.environ)
 
