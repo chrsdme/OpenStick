@@ -29,6 +29,10 @@ The separate installer wrapper is documented in [docs/INSTALLER.md](docs/INSTALL
 
 Each wizard stage is invoked separately with `--stage`; see the installer guide for backup, seed, build, flash and restore requirements. Do not run backup or write stages against a physical device without owner-supervised hardware acceptance. Passing `doctor` does not establish board, firmware, image or boot compatibility.
 
+### EDL sessions
+
+The first command that talks to the board after entering EDL reads the Sahara identity. Every command that talks to the board consumes that session. Before another board command, unplug USB for 30 seconds, reconnect without holding the button, and re-enter EDL. Never use `edl reset`.
+
 ## Host requirements (Debian/Ubuntu names)
 
 `git debootstrap debian-archive-keyring qemu-user-binfmt device-tree-compiler gdisk fdisk android-sdk-libsparse-utils
