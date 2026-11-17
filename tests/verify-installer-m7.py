@@ -544,6 +544,12 @@ class WizardTests(unittest.TestCase):
                    OPENSTICK_EDL_SESSION_FILE=str(self.tmp / "edl-session"),
                    OPENSTICK_EDL_DIR=str(bin_dir),
                    PATH=str(bin_dir) + ":" + str(ROOT / "tests/shims/bin") + ":/usr/bin:/bin")
+        usb_fixture = _FIXTURE_SYSFS / "1-1"
+        usb_fixture.mkdir()
+        self.addCleanup(__import__("shutil").rmtree, usb_fixture, ignore_errors=True)
+        for name, value in (("idVendor", "05c6"), ("idProduct", "9008"),
+                            ("busnum", "001"), ("devnum", "009")):
+            (usb_fixture / name).write_text(value + "\n", encoding="ascii")
 
         # A valid seed and registered generic build are fixture inputs; the
         # wizard still calls the real parser/manifest validators and injector.

@@ -404,7 +404,10 @@ def _execute(args, home, repo, stage, state):
         if state["selection"].get("backup_id"):
             _device_and_backup(home, state["selection"])
             return EXIT_OK
-        return cli.backup_command(_args_for(args, stage, state, home), home)
+        prepared = _args_for(args, stage, state, home)
+        from . import edl_runner
+        with edl_runner.Session(sysfs_root=prepared.usb_sysfs_root) as session:
+            return cli.backup_command(prepared, home, session=session)
     if stage == "configure":
         from . import configure
         selected = state["selection"]

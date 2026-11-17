@@ -6,6 +6,7 @@ import json
 import os
 import pathlib
 import subprocess
+import shlex
 import sys
 import tempfile
 import types
@@ -534,8 +535,18 @@ class M4Tests(unittest.TestCase):
         edl = str(pathlib.Path(args.edl_dir) / "edl")
         from contextlib import redirect_stdout
         captured = io.StringIO()
+        real_invoke = flash_module._invoke
+        proxy_configs = []
+        def inspect_proxy_invoke(command, phase_env):
+            proxy_command = shlex.split(phase_env["EDL_CMD"])
+            self.assertEqual(proxy_command[0], sys.executable)
+            proxy_script = pathlib.Path(proxy_command[1])
+            config = json.loads(proxy_script.with_suffix(proxy_script.suffix + ".json").read_text())
+            proxy_configs.append((proxy_command, config))
+            return real_invoke(command, phase_env)
         with mock.patch.dict(os.environ, env, clear=True), \
              mock.patch.object(flash_module.common, "LOADER_SHA256", digest(pathlib.Path(args.image_set) / "loader/prog_emmc_firehose_8916.mbn")), \
+             mock.patch.object(flash_module, "_invoke", side_effect=inspect_proxy_invoke), \
              redirect_stdout(captured):
             self.assertEqual(flash_module.flash_command(args, self.home, self.repo), 0)
         calls = pathlib.Path(args.edl_exec_log).read_text().splitlines()
@@ -543,7 +554,11 @@ class M4Tests(unittest.TestCase):
         self.assertTrue(all("--loader=" in line and "--memory=emmc" in line for line in calls), calls)
         self.assertTrue(any(" rs " in line for line in calls), calls)
         self.assertTrue(all(line.startswith(edl + " ") for line in calls), calls)
-        self.assertIn("EDL command: " + edl, captured.getvalue())
+        self.assertTrue(proxy_configs)
+        self.assertTrue(all(config["client"] == [edl] for _proxy, config in proxy_configs), proxy_configs)
+        self.assertTrue(all(config["loader"] == str(pathlib.Path(args.edl_dir) / flash_module.edl_runner.LOADER_NAME)
+                            for _proxy, config in proxy_configs), proxy_configs)
+        self.assertIn("EDL command: ", captured.getvalue())
 
     def test_flash_dry_confirmation_protocol_and_failure_stop(self):
         args, dev, identity, env = self._flash_fixture()

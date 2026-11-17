@@ -25,6 +25,14 @@ class EdlRunnerTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory(prefix="openstick-m2-")
         self.addCleanup(self.temp.cleanup)
         self.base = pathlib.Path(self.temp.name)
+        self.usb_sysfs_root = self.base / "sysfs"
+        self.usb_device_root = self.base / "dev"
+        usb = self.usb_sysfs_root / "1-1"
+        usb.mkdir(parents=True)
+        self.usb_device_root.mkdir()
+        for name, value in (("idVendor", "05c6"), ("idProduct", "9008"),
+                            ("busnum", "001"), ("devnum", "009")):
+            (usb / name).write_text(value + "\n", encoding="ascii")
         self.old_ceiling = os.environ.get("GIT_CEILING_DIRECTORIES")
         os.environ["GIT_CEILING_DIRECTORIES"] = str(self.base.parent)
         self.addCleanup(self._restore_ceiling)
@@ -68,7 +76,8 @@ class EdlRunnerTests(unittest.TestCase):
         output = io.StringIO()
         with mock.patch.dict(os.environ, environment, clear=True), self._with_fixture_pin(), \
                 contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
-            status = cli.main(argv)
+            status = cli.main(argv, usb_sysfs_root=self.usb_sysfs_root,
+                              usb_device_root=self.usb_device_root)
         return status, output.getvalue(), environment
 
     def test_backup_identity_uses_sahara_serial_and_required_loader_flags(self):
@@ -134,10 +143,11 @@ class EdlRunnerTests(unittest.TestCase):
         with mock.patch.dict(os.environ, env, clear=True), self._with_fixture_pin(), \
                 mock.patch.object(edl_runner, "IDENTITY_READ_TIMEOUT_SECONDS", 0.15), \
                 contextlib.redirect_stderr(output), contextlib.redirect_stdout(output):
-            result = cli.main(args)
-        self.assertEqual(result, cli.EXIT_ERROR)
+            result = cli.main(args, usb_sysfs_root=self.usb_sysfs_root,
+                              usb_device_root=self.usb_device_root)
+        self.assertEqual(result, cli.EXIT_REFUSED)
         self.assertIn("Unplug USB for 30 s", output.getvalue())
-        self.assertIn("[!] Exiting cleanly", output.getvalue())
+        self.assertIn("The EDL client started the handshake but the board stopped responding", output.getvalue())
         self.assertTrue((self.base / "signal-seen").exists(), "shim did not observe SIGINT")
         self.assertFalse((home / "registry.json").exists())
         self.assertFalse(list((home / "backups").glob("**/manifest.json")))

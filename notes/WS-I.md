@@ -64,5 +64,8 @@ The M6 generated restore runner reuses captured identity across its multi-call r
 ## Phase 2 validation
 
 - Focused Session lifecycle: **17 PASS / 0 FAIL / 0 SKIP**.
+- Final focused suites after integration-test repairs: M2 **13/13**, M4 **25/25**, M5 **25/25**, and M7 **27/27**.
+- M2 now asserts the typed HUNG refusal and uses fixture sysfs/dev roots; M4 verifies that the generated EDL proxy config points to the resolved fake client and pinned loader, while actual proxy calls preserve loader and memory flags. M5 fake-live helpers seed the passed Session identity before proxy use.
+- Wizard backup now passes its injected sysfs root into a scoped Session. The M7 fake-board integration creates and removes its synthetic 05c6:9008 sysfs entry around the backup flow.
 - M6 was not green: the last completed focused run failed in the generated install positive E2E with fake client exit status 1. A later diagnostic attempt was interrupted and produced no further evidence. The host path guard blocked no attempted access in the completed run; fixture roots were injected and cleaned.
 - Phase 2 secret-scan classifications: **SCAN-HIT FAKE-FIXTURE only** for synthetic transcript identifiers and test-only serial strings. No stop-class secret hit was found.
