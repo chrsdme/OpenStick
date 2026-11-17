@@ -16,6 +16,18 @@ from unittest import mock
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+def run_test_process(command, *args, **kwargs):
+    """Run non-interactive test children with bounded time and closed stdin."""
+    kwargs.setdefault("stdin", subprocess.DEVNULL)
+    kwargs.setdefault("timeout", 120)
+    return subprocess.run(command, *args, **kwargs)
+
+def check_test_process(command, *args, **kwargs):
+    """check_call equivalent with closed stdin and a per-process timeout."""
+    kwargs.setdefault("stdin", subprocess.DEVNULL)
+    kwargs.setdefault("timeout", 120)
+    return subprocess.check_call(command, *args, **kwargs)
+
 from tools.installer import edl_runner, store
 from tools.installer import cli, flash, packages, verify_restore
 
@@ -38,7 +50,7 @@ class SessionPreflightTests(unittest.TestCase):
         self.loader = self.edl_dir / edl_runner.LOADER_NAME
         self.loader.write_bytes(b"synthetic pinned loader fixture")
         self.disk = self.base / "fake-emmc.bin"
-        subprocess.check_call([sys.executable, str(ROOT / "tests/make-fake-emmc.py"),
+        check_test_process([sys.executable, str(ROOT / "tests/make-fake-emmc.py"),
                                str(self.disk), "--mib", "2"])
         self.env = dict(os.environ, OPENSTICK_FAKE_EMMC=str(self.disk),
                         OPENSTICK_EDL_SESSION_FILE=str(self.base / "session-state"))
@@ -229,11 +241,11 @@ class SessionPreflightTests(unittest.TestCase):
                     proxy = session.proxy_command(self.base / "edl-session-proxy.py")
                     target = self.base / "proxy-read.bin"
                     args = proxy + ["rf", str(target), "--loader=" + str(self.loader), "--memory=emmc"]
-                    first = subprocess.run(args, capture_output=True, text=True)
+                    first = run_test_process(args, capture_output=True, text=True)
                     self.assertEqual(first.returncode, 0, first.stderr)
                     self.assertTrue(target.is_file())
                     (self.sysfs / "1-1" / "devnum").write_text("010\n")
-                    changed = subprocess.run(args, capture_output=True, text=True)
+                    changed = run_test_process(args, capture_output=True, text=True)
         self.assertNotEqual(changed.returncode, 0)
         self.assertIn("bus/device number changed", changed.stderr)
         self.assertEqual(int((self.base / "session-state").read_text()), 2)
@@ -325,7 +337,7 @@ class SessionPreflightTests(unittest.TestCase):
         self.assertEqual(manifest["verified_by"], ["full-read-size", "gpt-primary-and-backup-crc", "sha256"])
         self.assertEqual(int((self.base / "session-state").read_text()), 2)
 
-        power_cycle = subprocess.run([str(ROOT / "tests/shims/bin/edl-power-cycle"),
+        power_cycle = run_test_process([str(ROOT / "tests/shims/bin/edl-power-cycle"),
                                       str(self.base / "session-state")], capture_output=True, text=True)
         self.assertEqual(power_cycle.returncode, 0, power_cycle.stderr)
         dry_output, dry_error = io.StringIO(), io.StringIO()
