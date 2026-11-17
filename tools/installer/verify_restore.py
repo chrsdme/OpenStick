@@ -714,9 +714,20 @@ def _safe_helper_stderr_line(stderr):
     if not lines:
         return ""
     line = edl_runner._tail("", lines[-1]).splitlines()[-1]
-    # The helper's scratch files live outside the user's store. Do not expose
-    # any absolute path the helper may include in its diagnostic.
-    return re.sub(r"(?<![A-Za-z0-9_.-])/(?:[^\s]+)", "[path]", line)[:240]
+    # R-5.6: mask any run of 8 or more hex digits (with or without 0x, after
+    # "serial", "SERIAL=" or anywhere). Over-masking is the safe direction.
+    line = re.sub(r"(?:0[xX])?[0-9A-Fa-f]{8,}", "[hex]", line)
+    # Mask every whitespace-separated token containing "/" (absolute, relative,
+    # "..", quoted). Paths may contain spaces, so from the first such token
+    # (leading quote or bracket characters kept) everything to the end of the
+    # line is replaced. The helper's scratch files live outside the user's store.
+    for match in re.finditer(r"\S+", line):
+        token = match.group(0)
+        if "/" in token:
+            lead = len(token) - len(token.lstrip("'\"`([{<"))
+            line = line[:match.start() + lead] + "[path]"
+            break
+    return line[:240]
 
 
 def _run_fwlib_phase(engine, edl, env, loader, prepared, work, write,

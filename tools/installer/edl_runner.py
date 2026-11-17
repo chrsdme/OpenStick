@@ -16,7 +16,40 @@ from . import store
 
 PINNED_LOADER_SHA256 = "959439aa5864685999b713c3ed12ad5fa408149648b670a9a9ef77bcc9dcab14"
 LOADER_NAME = "prog_emmc_firehose_8916.mbn"
-DEFAULT_USB_SYSFS_ROOT = os.environ.get("OPENSTICK_USB_SYSFS_ROOT", "/sys/bus/usb/devices")
+REAL_USB_SYSFS_ROOT = "/sys/bus/usb/devices"
+REAL_USB_DEVICE_ROOT = "/dev/bus/usb"
+# R-5.5: a plain exported OPENSTICK_USB_*_ROOT must never steer the 9008
+# preflight. The override is honoured only when OPENSTICK_TEST_USB_ROOTS_DIR
+# (a second marker, set by the test runner or the test itself) names an
+# existing directory AND the override resolves inside it. Anything else is
+# ignored silently and the real root is used.
+USB_ROOTS_MARKER_ENV = "OPENSTICK_TEST_USB_ROOTS_DIR"
+
+
+def usb_root_from_env(name, default):
+    value = os.environ.get(name)
+    marker = os.environ.get(USB_ROOTS_MARKER_ENV)
+    if not value or not marker:
+        return default
+    try:
+        marker_dir = os.path.realpath(marker)
+        resolved = os.path.realpath(value)
+        if (not os.path.isabs(marker) or not os.path.isabs(value) or marker_dir == os.sep
+                or not os.path.isdir(marker_dir)
+                or os.path.commonpath([marker_dir, resolved]) != marker_dir):
+            return default
+    except (OSError, ValueError):
+        return default
+    return value
+
+
+def default_usb_sysfs_root():
+    return usb_root_from_env("OPENSTICK_USB_SYSFS_ROOT", REAL_USB_SYSFS_ROOT)
+
+
+def default_usb_device_root():
+    return usb_root_from_env("OPENSTICK_USB_DEVICE_ROOT", REAL_USB_DEVICE_ROOT)
+
 IDENTITY_READ_TIMEOUT_SECONDS = 60
 RANGE_READ_TIMEOUT_SECONDS = 60
 FULL_READ_TIMEOUT_SECONDS = 3600
@@ -73,8 +106,13 @@ class PreflightResult:
     devnum: str = ""
 
 
-def preflight(sysfs_root=DEFAULT_USB_SYSFS_ROOT):
+_ENV_ROOT = object()
+
+
+def preflight(sysfs_root=_ENV_ROOT):
     """Inspect fixture-injectable USB sysfs metadata without opening /dev nodes."""
+    if sysfs_root is _ENV_ROOT:
+        sysfs_root = default_usb_sysfs_root()
     if sysfs_root is None:
         return PreflightResult("UNKNOWN")
     root = Path(sysfs_root)
@@ -128,9 +166,9 @@ def _absent_error():
 class Session:
     """Own identity and USB bus/devnum for one top-level installer command."""
 
-    def __init__(self, *, sysfs_root=DEFAULT_USB_SYSFS_ROOT, client=None,
+    def __init__(self, *, sysfs_root=_ENV_ROOT, client=None,
                  loader=None, env=None):
-        self.sysfs_root = sysfs_root
+        self.sysfs_root = default_usb_sysfs_root() if sysfs_root is _ENV_ROOT else sysfs_root
         self.client = client
         self.loader = loader
         self.env = env
