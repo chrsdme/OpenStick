@@ -8,6 +8,8 @@ Use Linux with Debian 12 Bookworm and Python 3.9 or newer. The launcher uses the
 
 `doctor` resolves the same EDL client and SHA-256-pinned Firehose loader used by backup and flash. It scans `/sys/bus/usb/devices` for a Qualcomm `05c6:9008` EDL device and checks read/write access to that device node. With no EDL device attached, USB access is reported as INFO and does not fail doctor. If access fails, the output recommends a narrow `uaccess` udev rule for `05c6:9008`; doctor never changes system files.
 
+Doctor does not invoke the EDL client, so it cannot determine whether an attached device has a fresh or consumed Sahara session. When a 9008 device is present it reports that the session state is unknown until the first command; an absent device or a connected Qualcomm device in normal mode is reported separately.
+
 The private store path uses this precedence: `--home DIR`, `OPENSTICK_HOME`, `${XDG_DATA_HOME}/openstick`, then `~/.local/share/openstick`. The store must be outside every Git worktree, must not pass through symlinks, and is created with private directory and file permissions. Keep backups and personalized artifacts on encrypted storage and make a second offline copy of a verified backup. A full eMMC backup contains unique identity and calibration data; do not share it or put it in Git.
 
 The current registry uses a single `registry.json` plus an append-only `events.jsonl` in the store root. It does not use the specification's per-device `devices/<id>/device.json` and per-device event files. Seed application history is recorded in the registry; other device details remain in its device entry.
@@ -46,6 +48,10 @@ The synthetic M7 wizard run exercises the preparation stages, SSH evidence parsi
 ## Backup and identity
 
 A backup must be a complete verified eMMC read with a valid primary and secondary GPT and matching `fsg`, `sec` and `fsc` fingerprints. The restore path compares the live EDL serial and identity fingerprints with the selected backup before writing. Identity is not inferred across EDL, Android or fastboot mode transitions. Stop if the live identity cannot be read or does not match.
+
+The manifest's default `verified_by` entries are `full-read-size`, `gpt-primary-and-backup-crc`, and `sha256`. They record internal completeness and consistency checks; they do not mean the device was read a second time or compared with the board. `backup --paranoid` performs the stronger check by taking a second full read and comparing it with the first; its manifest also records `paranoid-second-read`.
+
+The expected differences between the pristine dump and a post-boot backup are `modemst1`, `modemst2`, `system` (1 MiB chunk), `persist` (3 MiB chunks), `cache`, `recovery` (1 MiB chunk), and `userdata`. These observed differences are expected and are not alarms.
 
 Backups include all partitions and are sensitive. Keep the whole backup, manifest and checksums together. Do not omit calibration or identity partitions. Restore uses the existing rollback plan and its phase ordering; each destructive phase has its own dry-run and typed confirmation. A failure or power interruption requires manual device-state inspection and explicit reconciliation. Never retry a possibly partial write automatically.
 

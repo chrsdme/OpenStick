@@ -12,6 +12,10 @@ Nothing here was executed on the board. `tools/rollback-plan.sh` only PRINTS com
 | Partition table of that dump | `.../6-Alb-Stick-4313d69f-emmc-user-partitions.csv` (UTF-8 with BOM; `end_lba` inclusive) |
 | Original GPTs | `~/openstick/gpt-6-primary.bin` (34 sectors, sha256 `34c8a2d9...ace04ea`), `gpt-6-secondary.bin` (33 sectors, `91538825...c2861a5`) |
 
+## EDL sessions
+
+The first command that talks to the board after entering EDL reads the Sahara identity. Every command that talks to the board consumes that session. Before another board command, unplug USB for 30 seconds, reconnect without holding the button, and re-enter EDL. Never use `edl reset`.
+
 ```sh
 tools/rollback-plan.sh --dump <dump.bin> --csv <partitions.csv> --primary <gpt-6-primary.bin> --secondary <gpt-6-secondary.bin> \
     [--work <private dir>] [--loader <prog_emmc_firehose_8916.mbn>] [--compare <full re-read.bin>]
