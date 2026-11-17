@@ -134,6 +134,11 @@ def parser():
     prepare.add_argument("--output", required=True, metavar="DIR")
     image_verify = image_sub.add_parser("verify", help="read-only verification of a prepared GPT-T image set")
     image_verify.add_argument("path", metavar="DIR")
+    easy = subs.add_parser("easy", help="one linear interactive flow: EDL, backup, build, flash (see docs/INSTALLER.md)")
+    easy.add_argument("--yes", action="store_true", help="accept the defaults and skip the single YES confirmation")
+    easy.add_argument("--image-set", metavar="DIR", help="use a prepared GPT-T image set (skips build and mode)")
+    easy.add_argument("--build", metavar="ID", help="use an already registered build (skips build and mode)")
+    easy.add_argument("--verify-full", action="store_true", help="after writing, read the whole eMMC (about 4 minutes) and compare")
     wizard = subs.add_parser("wizard", help="run or resume one explicit installer workflow stage")
     wizard.add_argument("--id", dest="wizard_id", metavar="ID")
     wizard.add_argument("--stage", choices=("doctor", "backup", "configure", "build", "inject", "flash", "verify", "restore", "package"))
@@ -654,6 +659,13 @@ def main(argv=None, *, usb_sysfs_root=None, usb_device_root=None):
             from . import imageset
             return imageset.verify_command(args.path)
         root = store.ensure_store(args.home)
+        if args.command == "easy":
+            from . import easy
+            if args.image_set and args.build:
+                print("REFUSED: use either --image-set or --build, not both", file=sys.stderr)
+                return EXIT_REFUSED
+            return easy.run(args, root, Path(__file__).resolve().parents[2],
+                            usb_sysfs_root=usb_sysfs_root, usb_device_root=usb_device_root)
         if args.command in ("backup", "flash", "restore"):
             session = edl_runner.Session(sysfs_root=usb_sysfs_root)
             with session:
