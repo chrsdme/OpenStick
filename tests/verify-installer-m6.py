@@ -425,7 +425,7 @@ import errno, os, shutil, sys
 from pathlib import Path
 disk=Path(%r); a=sys.argv[1:]; op=a[0]
 with Path(%r).open('a') as f: f.write(' '.join(a)+'\\n')
-session=Path(os.environ['OPENSTICK_EDL_SESSION_FILE'])
+session=Path(%r + '.session')
 loader=next((x.split('=',1)[1] for x in a if x.startswith('--loader=')), '')
 memory=next((x.split('=',1)[1] for x in a if x.startswith('--memory=')), '')
 if not loader.startswith('/') or memory!='emmc': print('FAKE EDL ASSERTION FAILED: required loader and memory flags missing',file=sys.stderr); raise SystemExit(91)
@@ -470,7 +470,7 @@ if op=='ws':
   shutil.copyfileobj(src,dst,1048576)
  raise SystemExit(0)
 raise SystemExit(2)
-''' % (str(live_path), str(log_path)), encoding="utf-8")
+''' % (str(live_path), str(log_path), str(log_path)), encoding="utf-8")
     os.chmod(edl, 0o700)
     simg2img = directory / "simg2img"
     simg2img.write_text("#!/bin/sh\ncp -- \"$1\" \"$2\"\n", encoding="utf-8")
@@ -930,6 +930,8 @@ def run():
         assert rc == 2 and "stopped after GPT" in install_output, (
             rc, install_output[-5000:],
             install_edl_log.read_text(errors="replace")[-5000:] if install_edl_log.exists() else "no fake EDL calls logged")
+        assert pathlib.Path(str(install_edl_log) + ".session").read_text() == "used"
+        assert len(install_edl_log.read_text().splitlines()) > 1
         assert not fastboot_log.exists() or fastboot_log.read_text(encoding="utf-8") == "", "standalone first-install unexpectedly invoked fastboot"
         assert confirmations == {"flash deadbeef gpt"}, confirmations
         actual_writes = [line.split() for line in install_edl_log.read_text().splitlines()
