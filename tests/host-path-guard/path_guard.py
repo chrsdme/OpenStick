@@ -47,20 +47,18 @@ def _guard_edl_process(command, env, temp_root=None):
         argv = [os.fsdecode(item) for item in command]
     if not argv:
         return
-    client = None
-    for item in argv[:3]:
+    def looks_like_edl_client(item):
         name = os.path.basename(item).lower()
-        if (name.startswith("edl") and name != "edl-power-cycle") or name == "edl.py":
-            client = item
-            break
+        return (name.startswith("edl") and name != "edl-power-cycle") or name == "edl.py"
+
+    client = next((item for item in argv[:3] if looks_like_edl_client(item)), None)
     loader = None
     for index, item in enumerate(argv):
         if item.startswith("--loader="):
             loader = item.split("=", 1)[1]
         elif item == "--loader" and index + 1 < len(argv):
             loader = argv[index + 1]
-    is_edl = client is not None or loader is not None
-    if not is_edl:
+    if client is None:
         return
     temp_root = temp_root if temp_root is not None else env.get("TMPDIR")
     if client is not None:
