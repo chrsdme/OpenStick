@@ -1,0 +1,518 @@
+"""Shared fixtures for the `openstick easy` test groups (tests/groups/easy-*.py).
+
+Everything here is test-only: a fake board (shim edl with opt-in writes + a full-size sparse fake eMMC + a fake USB sysfs
+tree, all inside the runner temp dir), synthetic images and an expect-style pty driver. No real sysfs, no sudo, no
+hardware. Interface guesses about the easy command (prompt wording) live in the CONSTANTS block.
+"""
+import contextlib
+import errno
+import json
+import os
+import pathlib
+import re
+import select
+import shutil
+import signal
+import struct
+import subprocess
+import sys
+import threading
+import time
+import types
+import uuid
+import zlib
+
+# ---------------------------------------------------------------- CONSTANTS (the easy command's user-facing text)
+EASY_COMMAND = ["easy"]
+FLAG_YES = "--yes"
+FLAG_IMAGE_SET = "--image-set"
+FLAG_BUILD = "--build"
+POLL_ENV = {"OPENSTICK_EASY_POLL_TIMEOUT": "3", "OPENSTICK_EASY_POLL_INTERVAL": "0.2"}
+RE_INSTRUCTION = r"Hold the button"
+RE_CONFIRM = r"Type YES"
+RE_REUSE = r"(?i)reuse it"
+RE_MODE = r"\[1\] default"
+RE_STEP6 = r"Step 6/9"
+
+EMMC_SECTORS = 7634944
+SECTOR = 512
+QUIET = 0.4  # seconds without output before a prompt is answered
+
+
+# ---------------------------------------------------------------- generic helpers
+def strip_ansi(text):
+    return re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", text).replace("\r", "")
+
+
+def must_fail(function, *args, **kwargs):
+    """Mutation proof helper: the check MUST raise AssertionError on the deliberately broken input."""
+    try:
+        function(*args, **kwargs)
+    except AssertionError:
+        return True
+    raise SystemExit("MUTATION SURVIVED: check %s accepted a deliberately broken input" % function.__name__)
+
+
+class Rule:
+    """Answer a prompt: reply text (sent with newline), or run `action` immediately when the pattern shows up."""
+
+    def __init__(self, pattern, reply=None, fires=1, action=None):
+        self.pattern, self.reply, self.fires, self.action = re.compile(pattern), reply, fires, action
+
+
+def run_pty(argv, env, rules, timeout=300, cwd=None):
+    """Run argv under a pty and answer prompts from `rules` (each at most `fires` times). Returns (rc, transcript).
+
+    Reply rules fire only on text printed since the last reply, after QUIET seconds of silence, so a prompt is answered
+    only once it is fully shown. Action rules fire as soon as their pattern appears."""
+    pid, fd = os.forkpty()
+    if pid == 0:
+        try:
+            if cwd:
+                os.chdir(cwd)
+            os.execvpe(argv[0], argv, env)
+        finally:
+            os._exit(127)
+    out, mark, last = "", 0, time.monotonic()
+    deadline = last + timeout
+    fires = {id(rule): rule.fires for rule in rules}
+    action_pos = {id(rule): 0 for rule in rules}
+    try:
+        while True:
+            if time.monotonic() > deadline:
+                with contextlib.suppress(ProcessLookupError):
+                    os.kill(pid, signal.SIGKILL)
+                os.waitpid(pid, 0)
+                raise AssertionError("pty run timed out; transcript tail:\n" + strip_ansi(out)[-1500:])
+            ready, _, _ = select.select([fd], [], [], 0.1)
+            if ready:
+                try:
+                    chunk = os.read(fd, 65536)
+                except OSError:
+                    chunk = b""
+                if not chunk:
+                    break
+                out += chunk.decode("utf-8", "replace")
+                last = time.monotonic()
+                plain = strip_ansi(out)
+                for rule in rules:
+                    if rule.action and fires[id(rule)] > 0:
+                        match = rule.pattern.search(plain, action_pos[id(rule)])
+                        if match:
+                            fires[id(rule)] -= 1
+                            action_pos[id(rule)] = match.end()
+                            rule.action()
+                continue
+            if time.monotonic() - last >= QUIET:
+                tail = strip_ansi(out[mark:])
+                best = None
+                for rule in rules:
+                    if rule.action or fires[id(rule)] <= 0:
+                        continue
+                    match = rule.pattern.search(tail)
+                    if match and (best is None or match.start() < best[0]):
+                        best = (match.start(), rule)
+                if best:
+                    fires[id(best[1])] -= 1
+                    os.write(fd, (best[1].reply + "\n").encode())
+                    mark = len(out)
+                    last = time.monotonic()
+        _, status = os.waitpid(pid, 0)
+        return os.waitstatus_to_exitcode(status), strip_ansi(out)
+    finally:
+        with contextlib.suppress(OSError):
+            os.close(fd)
+
+
+# ---------------------------------------------------------------- sparse-file comparison
+def data_extents(path):
+    """(start, end) byte ranges that hold data (sparse holes are skipped); the whole file if holes are not reported."""
+    extents, size = [], os.stat(path).st_size
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        position = 0
+        while position < size:
+            try:
+                start = os.lseek(fd, position, os.SEEK_DATA)
+            except OSError as exc:
+                if exc.errno == errno.ENXIO:
+                    break
+                return [(0, size)]
+            end = os.lseek(fd, start, os.SEEK_HOLE)
+            extents.append((start, end))
+            position = end
+    finally:
+        os.close(fd)
+    return extents
+
+
+def _merge(ranges):
+    merged = []
+    for start, end in sorted(ranges):
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def check_layout(final_path, initial_path, overlays, chunk=1 << 20):
+    """Assert final == initial with `overlays` [(byte offset, bytes)] applied, byte for byte, on a sparse 3.9 GB image."""
+    final_path, initial_path = pathlib.Path(final_path), pathlib.Path(initial_path)
+    size = max([initial_path.stat().st_size] + [offset + len(data) for offset, data in overlays])
+    assert final_path.stat().st_size == size, "final disk size %d, expected %d" % (final_path.stat().st_size, size)
+    ranges = _merge(data_extents(final_path) + data_extents(initial_path) +
+                    [(offset, offset + len(data)) for offset, data in overlays])
+    with final_path.open("rb") as final, initial_path.open("rb") as initial:
+        for start, end in ranges:
+            position = start
+            while position < end:
+                length = min(chunk, end - position)
+                final.seek(position)
+                got = final.read(length).ljust(length, b"\0")
+                initial.seek(position)
+                expect = bytearray(initial.read(length).ljust(length, b"\0"))
+                for offset, data in overlays:
+                    lo, hi = max(offset, position), min(offset + len(data), position + length)
+                    if lo < hi:
+                        expect[lo - position:hi - position] = data[lo - offset:hi - offset]
+                if bytes(expect) != got:
+                    first = next(i for i, (a, b) in enumerate(zip(expect, got)) if a != b)
+                    raise AssertionError("final disk differs from the expected layout at byte %d (sector %d)"
+                                         % (position + first, (position + first) // SECTOR))
+                position += length
+
+
+def same_files(a, b):
+    try:
+        check_layout(a, b, [])
+    except AssertionError:
+        return False
+    return True
+
+
+# ---------------------------------------------------------------- synthetic images and the fake original disk
+def _gptool(root):
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("easy_test_gptool", pathlib.Path(root) / "scripts/gptool.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+# Stock-like layout of the fake board: names and sizes follow what tools/gen-gpt-tz1m.py and the GPT-T adapter require
+# (tz and tzbak 1024 sectors and adjacent; boot/system/userdata at the documented LBAs). All data is synthetic.
+FAKE_PARTITIONS = [
+    ("sbl1", 1024, 2047), ("rpm", 2048, 3071), ("tz", 3072, 4095), ("tzbak", 4096, 5119), ("hyp", 5120, 6143),
+    ("aboot", 6144, 8191), ("fsg", 8192, 9215), ("sec", 9216, 9727), ("fsc", 9728, 10239),
+    ("modemst1", 10240, 12287), ("modemst2", 12288, 14335), ("persist", 14336, 30719),
+    ("boot", 396384, 429151), ("system", 429152, 2067551), ("cache", 2067552, 2427999), ("userdata", 2428000, 7634910),
+]
+
+
+def make_original_disk(root, path):
+    """Full-size SPARSE fake eMMC with a stock-like GPT (primary and secondary) and recognisable partition data."""
+    gptool = _gptool(root)
+    entries = []
+    for name, first, last in FAKE_PARTITIONS:
+        type_guid = gptool.BOOT_TYPE if name == "boot" else gptool.ROOT_TYPE
+        entries.append(gptool.mk_entry(type_guid, str(uuid.uuid5(uuid.NAMESPACE_DNS, "openstick-easy-" + name)),
+                                       first, last, 0, name))
+    table = b"".join(entries).ljust(28 * 128, b"\0")
+    crc = zlib.crc32(table) & 0xffffffff
+    region = table.ljust(32 * SECTOR, b"\0")
+    guid = uuid.uuid5(uuid.NAMESPACE_DNS, "openstick-easy-disk").bytes_le
+    base = struct.pack(gptool.HDR, gptool.SIG, 0x10000, gptool.HDR_SZ, 0, 0, 1, EMMC_SECTORS - 1, 34,
+                       EMMC_SECTORS - 34, guid, 2, 28, 128, crc).ljust(SECTOR, b"\0")
+    primary_header = gptool.make_hdr(base, 1, EMMC_SECTORS - 1, 2, crc)
+    secondary_header = gptool.make_hdr(base, EMMC_SECTORS - 1, 1, EMMC_SECTORS - 33, crc)
+    mbr = bytearray(SECTOR)
+    mbr[510:512] = b"\x55\xaa"
+    mbr[450] = 0xee
+    struct.pack_into("<II", mbr, 454, 1, EMMC_SECTORS - 1)
+    with open(path, "wb") as disk:
+        disk.truncate(EMMC_SECTORS * SECTOR)
+        disk.write(bytes(mbr) + primary_header + region)
+        disk.seek((EMMC_SECTORS - 33) * SECTOR)
+        disk.write(region + secondary_header)
+        for name, first, last in FAKE_PARTITIONS:
+            if name in ("boot", "system", "cache", "userdata"):
+                continue
+            disk.seek(first * SECTOR)
+            disk.write((("unique-fake-%s-" % name).encode() * 64)[:SECTOR * 2])
+
+
+def synthetic_boot_image(tag=b"easy"):
+    page = 2048
+    kernel, ramdisk = b"K" * page, b"R" * page
+    header = struct.pack("<8s10I16s512s32s1024s", b"ANDROID!", len(kernel), 0x80080000, len(ramdisk), 0x82000000,
+                         0, 0x80f00000, 0x81e00000, page, 0, 0, tag, b"test", b"\0" * 32, b"")
+    return header.ljust(page, b"\0") + kernel + ramdisk
+
+
+def synthetic_ext4_stub(size=65536):
+    """Superblock-only ext4 look-alike: enough for the image-set adapter, not for debugfs."""
+    image = bytearray(size)
+    sb = memoryview(image)[1024:2048]
+    struct.pack_into("<I", sb, 4, size // 4096)
+    struct.pack_into("<I", sb, 24, 2)
+    sb[56:58] = b"\x53\xef"
+    return bytes(image)
+
+
+def real_ext4(path, workdir):
+    """A tiny REAL ext4 with /etc/openstick, so the seed injection (debugfs) works."""
+    source = pathlib.Path(workdir) / "ext4-src"
+    (source / "etc/openstick").mkdir(parents=True, exist_ok=True)
+    (source / "etc/openstick/.keep").write_text("")
+    subprocess.check_call(["mke2fs", "-q", "-F", "-t", "ext4", "-d", str(source), str(path), "4M"],
+                          stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
+
+
+def _make_removable(path, remove=True):
+    """Image sets and registered builds are read-only trees; make them writable so the runner can delete them."""
+    for dirpath, dirnames, filenames in os.walk(path):
+        with contextlib.suppress(OSError):
+            os.chmod(dirpath, 0o700)
+        for name in filenames:
+            with contextlib.suppress(OSError):
+                os.chmod(os.path.join(dirpath, name), 0o600)
+    if remove:
+        shutil.rmtree(path, ignore_errors=True)
+
+
+# ---------------------------------------------------------------- the fake board
+class Board:
+    """One fake board: private store, sparse fake eMMC, fake USB tree, EDL dir, logs. Lives under the runner temp dir."""
+
+    def __init__(self, root, tmp, name):
+        self.root = pathlib.Path(root)
+        self.runner_tmp = pathlib.Path(tmp)
+        self.base = self.runner_tmp / ("easy-" + name)
+        _make_removable(self.base)
+        self.base.mkdir(mode=0o700)
+        import atexit
+        atexit.register(_make_removable, self.base, False)  # image sets and builds are created read-only
+        self.home = self.base / "private"
+        self.sysfs = self.base / "usb/sys/bus/usb/devices"
+        self.devroot = self.base / "usb/dev/bus/usb"
+        self.sysfs.mkdir(parents=True)
+        (self.devroot / "001").mkdir(parents=True)
+        self.edl_dir = self.base / "edl"
+        self.edl_dir.mkdir()
+        shutil.copy(self.runner_tmp / "shims/bin/edl", self.edl_dir / "edl")
+        (self.edl_dir / "edl").chmod(0o755)
+        self.loader = self.edl_dir / "prog_emmc_firehose_8916.mbn"
+        self.loader.write_bytes(b"test-only synthetic loader")  # the launcher swaps the pinned hash for this file's hash
+        self.disk = self.base / "fake-emmc.img"
+        self.initial = self.base / "fake-emmc.initial"
+        make_original_disk(self.root, self.initial)
+        self.write_log = self.base / "write.log"
+        self.cmd_log = self.base / "edl-commands.log"
+        self.build_mark = self.base / "build-calls.log"
+        for path in (self.write_log, self.cmd_log, self.build_mark):
+            path.write_text("")
+        self.reset_disk()
+        (self.base / "home").mkdir()
+        self.fake_build_dir = None
+        self.extra_env = {}
+
+    # -- USB
+    def plug(self):
+        device = self.sysfs / "1-1"
+        device.mkdir(exist_ok=True)
+        for field, value in (("idVendor", "05c6"), ("idProduct", "9008"), ("busnum", "001"), ("devnum", "009")):
+            (device / field).write_text(value + "\n")
+        node = self.devroot / "001/009"
+        node.write_text("")
+        node.chmod(0o600)
+
+    def unplug(self):
+        shutil.rmtree(self.sysfs / "1-1", ignore_errors=True)
+
+    def replug_action(self):
+        """For a Rule: simulate unplug, a second of silence, then a cold re-entry into EDL (fresh session)."""
+        def worker():
+            self.unplug()
+            time.sleep(1.0)
+            (self.base / "edl-session").unlink(missing_ok=True)
+            self.plug()
+        return lambda: threading.Thread(target=worker, daemon=True).start()
+
+    def reset_disk(self):
+        subprocess.check_call(["cp", "--sparse=always", str(self.initial), str(self.disk)], stdin=subprocess.DEVNULL)
+        (self.base / "fake-emmc.img.writes").unlink(missing_ok=True)
+        for log in (self.write_log, self.cmd_log):
+            log.write_text("")
+
+    def unchanged(self):
+        return same_files(self.disk, self.initial)
+
+    # -- fixtures built with the product's own code, like tests/verify-installer-m4.py does
+    def _tools(self):
+        sys.path.insert(0, str(self.root))
+        from tools.installer import store, imageset
+        return store, imageset
+
+    def enable_fake_build(self, real_rootfs=False):
+        """Make the launcher's replacement build_command available (no sudo, no debootstrap)."""
+        self.fake_build_dir = self.base / "fake-build"
+        self.fake_build_dir.mkdir()
+        (self.fake_build_dir / "boot.img").write_bytes(synthetic_boot_image())
+        if real_rootfs:
+            real_ext4(self.fake_build_dir / "rootfs.img", self.base)
+        else:
+            (self.fake_build_dir / "rootfs.img").write_bytes(synthetic_ext4_stub())
+
+    def make_image_set(self, name="image-set"):
+        """GPT-T image set for this fake board: layout derived from the fake board's own GPT by tools/gen-gpt-tz1m.py."""
+        import hashlib
+        store, imageset = self._tools()
+        store.ensure_store(self.home)
+        build_id = "easy-set-build-" + name
+        build_dir = self.home / "builds" / build_id
+        build_dir.mkdir(mode=0o700)
+        boot, rootfs = synthetic_boot_image(), synthetic_ext4_stub()
+        (build_dir / "boot.img").write_bytes(boot)
+        (build_dir / "rootfs.img").write_bytes(rootfs)
+        manifest = {"schema_version": 1, "build_id": build_id, "board": "ufi103s", "profile": "dev",
+                    "artifacts": {"boot.img": {"sha256": hashlib.sha256(boot).hexdigest(), "size": len(boot)},
+                                  "rootfs.img": {"sha256": hashlib.sha256(rootfs).hexdigest(), "size": len(rootfs)}}}
+        (build_dir / "build.json").write_text(json.dumps(manifest))
+        registry = store.load_registry(self.home)
+        registry.setdefault("builds", []).append({"build_id": build_id, "path": str(build_dir), "board": "ufi103s",
+                                                  "profile": "dev"})
+        store.save_registry(self.home, registry)
+        primary = self.base / ("primary-" + name + ".bin")
+        with self.initial.open("rb") as disk:
+            primary.write_bytes(disk.read(34 * SECTOR))
+        layout = self.base / ("layout-" + name)
+        subprocess.check_call([sys.executable, "-I", str(self.root / "tools/gen-gpt-tz1m.py"), "--primary", str(primary),
+                               "--emmc", str(EMMC_SECTORS), "--outdir", str(layout)],
+                              stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, timeout=60)
+        output = self.base / name
+        args = types.SimpleNamespace(build=build_id, layout=str(layout), output=str(output))
+        assert imageset.prepare_command(args, self.home, self.root) == 0
+        return output
+
+    def product_image_sets(self):
+        images = self.home / "images"
+        return sorted(images.glob("easy-*")) if images.is_dir() else []
+
+    # -- running
+    def env(self, **overrides):
+        env = {
+            "HOME": str(self.base / "home"),
+            "PATH": str(self.runner_tmp / "shims/bin") + ":/usr/bin:/bin",
+            "LANG": "C.UTF-8", "TERM": "dumb",
+            "TMPDIR": str(self.runner_tmp),
+            "GIT_CEILING_DIRECTORIES": str(self.runner_tmp.parent),
+            "PYTHONPATH": "%s:%s" % (self.root / "tests/host-path-guard", self.root),
+            "OPENSTICK_USB_SYSFS_ROOT": str(self.sysfs),
+            "OPENSTICK_USB_DEVICE_ROOT": str(self.devroot),
+            "OPENSTICK_TEST_USB_ROOTS_DIR": str(self.runner_tmp),
+            "OPENSTICK_EDL_DIR": str(self.edl_dir),
+            "OPENSTICK_FAKE_EMMC": str(self.disk),
+            "OPENSTICK_EDL_ALLOW_WRITES": "1",
+            "OPENSTICK_EDL_WRITE_LOG": str(self.write_log),
+            "OPENSTICK_EDL_COMMAND_FILE": str(self.cmd_log),
+            "OPENSTICK_EDL_SESSION_FILE": str(self.base / "edl-session"),
+            "OPENSTICK_TEST_LOADER": str(self.loader),
+            "OPENSTICK_TEST_BUILD_MARK": str(self.build_mark),
+        }
+        env.update(POLL_ENV)
+        if self.fake_build_dir:
+            env["OPENSTICK_TEST_FAKE_BUILD"] = str(self.fake_build_dir)
+        if os.environ.get("OPENSTICK_GUARD_HIT_FILE"):
+            env["OPENSTICK_GUARD_HIT_FILE"] = os.environ["OPENSTICK_GUARD_HIT_FILE"]
+        env.update(self.extra_env)
+        env.update(overrides)
+        return env
+
+    def easy(self, extra_args, rules, env_overrides=None, timeout=600):
+        (self.base / "edl-session").unlink(missing_ok=True)
+        argv = [sys.executable, str(self.root / "tests/easy_launcher.py"), "--home", str(self.home), "--no-color",
+                "--usb-sysfs-root", str(self.sysfs), "--usb-device-root", str(self.devroot)] + EASY_COMMAND + list(extra_args)
+        return run_pty(argv, self.env(**(env_overrides or {})), rules, timeout=timeout, cwd=str(self.root))
+
+    # -- observations
+    def writes(self):
+        return [line.split() for line in self.write_log.read_text().splitlines() if line.strip()]
+
+    def edl_ops(self):
+        return [line.split()[0] for line in self.cmd_log.read_text().splitlines() if line.strip()]
+
+    def build_calls(self):
+        return [line for line in self.build_mark.read_text().splitlines() if line.strip()]
+
+    def backup_dirs(self):
+        root = self.home / "backups"
+        return sorted(p for p in root.glob("*/*") if p.is_dir() and not p.name.startswith(".")) if root.is_dir() else []
+
+    def seeds(self):
+        seeds = self.home / "seeds"
+        return sorted(seeds.glob("*.seed")) if seeds.is_dir() else []
+
+
+def base_rules(board, yes=False, mode="1"):
+    """Prompt answers common to every happy-path run (unlisted prompts block until the run times out: a failure)."""
+    rules = [Rule(RE_MODE, mode), Rule(RE_REUSE, ""), Rule(RE_STEP6, action=board.replug_action())]
+    if not yes:
+        rules.append(Rule(RE_CONFIRM, "YES"))
+    return rules
+
+
+def happy(board, extra, rules=None, **kw):
+    """Plug the board and run `openstick easy`."""
+    board.plug()
+    return board.easy(extra, rules if rules is not None else base_rules(board), **kw)
+
+
+# ---------------------------------------------------------------- expected-layout oracle and shared checks
+def expected_overlays(image_set, rootfs=None):
+    """Writes the finished disk must contain, from the image set and the documented GPT-T geometry:
+    primary GPT at LBA 0, secondary in the last 33 sectors, boot and userdata at their planned LBAs.
+    Preserved partitions keep their LBAs in the planned GPT-T, so they stay byte-identical to the initial disk."""
+    image_set = pathlib.Path(image_set)
+    manifest = json.loads((image_set / "manifest.json").read_text())
+    parts = manifest["partitions"]
+    return [
+        (0, (image_set / "layout/gpt-T-primary.bin").read_bytes()),
+        ((EMMC_SECTORS - 33) * SECTOR, (image_set / "layout/gpt-T-secondary.bin").read_bytes()),
+        (parts["boot"]["start_lba"] * SECTOR, (image_set / "payload/boot.img").read_bytes()),
+        (parts["userdata"]["start_lba"] * SECTOR, pathlib.Path(rootfs or image_set / "payload/rootfs.img").read_bytes()),
+    ]
+
+
+def stamp_dirs(board):
+    """backups/<device-id>/<UTC-stamp>/ folders (plan step 3)."""
+    found = board.backup_dirs()
+    for path in found:
+        assert re.match(r"\d{8}T\d{6}", path.name), "backup folder is not named by a UTC stamp: " + path.name
+    return found
+
+
+def check_no_traceback(output):
+    assert "Traceback (most recent call last)" not in output, "expected failure printed a stack trace"
+
+
+def check_restore_hint(output):
+    """Failure path (E-5): the restore command and the unplug/re-enter advice are printed."""
+    assert re.search(r"(?im)^.*\bopenstick\b.*\brestore\b.*--backup.*$", output), "no restore command printed"
+    assert re.search(r"(?i)unplug 30 s and re-enter EDL", output), "no unplug-30-s advice printed"
+
+
+def write_targets(board):
+    return [line[1] for line in board.writes()]
+
+
+def check_order(targets, boot_lba=396384, userdata_lba=2428000):
+    """Secondary GPT, primary GPT, boot, userdata (plan step 8; P writes the secondary first)."""
+    def at(names):
+        for index, target in enumerate(targets):
+            if target in names:
+                return index
+        raise AssertionError("no write to any of %s in %s" % (sorted(names), targets))
+    gpt = max(at({"0"}), at({str(EMMC_SECTORS - 33)}))
+    boot, userdata = at({str(boot_lba)}), at({str(userdata_lba)})
+    assert gpt < boot < userdata, "write order is not gpt, boot, userdata: %s" % targets

@@ -139,6 +139,15 @@ run m5-verify-restore python3 "$ROOT/tests/verify-installer-m5.py"
 run m6-portable-packages "$PYTHON" "$ROOT/tests/groups/_harness.py" "$ROOT/tests/verify-installer-m6.py"
 run m7-wizard python3 "$ROOT/tests/verify-installer-m7.py"
 
+# easy mode (round 6): scripted stdin through a pty against the fake board (shim edl with opt-in writes).
+runx easy-default-happy-path easy-default-happy-path.py "$ROOT" "$TMP"
+runx easy-custom-seed easy-custom-seed.py "$ROOT" "$TMP"
+runx easy-reuse-backup easy-reuse-backup.py "$ROOT" "$TMP"
+runx easy-poll-timeout easy-poll-timeout.py "$ROOT" "$TMP"
+runx easy-phase-failure easy-phase-failure.py "$ROOT" "$TMP"
+runx easy-yes-flag easy-yes-flag.py "$ROOT" "$TMP"
+runx easy-image-set easy-image-set.py "$ROOT" "$TMP"
+
 # Retain the M0 passing regression set. Known baseline failures remain documented and are not installer failures.
 for test in verify-fetch-firehose.sh verify-flash-board.sh verify-harden.sh verify-initramfs-fail.sh verify-nft-ruleset.sh verify-rollback-plan.sh verify-sshd-config.sh; do
   if [[ $test == verify-rollback-plan.sh ]]; then
