@@ -62,6 +62,19 @@ except RuntimeError as exc:
     assert "TEST SAFETY GUARD" in str(exc), str(exc)
 else:
     raise AssertionError("EDL client outside the test temp directory was allowed")
+try:
+    subprocess.run(["sudo", str(outside_client), "rs", "0", "1", str(pathlib.Path(tmp) / "sudo-out.bin")],
+                   stdin=subprocess.DEVNULL, timeout=5)
+except RuntimeError as exc:
+    assert "TEST SAFETY GUARD" in str(exc), str(exc)
+else:
+    raise AssertionError("wrapped EDL client outside the test temp directory was allowed")
+planner = pathlib.Path(tmp) / "rollback-plan.py"
+planner.write_text("raise SystemExit(0)\n", encoding="ascii")
+metadata = subprocess.run([sys.executable, "-I", str(planner), "--edl", "/outside/edl-client",
+                           "--loader", "/outside/pinned-loader"],
+                          stdin=subprocess.DEVNULL, timeout=5, capture_output=True, text=True)
+assert metadata.returncode == 0, (metadata.returncode, metadata.stdout, metadata.stderr)
 allowed_client = pathlib.Path(tmp) / "edl-child-stub"
 allowed_loader = pathlib.Path(tmp) / "synthetic-loader.mbn"
 allowed_client = allowed_client.with_suffix(".py")
