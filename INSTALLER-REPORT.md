@@ -19,6 +19,30 @@ The prior installer work merged branches B, A, C, D in order with merge commits 
 
 The pre-hardware-round aggregate runner result was **26 PASS, 0 FAIL, 0 SKIP**. After hardware fix round 1, the aggregate runner was withheld because its M7 doctor invocation inspects host sysfs and `/dev`. Focused synthetic suites passed: M2 **10/10**, doctor **10/10**, M3 **15/15**, M4 **25/25**, M5 **25/25**, and M6 composite package checks **PASS**. M7 **25/25** was recorded before the host-device check restriction and was not rerun. M6 is an assert-based composite script and emits no numeric case total.
 
+## Test hardening round 4
+
+The round started from `315ab96`. The required EOF-only base commit is `f6284ca`, tagged `round4-base`; the integrated `installer` head is `38bedd3`. All six workstreams below were tested with synthetic fixtures and shims. No real hardware, EDL device, `sudo`, network, production image, or real backup was used.
+
+| Requirement | Status | Evidence |
+|---|---|---|
+| R-T1 clean runner environment | VERIFIED-WITH-SHIMS | Matrix cases (a), (b), and (c) all passed. Hostile `OPENSTICK_*`, `GIT_*`, and PATH values were discarded. |
+| R-T2 client and loader path guard | VERIFIED-WITH-SHIMS | The guard blocks out-of-temp EDL clients and loaders in direct and Python child invocations. Planner metadata placeholders are not treated as EDL invocations. |
+| R-T3 bounded tests | VERIFIED-WITH-SHIMS | Runner groups have a 300-second timeout and `/dev/null` stdin. Noninteractive test subprocesses have explicit timeouts and `DEVNULL`; intentional PTY confirmation helpers use explicit deadlines. |
+| R-T4 Git layout independence | VERIFIED-WITH-SHIMS | M7 creates its own marker; M5 and other store tests set their own ceilings. The copy run in case (e) used the runner ceiling described below. |
+| R-T5 fixture USB roots | VERIFIED-WITH-SHIMS | Matrix runs passed with fixture sysfs and USB roots exported to parent and child processes. M5's timeout regression injects its synthetic EDL sysfs root. |
+| R-T6 helper failure message | VERIFIED-WITH-SHIMS | `test_helper_failure_appends_masked_stderr_without_external_paths` checks the final stderr line, serial masking, and path removal. |
+
+| Acceptance case | Result | Details |
+|---|---|---|
+| (a) regular runner invocation | 25 PASS / 0 FAIL / 0 SKIP | Passed with caller stdin redirected to `/dev/null`. |
+| (b) allowlisted `env -i` | 25 PASS / 0 FAIL / 0 SKIP | Passed with `HOME`, `PATH`, `LANG`, and a workspace-local temp parent. |
+| (c) hostile environment | 25 PASS / 0 FAIL / 0 SKIP | Passed with hostile EDL directory, home, Git ceiling, and a PATH `edl` stub. The stub's execution sentinel remained absent. |
+| (d) pseudo-terminal stdin | 25 PASS / 0 FAIL / 0 SKIP | Passed using Python `pty`. |
+| (e) copy without `.git` in the tree | 25 PASS / 0 FAIL / 0 SKIP | The copy excluded `.git` and passed with a Git ceiling that hid the outer workspace marker. A physical copy with no `.git` anywhere above it was not possible inside the requested workspace path because the workspace root is itself a Git worktree. This is a simulated no-Git layout. |
+| (f) Git worktree | 25 PASS / 0 FAIL / 0 SKIP | Passed from the `installer` worktree. |
+
+`python3 -m compileall -q tools tests`, `bash -n tests/run-installer-tests.sh`, and `git diff --check round4-base..installer` passed. `shellcheck` was unavailable. The patch scan reported `SCAN-HIT class=FAKE-FIXTURE` for the synthetic serial fixture in `tests/verify-installer-m5.py`; no private key block, real-looking secret, or unknown secret was found.
+
 ## Feature evidence
 
 ### CLI, private store, and doctor
@@ -121,7 +145,7 @@ Do not perform writes during this acceptance checklist.
 - No EDL command, sudo, network, real SSH, or production image was used. One earlier M7 invocation ran doctor against the host and read sysfs plus device-node permission metadata; it did not invoke the client or open/read/write the device node. The aggregate runner was not rerun after this host check was identified.
 - F-01 remains UNFIXED. The CLI wizard test proves the prerequisite failure is handled and backup is refused, not that successful end-to-end backup works.
 - M4 and M7 are PARTIAL. GPT-T first-install and complete wizard end-to-end acceptance lack non-mock EDL evidence.
-- The full aggregate test runner was not run after hardware fix round 1 because its M7 doctor check inspects host sysfs and `/dev`; focused synthetic suites and offline checks were used instead.
+- After hardware fix round 1, the aggregate runner was withheld because its M7 doctor check inspected host sysfs and `/dev`. Round 4 added fixture USB roots and child-process guards, then passed the six matrix runs above with shims. No real hardware behavior was verified.
 - M6 package install and restore remain UNVALIDATED on hardware.
 - Existing `tools/flash/`, `tools/pathA/`, rollback engines, initramfs code, and the protected flash scripts were not changed by this round.
 - Process artifacts listed in `../FIX-ROUND-1-EXCLUDE.txt`, including the worktree copy of `spec/` and `notes/`, are excluded from product integration.
