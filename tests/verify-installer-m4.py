@@ -18,6 +18,18 @@ from unittest import mock
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+
+def run_test_process(command, *args, **kwargs):
+    """Run non-interactive test children with bounded time and closed stdin."""
+    kwargs.setdefault("stdin", subprocess.DEVNULL)
+    kwargs.setdefault("timeout", 120)
+    return subprocess.run(command, *args, **kwargs)
+
+def check_test_process(command, *args, **kwargs):
+    """check_call equivalent with closed stdin and a per-process timeout."""
+    kwargs.setdefault("stdin", subprocess.DEVNULL)
+    kwargs.setdefault("timeout", 120)
+    return subprocess.check_call(command, *args, **kwargs)
 from tools.installer import build as build_module
 from tools.installer import flash as flash_module
 from tools.installer import imageset as imageset_module
@@ -91,7 +103,10 @@ def synthetic_ext4_image(size=65536):
 
 class M4Tests(unittest.TestCase):
     def setUp(self):
-        self.tmp = pathlib.Path(tempfile.mkdtemp(prefix="openstick-m4-test-"))
+        self._temporary_directory = tempfile.TemporaryDirectory(
+            prefix="openstick-m4-test-", dir=os.environ.get("TMPDIR"))
+        self.addCleanup(self._temporary_directory.cleanup)
+        self.tmp = pathlib.Path(self._temporary_directory.name)
         self.home = store.ensure_store(self.tmp / "private")
         self.repo = self.tmp / "repo"
         (self.repo / "boards" / "ufi103s").mkdir(parents=True)
@@ -383,16 +398,16 @@ class M4Tests(unittest.TestCase):
         generic_out = self.tmp / "generic-out"
         generic_out.mkdir()
         base_env = {"OPENSTICK_ROOT": str(self.repo), "BOARD": "ufi103s", "PATH": "/usr/bin:/bin"}
-        generic = subprocess.run(cmd, env=dict(base_env, OPENSTICK_CONFIG_MODE="generic",
+        generic = run_test_process(cmd, env=dict(base_env, OPENSTICK_CONFIG_MODE="generic",
                                               OPENSTICK_OUT=str(generic_out)), text=True, capture_output=True, check=True)
         base_env["WIFI_PSK"] = "INHERITED_FAKE"
-        legacy = subprocess.run(cmd, env=dict(base_env, OPENSTICK_CONFIG_MODE="legacy"), text=True, capture_output=True, check=True)
+        legacy = run_test_process(cmd, env=dict(base_env, OPENSTICK_CONFIG_MODE="legacy"), text=True, capture_output=True, check=True)
         self.assertEqual(generic.stdout, "")
         self.assertEqual(legacy.stdout, "INHERITED_FAKE")
 
     def _flash_fixture(self, board="ufi103s", with_backup=True, live_identity=True):
         disk = self.tmp / "fake-emmc.bin"
-        subprocess.check_call([sys.executable, str(ROOT / "tests/make-fake-emmc.py"), str(disk), "--mib", "2"])
+        check_test_process([sys.executable, str(ROOT / "tests/make-fake-emmc.py"), str(disk), "--mib", "2"])
         parsed = _parse_gpt(disk)
         identity = {name: _hash_range(disk, *parsed[name]) for name in ("fsg", "sec", "fsc")}
         manifest_parts = {name: {"start_lba": start, "end_lba": end} for name, (start, end) in parsed.items()}
@@ -477,7 +492,7 @@ class M4Tests(unittest.TestCase):
 
     def test_missing_backup_cli_exit_code_2(self):
         args, dev, identity, env = self._flash_fixture(with_backup=False)
-        proc = subprocess.run([str(ROOT / "openstick"), "--home", str(self.home), "flash", "--device", "deadbeef",
+        proc = run_test_process([str(ROOT / "openstick"), "--home", str(self.home), "flash", "--device", "deadbeef",
                                "--image-set", args.image_set], env=dict(env, OPENSTICK_HOME=""), capture_output=True, text=True)
         self.assertEqual(proc.returncode, 2, (proc.stdout, proc.stderr))
         args, dev, identity, env = self._flash_fixture(board="mf800", with_backup=False)
@@ -620,7 +635,7 @@ class M4Tests(unittest.TestCase):
 
     def test_flash_backup_slice_materialization(self):
         disk = self.tmp / "fixture-disk.bin"
-        subprocess.check_call([sys.executable, str(ROOT / "tests/make-fake-emmc.py"), str(disk), "--mib", "2"])
+        check_test_process([sys.executable, str(ROOT / "tests/make-fake-emmc.py"), str(disk), "--mib", "2"])
         parts = _parse_gpt(disk)
         manifest_parts = {name: {"start_lba": start, "end_lba": end} for name, (start, end) in parts.items()}
         destination = self.tmp / "backup-slices"

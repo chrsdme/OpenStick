@@ -17,6 +17,18 @@ from unittest import mock
 
 ROOT = pathlib.Path(sys.argv[1]).resolve()
 sys.path.insert(0, str(ROOT))
+
+def run_test_process(command, *args, **kwargs):
+    """Run non-interactive test children with bounded time and closed stdin."""
+    kwargs.setdefault("stdin", subprocess.DEVNULL)
+    kwargs.setdefault("timeout", 120)
+    return subprocess.run(command, *args, **kwargs)
+
+def check_test_process(command, *args, **kwargs):
+    """check_call equivalent with closed stdin and a per-process timeout."""
+    kwargs.setdefault("stdin", subprocess.DEVNULL)
+    kwargs.setdefault("timeout", 120)
+    return subprocess.check_call(command, *args, **kwargs)
 from tools.installer import seed
 from tools.installer.configure import configure, show
 from tools.installer.store import ensure_store
@@ -101,7 +113,7 @@ def configure_test(tmp):
         show(home, "private")
     output = "\n".join(str(c.args[0]) for c in printer.call_args_list)
     assert "synthetic-login" not in output and "synthetic-user" not in output and "[REDACTED]" in output
-    shown = subprocess.run([str(ROOT / "openstick"), "--home", str(home), "configure", "--seed", "private", "--show"], capture_output=True, text=True)
+    shown = run_test_process([str(ROOT / "openstick"), "--home", str(home), "configure", "--seed", "private", "--show"], capture_output=True, text=True)
     assert shown.returncode == 0 and "[REDACTED]" in shown.stdout and "synthetic-login" not in shown.stdout
     assert home.stat().st_mode & 0o777 == 0o700 and (home / "seeds").stat().st_mode & 0o777 == 0o700
     private_file = tmp / "synthetic-private-key"
@@ -187,7 +199,7 @@ def apply_test(tmp):
     seedfile.write_text(seed.serialize(data))
     seedfile.chmod(0o600)
     env = dict(os.environ, OPENSTICK_ROOT=str(root), PATH=str(bindir) + ":/usr/bin:/bin", SHIM_LOG=str(log))
-    p = subprocess.run([str(ROOT / "configs/apply-seed")], env=env, text=True, capture_output=True)
+    p = run_test_process([str(ROOT / "configs/apply-seed")], env=env, text=True, capture_output=True)
     assert p.returncode == 0 and "secret" not in p.stdout + p.stderr
     assert not seedfile.exists(), "apply rejected: " + (log.read_text() if log.exists() else "no journal output")
     assert (root / "etc/hostname").read_text().strip() == "stick_89abcdef" or (root / "etc/hostname").read_text().strip() == "stick-89abcdef"
@@ -212,7 +224,7 @@ def apply_test(tmp):
     # Recreate identical pending input and apply a second time; all resulting files stay stable.
     seedfile.write_text(seed.serialize(data))
     seedfile.chmod(0o600)
-    p = subprocess.run([str(ROOT / "configs/apply-seed")], env=env, text=True, capture_output=True)
+    p = run_test_process([str(ROOT / "configs/apply-seed")], env=env, text=True, capture_output=True)
     assert p.returncode == 0 and not seedfile.exists()
 
 
@@ -232,7 +244,7 @@ def seed_transaction_test(tmp):
         seedfile = root / "etc/openstick/seed.env"
         seedfile.write_text(seed.serialize(data)); seedfile.chmod(0o600)
         env = dict(os.environ, OPENSTICK_ROOT=str(root), PATH=str(bindir) + ":" + str(restricted), SHIM_LOG=str(log))
-        p = subprocess.run([str(ROOT / "configs/apply-seed")], env=env, capture_output=True, text=True)
+        p = run_test_process([str(ROOT / "configs/apply-seed")], env=env, capture_output=True, text=True)
         assert p.returncode == 0 and not seedfile.exists(), (missing, p.stderr)
         assert (root / "etc/openstick/seed.applied").exists()
 
@@ -246,7 +258,7 @@ def seed_transaction_test(tmp):
     (bindir / "useradd").write_text("#!/bin/sh\nkill -TERM \"$PPID\"\nexit 17\n")
     (bindir / "useradd").chmod(0o755)
     env = dict(os.environ, OPENSTICK_ROOT=str(root), PATH=str(bindir) + ":/usr/bin:/bin", SHIM_LOG=str(log))
-    p = subprocess.run([str(ROOT / "configs/apply-seed")], env=env, capture_output=True, text=True)
+    p = run_test_process([str(ROOT / "configs/apply-seed")], env=env, capture_output=True, text=True)
     assert p.returncode == 1 and seedfile.exists()
     assert (root / "etc/hostname").read_text() == "old-host\n"
     assert not (root / "etc/openstick/seed.applied").exists()
@@ -256,7 +268,7 @@ def seed_transaction_test(tmp):
     prod_seed.chmod(0o600)
     (prod_root / "etc/openstick/image-profile").write_text("prod\n")
     prod_env = dict(os.environ, OPENSTICK_ROOT=str(prod_root), PATH=str(prod_bin) + ":/usr/bin:/bin", SHIM_LOG=str(prod_log))
-    subprocess.run([str(ROOT / "configs/apply-seed")], env=prod_env, capture_output=True, text=True, check=True)
+    run_test_process([str(ROOT / "configs/apply-seed")], env=prod_env, capture_output=True, text=True, check=True)
     assert prod_seed.exists() and not (prod_root / "etc/hostname").exists()
 
     root, bindir, log = fake_root(tmp / "profile-mismatch")
@@ -264,7 +276,7 @@ def seed_transaction_test(tmp):
     mismatch_seed.write_text(seed.serialize({"SEED_VERSION": "1", "PROFILE": "prod", "HOSTNAME": "should-not-apply"}))
     mismatch_seed.chmod(0o600)
     env = dict(os.environ, OPENSTICK_ROOT=str(root), PATH=str(bindir) + ":/usr/bin:/bin", SHIM_LOG=str(log))
-    subprocess.run([str(ROOT / "configs/apply-seed")], env=env, capture_output=True, text=True, check=True)
+    run_test_process([str(ROOT / "configs/apply-seed")], env=env, capture_output=True, text=True, check=True)
     assert mismatch_seed.exists() and not (root / "etc/hostname").exists()
 
     root, bindir, log = fake_root(tmp / "symlink-run")
@@ -276,7 +288,7 @@ def seed_transaction_test(tmp):
     seedfile.write_text(seed.serialize({"SEED_VERSION": "1", "PROFILE": "dev", "HOSTNAME": "new-host"}))
     seedfile.chmod(0o600)
     env = dict(os.environ, OPENSTICK_ROOT=str(root), PATH=str(bindir) + ":/usr/bin:/bin", SHIM_LOG=str(log))
-    subprocess.run([str(ROOT / "configs/apply-seed")], env=env, capture_output=True, text=True, check=True)
+    run_test_process([str(ROOT / "configs/apply-seed")], env=env, capture_output=True, text=True, check=True)
     assert seedfile.exists() and not (outside / "openstick-seed.env").exists()
     assert not (root / "etc/openstick/seed.applied").exists()
 
@@ -292,7 +304,7 @@ def shell_network_roundtrip_test(tmp):
         seedfile = root / "etc/openstick/seed.env"
         seedfile.write_text(seed.serialize(data)); seedfile.chmod(0o600)
         env = dict(os.environ, OPENSTICK_ROOT=str(root), PATH=str(bindir) + ":/usr/bin:/bin", SHIM_LOG=str(log))
-        p = subprocess.run([str(ROOT / "configs/apply-seed")], env=env, capture_output=True, text=True)
+        p = run_test_process([str(ROOT / "configs/apply-seed")], env=env, capture_output=True, text=True)
         assert p.returncode == 0 and not seedfile.exists(), (index, p.stderr)
         config = (root / "etc/NetworkManager/system-connections/wifi-client.nmconnection").read_text()
         escaped = value.replace("\\", "\\\\").replace('"', '\\"').replace(" ", "\\s")
@@ -308,7 +320,7 @@ def shell_network_roundtrip_test(tmp):
                         (data["WIFI_SSID_B64"], data["WIFI_PSK_B64"]))
     seedfile.chmod(0o600)
     env = dict(os.environ, OPENSTICK_ROOT=str(root), PATH=str(bindir) + ":/usr/bin:/bin", SHIM_LOG=str(log))
-    subprocess.run([str(ROOT / "configs/apply-seed")], env=env, capture_output=True, text=True, check=True)
+    run_test_process([str(ROOT / "configs/apply-seed")], env=env, capture_output=True, text=True, check=True)
     assert seedfile.exists() and not (root / "etc/openstick/seed.applied").exists()
     for index, value in enumerate(["Coffee café", "Bob's WiFi", "Room\\2", 'The "Place"', " edge spaces ", "S" * 32]):
         root, bindir, log = fake_root(tmp / ("ssid-%d" % index))
@@ -318,7 +330,7 @@ def shell_network_roundtrip_test(tmp):
         seedfile = root / "etc/openstick/seed.env"
         seedfile.write_text(seed.serialize(data)); seedfile.chmod(0o600)
         env = dict(os.environ, OPENSTICK_ROOT=str(root), PATH=str(bindir) + ":/usr/bin:/bin", SHIM_LOG=str(log))
-        p = subprocess.run([str(ROOT / "configs/apply-seed")], env=env, capture_output=True, text=True)
+        p = run_test_process([str(ROOT / "configs/apply-seed")], env=env, capture_output=True, text=True)
         assert p.returncode == 0 and not seedfile.exists(), (index, p.stderr)
         config = (root / "etc/NetworkManager/system-connections/wifi-client.nmconnection").read_text()
         escaped = value.replace("\\", "\\\\").replace('"', '\\"').replace(" ", "\\s")
@@ -331,7 +343,7 @@ def shell_network_roundtrip_test(tmp):
     seedfile.write_text("SEED_VERSION=1\nPROFILE=dev\nWIFI_SSID_B64=%s\nWIFI_PSK_B64=%s\n" % (data["WIFI_SSID_B64"], data["WIFI_PSK_B64"]))
     seedfile.chmod(0o600)
     env = dict(os.environ, OPENSTICK_ROOT=str(root), PATH=str(bindir) + ":/usr/bin:/bin", SHIM_LOG=str(log))
-    subprocess.run([str(ROOT / "configs/apply-seed")], env=env, capture_output=True, text=True, check=True)
+    run_test_process([str(ROOT / "configs/apply-seed")], env=env, capture_output=True, text=True, check=True)
     assert seedfile.exists() and not (root / "etc/openstick/seed.applied").exists()
 
 
@@ -350,12 +362,12 @@ def invalid_apply_test(tmp):
     seedfile.write_text("SEED_VERSION=1\nHOSTNAME=would-have-changed\nUNKNOWN=x\n")
     seedfile.chmod(0o600)
     env = dict(os.environ, OPENSTICK_ROOT=str(root), PATH=str(bindir) + ":/usr/bin:/bin", SHIM_LOG=str(log))
-    p = subprocess.run([str(ROOT / "configs/apply-seed")], env=env, text=True, capture_output=True)
+    p = run_test_process([str(ROOT / "configs/apply-seed")], env=env, text=True, capture_output=True)
     assert p.returncode == 0 and seedfile.exists() and not (root / "etc/hostname").exists()
     assert not (root / "etc/openstick/seed.applied").exists()
     (root / "etc/openstick/seed.env").write_text("SEED_VERSION=1\nHOSTNAME=would-change\nAPN=$(touch %s)\n" % (tmp / "shell-executed"))
     (root / "etc/openstick/seed.env").chmod(0o600)
-    p = subprocess.run([str(ROOT / "configs/apply-seed")], env=env, text=True, capture_output=True)
+    p = run_test_process([str(ROOT / "configs/apply-seed")], env=env, text=True, capture_output=True)
     assert p.returncode == 0 and not (root / "etc/hostname").exists() and not (tmp / "shell-executed").exists()
 
 
@@ -364,7 +376,7 @@ def secret_redaction_test(tmp):
     secret = "synthetic-exception-secret"
     (home / "seeds/leak.seed").write_text("SEED_VERSION=1\nPROFILE=dev\nWIFI_PSK_B64=%s\n" % base64.b64encode(secret.encode()).decode())
     (home / "seeds/leak.seed").chmod(0o600)
-    p = subprocess.run([str(ROOT / "openstick"), "--home", str(home), "configure", "--seed", "leak", "--show"], capture_output=True, text=True)
+    p = run_test_process([str(ROOT / "openstick"), "--home", str(home), "configure", "--seed", "leak", "--show"], capture_output=True, text=True)
     assert p.returncode != 0 and secret not in p.stdout + p.stderr
     assert not (home / "registry.json").exists() and not (home / "events.jsonl").exists()
 
@@ -378,27 +390,27 @@ def injection_test(tmp):
     build.mkdir(parents=True)
     (build / "build.json").write_text(json.dumps({"build_id": "demo", "profile": "dev"}))
     image = build / "rootfs.img"
-    subprocess.run(["mke2fs", "-q", "-t", "ext4", "-F", "-d", str(tree), str(image), "24M"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    run_test_process(["mke2fs", "-q", "-t", "ext4", "-F", "-d", str(tree), str(image), "24M"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     original_hash = hashlib.sha256(image.read_bytes()).hexdigest()
     seed_path = home / "seeds/test.seed"
     seed_path.write_text(seed.serialize(fixture_seed()))
     seed_path.chmod(0o600)
     seed_path.write_text(seed.serialize({"SEED_VERSION": "1", "PROFILE": "prod"}))
-    refused = subprocess.run([str(ROOT / "openstick"), "--home", str(home), "seed", "inject", "--build", "demo", "--seed", "test"], text=True, capture_output=True)
+    refused = run_test_process([str(ROOT / "openstick"), "--home", str(home), "seed", "inject", "--build", "demo", "--seed", "test"], text=True, capture_output=True)
     assert refused.returncode == 2 and not (build / "personal-test").exists()
     seed_path.write_text(seed.serialize(fixture_seed()))
-    p = subprocess.run([str(ROOT / "openstick"), "--home", str(home), "seed", "inject", "--build", "demo", "--seed", "test"], text=True, capture_output=True)
+    p = run_test_process([str(ROOT / "openstick"), "--home", str(home), "seed", "inject", "--build", "demo", "--seed", "test"], text=True, capture_output=True)
     assert p.returncode == 0, (p.stdout, p.stderr)
     assert hashlib.sha256(image.read_bytes()).hexdigest() == original_hash
     personal = build / "personal-test/rootfs.img"
     assert personal.exists() and personal.stat().st_mode & 0o777 == 0o600
     assert personal.parent.stat().st_mode & 0o777 == 0o700
-    out = subprocess.run(["debugfs", "-R", "cat /etc/openstick/seed.env", str(personal)], text=True, capture_output=True, check=True)
+    out = run_test_process(["debugfs", "-R", "cat /etc/openstick/seed.env", str(personal)], text=True, capture_output=True, check=True)
     assert hashlib.sha256(out.stdout.encode()).hexdigest() == hashlib.sha256(seed_path.read_bytes()).hexdigest()
     meta = json.loads((personal.parent / "personal.json").read_text())
     assert meta["sensitive"] is True and meta["seed_sha256"] == hashlib.sha256(seed_path.read_bytes()).hexdigest()
     assert (personal.parent / "personal.json").stat().st_mode & 0o777 == 0o600
-    stat_output = subprocess.run(["debugfs", "-R", "stat /etc/openstick/seed.env", str(personal)], text=True, capture_output=True, check=True).stdout
+    stat_output = run_test_process(["debugfs", "-R", "stat /etc/openstick/seed.env", str(personal)], text=True, capture_output=True, check=True).stdout
     assert "User:     0   Group:     0" in stat_output and "Mode:  0600" in stat_output
     registry = json.loads((home / "registry.json").read_text())
     applied = registry["seeds_applied"][-1]
@@ -417,7 +429,7 @@ def bad_injection_test(tmp):
     seedfile = home / "seeds/x.seed"
     seedfile.write_text("SEED_VERSION=1\nPROFILE=dev\n")
     seedfile.chmod(0o600)
-    p = subprocess.run([str(ROOT / "openstick"), "--home", str(home), "seed", "inject", "--build", "demo", "--seed", "x"], capture_output=True, text=True)
+    p = run_test_process([str(ROOT / "openstick"), "--home", str(home), "seed", "inject", "--build", "demo", "--seed", "x"], capture_output=True, text=True)
     assert p.returncode == 3 and not (build / "personal-x").exists()
     original.write_bytes(b"unchanged")
 
@@ -430,7 +442,7 @@ def interrupted_injection_test(tmp):
     tree = tmp / "interrupted-tree"
     (tree / "etc/openstick").mkdir(parents=True)
     source = tmp / "valid-rootfs.img"
-    subprocess.run(["mke2fs", "-q", "-t", "ext4", "-F", "-d", str(tree), str(source), "24M"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    run_test_process(["mke2fs", "-q", "-t", "ext4", "-F", "-d", str(tree), str(source), "24M"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     shutil.copyfile(source, build / "rootfs.img")
     original_hash = hashlib.sha256((build / "rootfs.img").read_bytes()).hexdigest()
     (home / "seeds/x.seed").write_text("SEED_VERSION=1\nPROFILE=dev\n")
@@ -441,13 +453,13 @@ def interrupted_injection_test(tmp):
     shim.write_text("#!/bin/sh\nexit 17\n")
     shim.chmod(0o755)
     env = dict(os.environ, PATH=str(bindir) + ":/usr/bin:/bin")
-    p = subprocess.run([str(ROOT / "openstick"), "--home", str(home), "seed", "inject", "--build", "demo", "--seed", "x"], env=env, capture_output=True, text=True)
+    p = run_test_process([str(ROOT / "openstick"), "--home", str(home), "seed", "inject", "--build", "demo", "--seed", "x"], env=env, capture_output=True, text=True)
     assert p.returncode == 3 and not (build / "personal-x").exists()
     assert not list(build.glob(".personal-x.staging-*"))
     assert hashlib.sha256((build / "rootfs.img").read_bytes()).hexdigest() == original_hash
     shim.write_text("#!/bin/sh\nkill -TERM \"$PPID\"\nexit 0\n")
     shim.chmod(0o755)
-    p = subprocess.run([str(ROOT / "openstick"), "--home", str(home), "seed", "inject", "--build", "demo", "--seed", "x"], env=env, capture_output=True, text=True)
+    p = run_test_process([str(ROOT / "openstick"), "--home", str(home), "seed", "inject", "--build", "demo", "--seed", "x"], env=env, capture_output=True, text=True)
     assert p.returncode == 1 and "operation interrupted" in p.stderr
     assert not (build / "personal-x").exists() and not list(build.glob(".personal-x.staging-*"))
 
@@ -456,7 +468,7 @@ def push_test(tmp):
     home = ensure_store(tmp / "push-home")
     (home / "seeds").joinpath("x.seed").write_text("SEED_VERSION=1\nPROFILE=dev\n")
     (home / "seeds/x.seed").chmod(0o600)
-    p = subprocess.run([str(ROOT / "openstick"), "--home", str(home), "seed", "push", "--seed", "x"], capture_output=True, text=True)
+    p = run_test_process([str(ROOT / "openstick"), "--home", str(home), "seed", "push", "--seed", "x"], capture_output=True, text=True)
     assert p.returncode == 2 and "flashing a seeded image" in p.stderr
     bindir = tmp / "sshbin"
     bindir.mkdir()
@@ -465,7 +477,7 @@ def push_test(tmp):
         f.write_text("#!/bin/sh\nexit 255\n")
         f.chmod(0o755)
     env = dict(os.environ, PATH=str(bindir) + ":/usr/bin:/bin")
-    p = subprocess.run([str(ROOT / "openstick"), "--home", str(home), "seed", "push", "--seed", "x", "--host", "tester@example.invalid"], env=env, capture_output=True, text=True)
+    p = run_test_process([str(ROOT / "openstick"), "--home", str(home), "seed", "push", "--seed", "x", "--host", "tester@example.invalid"], env=env, capture_output=True, text=True)
     assert p.returncode == 2 and "flashing a seeded image" in p.stderr
     success_bin = tmp / "ssh-success-bin"
     success_bin.mkdir()
@@ -477,7 +489,7 @@ def push_test(tmp):
     scp.chmod(0o755)
     ssh_log, scp_log = tmp / "ssh.log", tmp / "scp.log"
     env = dict(os.environ, PATH=str(success_bin) + ":/usr/bin:/bin", SSH_LOG=str(ssh_log), SCP_LOG=str(scp_log))
-    p = subprocess.run([str(ROOT / "openstick"), "--home", str(home), "seed", "push", "--seed", "x", "--host", "tester@example.invalid"], env=env, capture_output=True, text=True)
+    p = run_test_process([str(ROOT / "openstick"), "--home", str(home), "seed", "push", "--seed", "x", "--host", "tester@example.invalid"], env=env, capture_output=True, text=True)
     assert p.returncode == 0, (p.stdout, p.stderr)
     assert "/run/openstick-seed.fixture/seed.env" in scp_log.read_text()
     assert "/tmp/openstick-seed" not in scp_log.read_text()
@@ -486,7 +498,7 @@ def push_test(tmp):
     assert applied["method"] == "push" and applied["target"] == "host:tester@example.invalid"
     assert applied["seed_sha256"] == hashlib.sha256((home / "seeds/x.seed").read_bytes()).hexdigest()
     bad_env = dict(env, FAKE_REMOTE_SYMLINK="1")
-    p = subprocess.run([str(ROOT / "openstick"), "--home", str(home), "seed", "push", "--seed", "x", "--host", "tester@example.invalid"], env=bad_env, capture_output=True, text=True)
+    p = run_test_process([str(ROOT / "openstick"), "--home", str(home), "seed", "push", "--seed", "x", "--host", "tester@example.invalid"], env=bad_env, capture_output=True, text=True)
     assert p.returncode == 2 and "private remote seed directory" in p.stderr
 
 
@@ -498,9 +510,9 @@ def installation_test(_tmp):
     assert "enable_unit network-pre.target openstick-seed.service" in hook
     assert "usr/lib/openstick/apply-seed" in hook
     assert 'printf \'%s\\n\' "$PROFILE" > /etc/openstick/image-profile' in setup
-    p = subprocess.run(["bash", "-n", str(ROOT / "scripts/20-rootfs.sh")], capture_output=True)
+    p = run_test_process(["bash", "-n", str(ROOT / "scripts/20-rootfs.sh")], capture_output=True)
     assert p.returncode == 0
-    p = subprocess.run(["sh", "-n", str(ROOT / "configs/apply-seed")], capture_output=True)
+    p = run_test_process(["sh", "-n", str(ROOT / "configs/apply-seed")], capture_output=True)
     assert p.returncode == 0
 
 

@@ -24,6 +24,13 @@ from functools import wraps
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+
+def run_test_process(command, *args, **kwargs):
+    """Run non-interactive test children with bounded time and closed stdin."""
+    kwargs.setdefault("stdin", subprocess.DEVNULL)
+    kwargs.setdefault("timeout", 120)
+    return subprocess.run(command, *args, **kwargs)
+
 from tools.installer import packages, store
 from tools.installer import build as build_module
 
@@ -93,13 +100,13 @@ def test_common_rejects_empty_openstick_out():
     for mode in ("legacy", "generic"):
         env = dict(os.environ, OPENSTICK_ROOT=str(ROOT), OPENSTICK_CONFIG_MODE=mode,
                    OPENSTICK_OUT="", PATH="/usr/bin:/bin")
-        result = subprocess.run(["/bin/sh", "-c", '. "$OPENSTICK_ROOT/scripts/common.sh"'],
+        result = run_test_process(["/bin/sh", "-c", '. "$OPENSTICK_ROOT/scripts/common.sh"'],
                                 env=env, capture_output=True, text=True)
         assert result.returncode != 0 and "OPENSTICK_OUT" in result.stderr, (mode, result.returncode, result.stderr)
     generic_missing = dict(os.environ, OPENSTICK_ROOT=str(ROOT), OPENSTICK_CONFIG_MODE="generic",
                            PATH="/usr/bin:/bin")
     generic_missing.pop("OPENSTICK_OUT", None)
-    result = subprocess.run(["/bin/sh", "-c", '. "$OPENSTICK_ROOT/scripts/common.sh"'],
+    result = run_test_process(["/bin/sh", "-c", '. "$OPENSTICK_ROOT/scripts/common.sh"'],
                             env=generic_missing, capture_output=True, text=True)
     assert result.returncode != 0 and "OPENSTICK_OUT" in result.stderr, (result.returncode, result.stderr)
 
@@ -228,7 +235,7 @@ def canonical_restore_state(requested, backup_sha):
 def run_restore(command, env, **kwargs):
     command, env = prepare_restore_state(command, env)
     with injected_package_runner(command, env) as (command, env):
-        return subprocess.run(command, env=env, **kwargs)
+        return run_test_process(command, env=env, **kwargs)
 
 
 @contextmanager
@@ -537,7 +544,7 @@ def run():
 
         # Package publication refuses any destination within a Git worktree.
         git_tree = root / "package-git-tree"; git_tree.mkdir()
-        subprocess.run(["git", "init", "-q", str(git_tree)], check=True)
+        run_test_process(["git", "init", "-q", str(git_tree)], check=True)
         staging = root / "minimal-package-stage"; staging.mkdir()
         (staging / "payload").mkdir(); (staging / "scripts").mkdir()
         try:
@@ -570,7 +577,7 @@ def run():
                         OPENSTICK_TEST_BACKUP_SHA=json.loads((disk.parent / "manifest.json").read_text())["sha256"])
 
         # Production-pinned loader check must reject arbitrary synthetic bytes.
-        original_run = subprocess.run([sys.executable, str(script_path), "--device", "deadbeef", "--edl", str(fake_edl),
+        original_run = run_test_process([sys.executable, str(script_path), "--device", "deadbeef", "--edl", str(fake_edl),
                                        "--loader", str(loader)], env=base_env, capture_output=True, text=True)
         assert original_run.returncode == 2 and "pinned SHA-256" in original_run.stderr, (original_run.returncode, original_run.stdout, original_run.stderr)
 
@@ -609,7 +616,7 @@ def run():
         lock_fd = os.open(str(lock_state) + ".lock", os.O_CREAT | os.O_RDWR, 0o600)
         fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         with injected_package_runner(locked_command, locked_env) as (locked_command, locked_env):
-            locked = subprocess.run(locked_command, env=locked_env, capture_output=True, text=True)
+            locked = run_test_process(locked_command, env=locked_env, capture_output=True, text=True)
         assert locked.returncode == 2 and "another package operation is active" in locked.stderr, (locked.returncode, locked.stderr)
         lock_log = pathlib.Path(base_env["OPENSTICK_EDL_LOG"])
         assert not lock_log.exists() or not any(line.startswith("ws ") and "--skipwrite" not in line
@@ -680,7 +687,7 @@ def run():
         alternate_command = args + ["--phase", "userdata", "--state", str(alternate)]
         alternate_env = dict(fail_env, HOME=str(pinned_fail_state.parents[3]))
         with injected_package_runner(alternate_command, alternate_env) as (alternate_command, alternate_env):
-            alternate = subprocess.run(alternate_command, env=alternate_env, capture_output=True, text=True)
+            alternate = run_test_process(alternate_command, env=alternate_env, capture_output=True, text=True)
         assert alternate.returncode == 2 and "state path is pinned" in alternate.stderr, (alternate.returncode, alternate.stderr)
         writes = [line for line in fail_log.read_text().splitlines() if line.startswith("ws ") and "--skipwrite" not in line]
         assert len(writes) == 1, writes
@@ -891,24 +898,24 @@ def run():
         (install_race / boot_rel).write_bytes(b"changed-after-validation")
         assert (install_snapshot / boot_rel).read_bytes() == before
         install_script = clean_install / "scripts/install.py"
-        install_help = subprocess.run([sys.executable, str(install_script), "--help"],
+        install_help = run_test_process([sys.executable, str(install_script), "--help"],
                                       env=dict(os.environ, PATH="/usr/bin:/bin"), capture_output=True, text=True)
         assert "UNVALIDATED on hardware" in install_help.stdout
         wrong_device_command = [sys.executable, str(install_script), "--device", "cafebabe", "--edl", "/missing/edl",
                                 "--loader", str(loader), "--state-dir", str(root / "install-state")]
         with injected_package_runner(wrong_device_command, dict(os.environ, PATH="/usr/bin:/bin")) as (wrong_device_command, wrong_device_env):
-            wrong_device = subprocess.run(wrong_device_command, env=wrong_device_env, capture_output=True, text=True)
+            wrong_device = run_test_process(wrong_device_command, env=wrong_device_env, capture_output=True, text=True)
         assert wrong_device.returncode == 2 and "selected device" in wrong_device.stderr, (wrong_device.returncode, wrong_device.stdout, wrong_device.stderr)
         wrong_loader = root / "wrong-loader"; wrong_loader.write_bytes(b"not pinned")
         refuse_loader_command = [sys.executable, str(install_script), "--device", "deadbeef", "--edl", "/missing/edl",
                                  "--loader", str(wrong_loader), "--state-dir", str(root / "install-state")]
         with injected_package_runner(refuse_loader_command, dict(os.environ, PATH="/usr/bin:/bin")) as (refuse_loader_command, refuse_loader_env):
-            refuse_loader = subprocess.run(refuse_loader_command, env=refuse_loader_env, capture_output=True, text=True)
+            refuse_loader = run_test_process(refuse_loader_command, env=refuse_loader_env, capture_output=True, text=True)
         assert refuse_loader.returncode == 2 and "hash mismatched" in refuse_loader.stderr
         no_edl_command = [sys.executable, str(install_script), "--device", "deadbeef", "--edl", "/missing/edl",
                           "--loader", str(loader), "--state-dir", str(root / "install-state")]
         with injected_package_runner(no_edl_command, dict(os.environ, PATH="/usr/bin:/bin")) as (no_edl_command, no_edl_env):
-            no_edl = subprocess.run(no_edl_command, env=no_edl_env, capture_output=True, text=True)
+            no_edl = run_test_process(no_edl_command, env=no_edl_env, capture_output=True, text=True)
         assert no_edl.returncode == 2 and "live EDL" in no_edl.stderr, (no_edl.returncode, no_edl.stdout, no_edl.stderr)
         # Positive standalone fake-board installation: no builder checkout on
         # PATH, only fake EDL/sudo/simg2img. The package runner delegates to the
@@ -988,7 +995,7 @@ def run():
         transition_loader = root / "transition-loader"; transition_loader.write_bytes(loader.read_bytes())
         transition_args = [sys.executable, str(restore_script), "--device", "deadbeef", "--edl", str(transition_edl),
                            "--loader", str(transition_loader)]
-        restore_help = subprocess.run(transition_args + ["--help"], env=transition_env,
+        restore_help = run_test_process(transition_args + ["--help"], env=transition_env,
                                       capture_output=True, text=True)
         assert "UNVALIDATED on hardware" in restore_help.stdout
         inspect = run_restore(transition_args, env=transition_env, capture_output=True, text=True)

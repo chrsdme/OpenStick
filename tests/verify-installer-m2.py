@@ -15,6 +15,18 @@ import signal
 from unittest import mock
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
+
+def run_test_process(command, *args, **kwargs):
+    """Run non-interactive test children with bounded time and closed stdin."""
+    kwargs.setdefault("stdin", subprocess.DEVNULL)
+    kwargs.setdefault("timeout", 120)
+    return subprocess.run(command, *args, **kwargs)
+
+def check_test_process(command, *args, **kwargs):
+    """check_call equivalent with closed stdin and a per-process timeout."""
+    kwargs.setdefault("stdin", subprocess.DEVNULL)
+    kwargs.setdefault("timeout", 120)
+    return subprocess.check_call(command, *args, **kwargs)
 sys.path.insert(0, str(ROOT))
 
 from tools.installer import cli, edl_runner, store
@@ -52,7 +64,7 @@ class EdlRunnerTests(unittest.TestCase):
             "OPENSTICK_EDL_SESSION_FILE": str(self.base / "edl-session"),
             "OPENSTICK_FAKE_EMMC": str(self.base / "disk.img"),
         })
-        subprocess.check_call([sys.executable, str(ROOT / "tests/make-fake-emmc.py"), self.env["OPENSTICK_FAKE_EMMC"], "--mib", "2"])
+        check_test_process([sys.executable, str(ROOT / "tests/make-fake-emmc.py"), self.env["OPENSTICK_FAKE_EMMC"], "--mib", "2"])
 
     def _restore_ceiling(self):
         if self.old_ceiling is None:
@@ -64,7 +76,7 @@ class EdlRunnerTests(unittest.TestCase):
         return mock.patch.object(edl_runner, "PINNED_LOADER_SHA256", hashlib.sha256(self.loader.read_bytes()).hexdigest())
 
     def run_cli_backup(self, home, options=(), env_extra=None, verbose=False):
-        subprocess.check_call([str(ROOT / "tests/shims/bin/edl-power-cycle"),
+        check_test_process([str(ROOT / "tests/shims/bin/edl-power-cycle"),
                                self.env["OPENSTICK_EDL_SESSION_FILE"]])
         environment = dict(self.env)
         environment["OPENSTICK_EDL_CALL_FILE"] = str(self.base / ("calls-" + str(len(list(self.base.glob("calls-*"))))))
@@ -162,6 +174,7 @@ class EdlRunnerTests(unittest.TestCase):
     def test_no_loader_shim_mode_matches_transcript_and_exits_cleanly_on_sigint(self):
         env = dict(self.env, OPENSTICK_EDL_NO_LOADER_SIM="1", OPENSTICK_EDL_SIGNAL_FILE=str(self.base / "no-loader-signal"))
         process = subprocess.Popen([str(self.shim), "getstorageinfo"], env=env,
+                                   stdin=subprocess.DEVNULL,
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:
             import time
@@ -178,7 +191,7 @@ class EdlRunnerTests(unittest.TestCase):
         self.assertTrue((self.base / "no-loader-signal").exists())
 
     def test_shim_fails_calls_missing_required_flags(self):
-        result = subprocess.run([str(self.shim), "getstorageinfo"], env=self.env,
+        result = run_test_process([str(self.shim), "getstorageinfo"], env=self.env,
                                 capture_output=True, text=True)
         self.assertEqual(result.returncode, 91)
         self.assertIn("every call must include --loader", result.stderr)
@@ -186,10 +199,10 @@ class EdlRunnerTests(unittest.TestCase):
     def test_shim_models_fresh_then_consumed_session_and_power_cycle(self):
         session = self.base / "session-state"
         env = dict(self.env, OPENSTICK_EDL_SESSION_FILE=str(session))
-        first = subprocess.run([str(self.shim), "rs", "0", "1", str(self.base / "first.bin"),
+        first = run_test_process([str(self.shim), "rs", "0", "1", str(self.base / "first.bin"),
                                 "--loader=" + str(self.loader), "--memory=emmc"],
                                env=env, capture_output=True, text=True)
-        second = subprocess.run([str(self.shim), "rs", "1", "1", str(self.base / "second.bin"),
+        second = run_test_process([str(self.shim), "rs", "1", "1", str(self.base / "second.bin"),
                                  "--loader=" + str(self.loader), "--memory=emmc"],
                                 env=env, capture_output=True, text=True)
         self.assertEqual(first.returncode, 0, first.stderr)
@@ -200,16 +213,16 @@ class EdlRunnerTests(unittest.TestCase):
         self.assertNotIn("Serial:", second.stdout)
 
         helper = ROOT / "tests/shims/bin/edl-power-cycle"
-        reset = subprocess.run([str(helper), str(session)], capture_output=True, text=True)
+        reset = run_test_process([str(helper), str(session)], capture_output=True, text=True)
         self.assertEqual(reset.returncode, 0, reset.stderr)
-        third = subprocess.run([str(self.shim), "rs", "2", "1", str(self.base / "third.bin"),
+        third = run_test_process([str(self.shim), "rs", "2", "1", str(self.base / "third.bin"),
                                 "--loader=" + str(self.loader), "--memory=emmc"],
                                env=env, capture_output=True, text=True)
         self.assertIn("Mode detected: sahara", third.stdout)
 
     def test_shim_absent_transcript_has_no_device_detected_marker(self):
         env = dict(self.env, OPENSTICK_EDL_DEVICE_STATE="absent")
-        result = subprocess.run([str(self.shim), "rs", "0", "1", str(self.base / "absent.bin"),
+        result = run_test_process([str(self.shim), "rs", "0", "1", str(self.base / "absent.bin"),
                                  "--loader=" + str(self.loader), "--memory=emmc"],
                                 env=env, capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -221,7 +234,8 @@ class EdlRunnerTests(unittest.TestCase):
         env = dict(self.env, OPENSTICK_EDL_HANG="sahara", OPENSTICK_EDL_SIGNAL_FILE=str(self.base / "hung-signal"))
         process = subprocess.Popen([str(self.shim), "rs", "0", "1", str(self.base / "hung.bin"),
                                      "--loader=" + str(self.loader), "--memory=emmc"],
-                                    env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                                    env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, text=True)
         try:
             import time
             time.sleep(0.1)

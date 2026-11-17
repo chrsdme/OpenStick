@@ -21,6 +21,12 @@ os.environ["PYTHONPATH"] = guard_pythonpath + (os.pathsep + os.environ["PYTHONPA
 sys.path.insert(0, str(ROOT))
 from tools.installer import store, verify_restore as m5, wizard
 
+def run_test_process(command, *args, **kwargs):
+    """Run non-interactive test children with bounded time and closed stdin."""
+    kwargs.setdefault("stdin", subprocess.DEVNULL)
+    kwargs.setdefault("timeout", 60)
+    return subprocess.run(command, *args, **kwargs)
+
 _FIXTURE_TEMPORARY = tempfile.TemporaryDirectory(prefix="openstick-m7-usb-fixtures-")
 _FIXTURE_ROOT = pathlib.Path(_FIXTURE_TEMPORARY.name)
 _FIXTURE_SYSFS = _FIXTURE_ROOT / "sysfs"
@@ -304,7 +310,7 @@ class WizardTests(unittest.TestCase):
         env = dict(os.environ, PATH=str(fake_bin) + ":/usr/bin:/bin")
         home = self.tmp / "cli-home"
         run_id = "cli-doctor"
-        result = subprocess.run([str(ROOT / "openstick"), "--usb-sysfs-root", str(self.sysfs),
+        result = run_test_process([str(ROOT / "openstick"), "--usb-sysfs-root", str(self.sysfs),
                                  "--usb-device-root", str(self.usb), "--home", str(home), "wizard",
                                  "--id", run_id, "--stage", "doctor"], env=env,
                                 text=True, capture_output=True)
@@ -316,7 +322,7 @@ class WizardTests(unittest.TestCase):
         self.assertIn("PASS EDL client", result.stdout)
         self.assertIn("FAIL Firehose loader", result.stdout)
         self.assertNotIn("AttributeError", result.stderr)
-        backup = subprocess.run([str(ROOT / "openstick"), "--usb-sysfs-root", str(self.sysfs),
+        backup = run_test_process([str(ROOT / "openstick"), "--usb-sysfs-root", str(self.sysfs),
                                  "--usb-device-root", str(self.usb), "--home", str(home), "wizard",
                                  "--id", run_id, "--stage", "backup", "--resume",
                                  "--device", "deadbeef"], env=env, text=True, capture_output=True)
@@ -332,7 +338,7 @@ class WizardTests(unittest.TestCase):
                 os.open(path, os.O_RDONLY)
 
     def test_usb_root_injection_flags_are_hidden_from_public_help(self):
-        result = subprocess.run([str(ROOT / "openstick"), "--help"], text=True, capture_output=True)
+        result = run_test_process([str(ROOT / "openstick"), "--help"], text=True, capture_output=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("--usb-sysfs-root", result.stdout)
         self.assertNotIn("--usb-device-root", result.stdout)
@@ -381,9 +387,12 @@ class WizardTests(unittest.TestCase):
             self.assertTrue(store._inside_git(link / "child" / "future"))
 
     def test_git_ceiling_without_environment_keeps_foreign_marker_fail_closed(self):
+        foreign_repo = self.tmp / "synthetic-foreign-repo"
+        (foreign_repo / ".git").mkdir(parents=True)
+        requested = foreign_repo / "child" / "future"
         with mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop("GIT_CEILING_DIRECTORIES", None)
-            self.assertTrue(store._inside_git(self.tmp / "future"))
+            self.assertTrue(store._inside_git(requested))
 
     def test_wizard_failed_stage_can_be_retried(self):
         state_args = args("doctor", wizard_id="retry-doctor")
@@ -404,21 +413,21 @@ class WizardTests(unittest.TestCase):
             self.assertEqual(cli.resolve_home(), self.tmp / "xdg" / "openstick")
         with mock.patch.dict(os.environ, {"HOME": str(self.tmp / "default-home")}, clear=True):
             self.assertEqual(cli.resolve_home(), self.tmp / "default-home" / ".local/share/openstick")
-        help_result = subprocess.run([str(ROOT / "openstick"), "package", "restore", "--help"],
+        help_result = run_test_process([str(ROOT / "openstick"), "package", "restore", "--help"],
                                      text=True, capture_output=True)
         self.assertEqual(help_result.returncode, 0)
         self.assertIn("--out", help_result.stdout)
         self.assertIn("--output", help_result.stdout)
-        package_help = subprocess.run([str(ROOT / "openstick"), "package", "--help"],
+        package_help = run_test_process([str(ROOT / "openstick"), "package", "--help"],
                                       text=True, capture_output=True)
         self.assertIn("write scripts", package_help.stdout)
         self.assertIn("UNVALIDATED on hardware", package_help.stdout)
         for package_type in ("install", "restore"):
-            type_help = subprocess.run([str(ROOT / "openstick"), "package", package_type, "--help"],
+            type_help = run_test_process([str(ROOT / "openstick"), "package", package_type, "--help"],
                                        text=True, capture_output=True)
             self.assertIn("UNVALIDATED on hardware", type_help.stdout)
             self.assertIn("require typed confirmation", type_help.stdout)
-        help_result = subprocess.run([str(ROOT / "openstick"), "package", "restore", "--help"],
+        help_result = run_test_process([str(ROOT / "openstick"), "package", "restore", "--help"],
                                      text=True, capture_output=True)
         self.assertIn("--out", help_result.stdout)
         self.assertIn("--output", help_result.stdout)
@@ -428,7 +437,7 @@ class WizardTests(unittest.TestCase):
         code = ("from tools.installer import cli; "
                 "cli.doctor = lambda *args: (_ for _ in ()).throw(RuntimeError('detail')); "
                 "raise SystemExit(cli.main(['doctor']))")
-        result = subprocess.run([sys.executable, "-c", code], cwd=ROOT, env=env,
+        result = run_test_process([sys.executable, "-c", code], cwd=ROOT, env=env,
                                 text=True, capture_output=True)
         self.assertEqual(result.returncode, 1)
         self.assertIn("unexpected exception", result.stderr)
@@ -564,7 +573,7 @@ class WizardTests(unittest.TestCase):
         boot.write_bytes(m4.synthetic_boot_image())
         tree = self.tmp / "rootfs-tree"
         (tree / "etc/openstick").mkdir(parents=True)
-        subprocess.run(["mke2fs", "-q", "-t", "ext4", "-F", "-d", str(tree), str(rootfs), "16M"], check=True)
+        run_test_process(["mke2fs", "-q", "-t", "ext4", "-F", "-d", str(tree), str(rootfs), "16M"], check=True)
         boot_sha, rootfs_sha = hashlib.sha256(boot.read_bytes()).hexdigest(), hashlib.sha256(rootfs.read_bytes()).hexdigest()
         manifest = {"schema_version": 1, "build_id": build_id, "board": "ufi103s", "profile": "prod",
                     "artifacts": {"boot.img": {"sha256": boot_sha, "size": boot.stat().st_size},
