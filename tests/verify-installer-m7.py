@@ -12,8 +12,21 @@ import unittest
 from unittest import mock
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
+HOST_PATH_GUARD = ROOT / "tests/host-path-guard"
+sys.path.insert(0, str(HOST_PATH_GUARD))
+from path_guard import install as install_host_path_guard
+install_host_path_guard()
+guard_pythonpath = os.pathsep.join((str(HOST_PATH_GUARD), str(ROOT)))
+os.environ["PYTHONPATH"] = guard_pythonpath + (os.pathsep + os.environ["PYTHONPATH"] if os.environ.get("PYTHONPATH") else "")
 sys.path.insert(0, str(ROOT))
 from tools.installer import store, verify_restore as m5, wizard
+
+_FIXTURE_TEMPORARY = tempfile.TemporaryDirectory(prefix="openstick-m7-usb-fixtures-")
+_FIXTURE_ROOT = pathlib.Path(_FIXTURE_TEMPORARY.name)
+_FIXTURE_SYSFS = _FIXTURE_ROOT / "sysfs"
+_FIXTURE_DEV = _FIXTURE_ROOT / "dev"
+_FIXTURE_SYSFS.mkdir()
+_FIXTURE_DEV.mkdir()
 
 
 def args(stage, **values):
@@ -23,7 +36,8 @@ def args(stage, **values):
                     wizard_image_set="/tmp/synthetic-image-set", wizard_board="ufi103s",
                     wizard_profile="prod", wizard_host=None, dry_run=False,
                     bake_user_env=False, paranoid=False, i_accept_untested=False,
-                    reconcile_state=False)
+                    reconcile_state=False, usb_sysfs_root=str(_FIXTURE_SYSFS),
+                    usb_device_root=str(_FIXTURE_DEV))
     defaults.update(values)
     return types.SimpleNamespace(**defaults)
 
@@ -41,6 +55,10 @@ class WizardTests(unittest.TestCase):
             (self.home / name).mkdir(mode=0o700)
         self.repo = self.tmp / "builder"
         self.repo.mkdir()
+        self.sysfs = self.tmp / "sysfs"
+        self.sysfs.mkdir()
+        self.usb = self.tmp / "usb"
+        self.usb.mkdir()
 
     def tearDown(self):
         import shutil
@@ -286,7 +304,8 @@ class WizardTests(unittest.TestCase):
         env = dict(os.environ, PATH=str(fake_bin) + ":/usr/bin:/bin")
         home = self.tmp / "cli-home"
         run_id = "cli-doctor"
-        result = subprocess.run([str(ROOT / "openstick"), "--home", str(home), "wizard",
+        result = subprocess.run([str(ROOT / "openstick"), "--usb-sysfs-root", str(self.sysfs),
+                                 "--usb-device-root", str(self.usb), "--home", str(home), "wizard",
                                  "--id", run_id, "--stage", "doctor"], env=env,
                                 text=True, capture_output=True)
         state_path = home / "wizard" / (run_id + ".json")
@@ -297,7 +316,8 @@ class WizardTests(unittest.TestCase):
         self.assertIn("PASS EDL client", result.stdout)
         self.assertIn("FAIL Firehose loader", result.stdout)
         self.assertNotIn("AttributeError", result.stderr)
-        backup = subprocess.run([str(ROOT / "openstick"), "--home", str(home), "wizard",
+        backup = subprocess.run([str(ROOT / "openstick"), "--usb-sysfs-root", str(self.sysfs),
+                                 "--usb-device-root", str(self.usb), "--home", str(home), "wizard",
                                  "--id", run_id, "--stage", "backup", "--resume",
                                  "--device", "deadbeef"], env=env, text=True, capture_output=True)
         self.assertEqual(backup.returncode, 2)
@@ -305,6 +325,17 @@ class WizardTests(unittest.TestCase):
         state = json.loads(state_path.read_text())
         self.assertEqual([item["name"] for item in state["stages"]], ["doctor"])
         self.assertEqual(state["stages"][0]["status"], "failed")
+
+    def test_host_usb_path_guard_blocks_real_sysfs_and_dev(self):
+        for path in ("/sys/bus/usb/devices", "/dev/bus/usb"):
+            with self.subTest(path=path), self.assertRaisesRegex(RuntimeError, "TEST SAFETY GUARD"):
+                os.open(path, os.O_RDONLY)
+
+    def test_usb_root_injection_flags_are_hidden_from_public_help(self):
+        result = subprocess.run([str(ROOT / "openstick"), "--help"], text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("--usb-sysfs-root", result.stdout)
+        self.assertNotIn("--usb-device-root", result.stdout)
 
     def test_inside_git_walks_markers_even_when_git_is_unavailable_and_through_symlinks(self):
         repo = self.tmp / "repo"
@@ -395,7 +426,7 @@ class WizardTests(unittest.TestCase):
     def test_cli_unknown_exception_is_one_line_and_exit_one(self):
         env = dict(os.environ, PYTHONPATH=str(ROOT), OPENSTICK_HOME=str(self.tmp / "home"))
         code = ("from tools.installer import cli; "
-                "cli.doctor = lambda args: (_ for _ in ()).throw(RuntimeError('detail')); "
+                "cli.doctor = lambda *args: (_ for _ in ()).throw(RuntimeError('detail')); "
                 "raise SystemExit(cli.main(['doctor']))")
         result = subprocess.run([sys.executable, "-c", code], cwd=ROOT, env=env,
                                 text=True, capture_output=True)
@@ -510,8 +541,15 @@ class WizardTests(unittest.TestCase):
         ssh.chmod(0o700)
         env = dict(os.environ, OPENSTICK_FAKE_EMMC=str(disk),
                    OPENSTICK_EDL_CALL_FILE=str(self.tmp / "edl-calls"),
+                   OPENSTICK_EDL_SESSION_FILE=str(self.tmp / "edl-session"),
                    OPENSTICK_EDL_DIR=str(bin_dir),
                    PATH=str(bin_dir) + ":" + str(ROOT / "tests/shims/bin") + ":/usr/bin:/bin")
+        usb_fixture = _FIXTURE_SYSFS / "1-1"
+        usb_fixture.mkdir()
+        self.addCleanup(__import__("shutil").rmtree, usb_fixture, ignore_errors=True)
+        for name, value in (("idVendor", "05c6"), ("idProduct", "9008"),
+                            ("busnum", "001"), ("devnum", "009")):
+            (usb_fixture / name).write_text(value + "\n", encoding="ascii")
 
         # A valid seed and registered generic build are fixture inputs; the
         # wizard still calls the real parser/manifest validators and injector.

@@ -61,6 +61,12 @@ def make_disk(path):
     return parts
 
 
+def seed_fake_session_identity(session):
+    """Represent identity already captured by a fake `_live` implementation."""
+    if session is not None:
+        session.identity = {"serial": "deadbeef", "hwid": "007050e100000000", "pk_hash": "0" * 64}
+
+
 class M5Tests(unittest.TestCase):
     def setUp(self):
         self.tmp = pathlib.Path(tempfile.mkdtemp(prefix="openstick-m5-"))
@@ -258,7 +264,8 @@ exec /usr/bin/sha256sum "$@"
         with self.disk.open("r+b") as f:
             f.seek(self.parts["userdata"][0] * 512 + 17); f.write(b"changed")
         fake_loader = self.tmp / "loader.mbn"; fake_loader.write_bytes(b"synthetic loader")
-        fake_live = lambda edl, env, loader, directory, ident: ("deadbeef", self.identity, self.disk, self.parts)
+        fake_live = lambda edl, env, loader, directory, ident, session=None: (
+            seed_fake_session_identity(session) or ("deadbeef", self.identity, self.disk, self.parts))
         args = types.SimpleNamespace(restore_device="deadbeef", restore_backup="synthetic", dry_run=False,
                                      restore_reconcile_state=False)
         with mock.patch.dict(os.environ, self.env, clear=True), \
@@ -325,7 +332,8 @@ exec /usr/bin/sha256sum "$@"
     def test_restore_dry_run_is_read_only_and_hostile_host_refused(self):
         args = types.SimpleNamespace(restore_device="deadbeef", restore_backup="synthetic", dry_run=True)
         live_parts = self.parts
-        def fake_live(edl, env, loader, directory, device_id):
+        def fake_live(edl, env, loader, directory, device_id, session=None):
+            seed_fake_session_identity(session)
             copy = pathlib.Path(directory) / "fake-live.bin"
             copy.write_bytes(self.disk.read_bytes())
             return "deadbeef", self.identity, copy, live_parts
@@ -341,14 +349,16 @@ exec /usr/bin/sha256sum "$@"
     def test_restore_rejects_unpinned_loader_and_live_identity_mismatch(self):
         args = types.SimpleNamespace(restore_device="deadbeef", restore_backup="synthetic", dry_run=True)
         fake_loader = self.tmp / "loader.mbn"; fake_loader.write_bytes(b"synthetic loader")
-        fake_live = lambda edl, env, loader, directory, ident: ("deadbeef", self.identity, self.disk, self.parts)
+        fake_live = lambda edl, env, loader, directory, ident, session=None: (
+            seed_fake_session_identity(session) or ("deadbeef", self.identity, self.disk, self.parts))
         with mock.patch.dict(os.environ, self.env, clear=True), \
              mock.patch.object(m5, "_live", side_effect=fake_live), \
              mock.patch.object(m5.edl_runner, "PINNED_LOADER_SHA256", "0" * 64):
             with self.assertRaisesRegex(store.RefusedError, "pinned Firehose loader"):
                 m5.restore_command(args, self.home, ROOT)
         wrong = dict(self.identity); wrong["fsg"] = "0" * 64
-        fake_live_wrong = lambda edl, env, loader, directory, ident: ("deadbeef", wrong, self.disk, self.parts)
+        fake_live_wrong = lambda edl, env, loader, directory, ident, session=None: (
+            seed_fake_session_identity(session) or ("deadbeef", wrong, self.disk, self.parts))
         with mock.patch.dict(os.environ, self.env, clear=True), \
              mock.patch.object(m5, "_live", side_effect=fake_live_wrong), \
              mock.patch.object(m5.shutil, "which", return_value=str(self.fake_edl_path)), \
@@ -361,7 +371,8 @@ exec /usr/bin/sha256sum "$@"
     def test_wrong_typed_confirmation_and_fwlib_test_override_do_not_write(self):
         with self.disk.open("r+b") as f:
             f.seek(self.parts["userdata"][0] * 512 + 17); f.write(b"changed")
-        fake_live = lambda edl, env, loader, directory, ident: ("deadbeef", self.identity, self.disk, self.parts)
+        fake_live = lambda edl, env, loader, directory, ident, session=None: (
+            seed_fake_session_identity(session) or ("deadbeef", self.identity, self.disk, self.parts))
         args = types.SimpleNamespace(restore_device="deadbeef", restore_backup="synthetic", dry_run=False)
         with mock.patch.dict(os.environ, dict(self.env, FWLIB_TEST_LDR_SHA="0" * 64), clear=True), \
              mock.patch.object(m5, "_live", side_effect=fake_live), \
@@ -427,7 +438,8 @@ exec /usr/bin/sha256sum "$@"
         original = (self.backup / "emmc-full.bin").read_bytes()
         fake_loader = self.tmp / "loader.mbn"; fake_loader.write_bytes(b"synthetic loader")
         args = types.SimpleNamespace(restore_device="deadbeef", restore_backup="synthetic", dry_run=False)
-        fake_live = lambda edl, env, loader, directory, ident: ("deadbeef", self.identity, self.disk, self.parts)
+        fake_live = lambda edl, env, loader, directory, ident, session=None: (
+            seed_fake_session_identity(session) or ("deadbeef", self.identity, self.disk, self.parts))
         confirmations = []
         def confirm(phase, ident):
             value = "restore %s %s" % (ident[-8:], phase); confirmations.append(value); return value
@@ -458,7 +470,8 @@ exec /usr/bin/sha256sum "$@"
             f.seek(self.parts["userdata"][0] * 512 + 17); f.write(b"changed")
         fake_loader = self.tmp / "loader.mbn"; fake_loader.write_bytes(b"synthetic loader")
         args = types.SimpleNamespace(restore_device="deadbeef", restore_backup="synthetic", dry_run=False)
-        fake_live = lambda edl, env, loader, directory, ident: ("deadbeef", self.identity, self.disk, self.parts)
+        fake_live = lambda edl, env, loader, directory, ident, session=None: (
+            seed_fake_session_identity(session) or ("deadbeef", self.identity, self.disk, self.parts))
         def bad_final(edl, edl_args, env, loader=None, **kwargs):
             self.fake_edl(edl, edl_args, env)
             if edl_args[0] == "rf":
@@ -484,7 +497,8 @@ exec /usr/bin/sha256sum "$@"
         with self.disk.open("r+b") as f:
             f.seek(self.parts["userdata"][0] * 512 + 17); f.write(b"changed")
         fake_loader = self.tmp / "loader.mbn"; fake_loader.write_bytes(b"synthetic loader")
-        fake_live = lambda edl, env, loader, directory, ident: ("deadbeef", self.identity, self.disk, self.parts)
+        fake_live = lambda edl, env, loader, directory, ident, session=None: (
+            seed_fake_session_identity(session) or ("deadbeef", self.identity, self.disk, self.parts))
         real_edl = m5._edl
         def timeout_final(edl, edl_args, env, loader=None, **kwargs):
             if edl_args[0] == "rf":
@@ -515,7 +529,8 @@ exec /usr/bin/sha256sum "$@"
         fake_loader = self.tmp / "loader.mbn"; fake_loader.write_bytes(b"synthetic loader")
         args = types.SimpleNamespace(restore_device="deadbeef", restore_backup="synthetic", dry_run=False,
                                      restore_reconcile_state=False)
-        fake_live = lambda edl, env, loader, directory, ident: ("deadbeef", self.identity, self.disk, self.parts)
+        fake_live = lambda edl, env, loader, directory, ident, session=None: (
+            seed_fake_session_identity(session) or ("deadbeef", self.identity, self.disk, self.parts))
         self.fail_control.write_text("%d fail\n" % self.parts["cache"][0])
         patches = [mock.patch.dict(os.environ, self.env, clear=True),
                    mock.patch.object(m5, "_live", side_effect=fake_live),
@@ -568,7 +583,8 @@ exec /usr/bin/sha256sum "$@"
         fake_loader = self.tmp / "loader.mbn"; fake_loader.write_bytes(b"synthetic loader")
         args = types.SimpleNamespace(restore_device="deadbeef", restore_backup="synthetic", dry_run=False,
                                      restore_reconcile_state=False)
-        fake_live = lambda edl, env, loader, directory, ident: ("deadbeef", self.identity, self.disk, self.parts)
+        fake_live = lambda edl, env, loader, directory, ident, session=None: (
+            seed_fake_session_identity(session) or ("deadbeef", self.identity, self.disk, self.parts))
         gpt_secondary = self.disk.stat().st_size // 512 - 33
         self.fail_control.write_text("%d complete\n" % gpt_secondary)
         with mock.patch.dict(os.environ, self.env, clear=True), \
@@ -618,7 +634,8 @@ exec /usr/bin/sha256sum "$@"
         fake_loader = self.tmp / "loader.mbn"; fake_loader.write_bytes(b"synthetic loader")
         args = types.SimpleNamespace(restore_device="deadbeef", restore_backup="synthetic", dry_run=False,
                                      restore_reconcile_state=False)
-        fake_live = lambda edl, env, loader, directory, ident: ("deadbeef", self.identity, self.disk, self.parts)
+        fake_live = lambda edl, env, loader, directory, ident, session=None: (
+            seed_fake_session_identity(session) or ("deadbeef", self.identity, self.disk, self.parts))
         self.fail_control.write_text("%d partial\n" % self.parts["cache"][0])
         with mock.patch.dict(os.environ, self.env, clear=True), \
              mock.patch.object(m5, "_live", side_effect=fake_live), \

@@ -358,7 +358,9 @@ def _args_for(args, stage, state, home=None):
     chosen = state["selection"]
     common = {"home": str(home) if home is not None else getattr(args, "home", None),
               "dry_run": bool(getattr(args, "dry_run", False)),
-              "board": chosen.get("board"), "device": chosen.get("device_id")}
+              "board": chosen.get("board"), "device": chosen.get("device_id"),
+              "usb_sysfs_root": getattr(args, "usb_sysfs_root", "/sys/bus/usb/devices"),
+              "usb_device_root": getattr(args, "usb_device_root", "/dev/bus/usb")}
     if stage == "backup":
         return Namespace(**common, paranoid=bool(getattr(args, "paranoid", False)),
                          again=bool(getattr(args, "again", False)))
@@ -395,13 +397,17 @@ def _args_for(args, stage, state, home=None):
 def _execute(args, home, repo, stage, state):
     if stage == "doctor":
         from . import cli
-        return cli.doctor(_args_for(args, stage, state, home))
+        prepared = _args_for(args, stage, state, home)
+        return cli.doctor(prepared, prepared.usb_sysfs_root, prepared.usb_device_root)
     if stage == "backup":
         from . import cli
         if state["selection"].get("backup_id"):
             _device_and_backup(home, state["selection"])
             return EXIT_OK
-        return cli.backup_command(_args_for(args, stage, state, home), home)
+        prepared = _args_for(args, stage, state, home)
+        from . import edl_runner
+        with edl_runner.Session(sysfs_root=prepared.usb_sysfs_root) as session:
+            return cli.backup_command(prepared, home, session=session)
     if stage == "configure":
         from . import configure
         selected = state["selection"]

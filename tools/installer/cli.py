@@ -64,6 +64,8 @@ def parser():
     p.add_argument("--show-serial", action="store_true", help="show the full device serial in console output")
     p.add_argument("--board", metavar="NAME", help="select a board class")
     p.add_argument("--device", metavar="ID", help="select a registered device")
+    p.add_argument("--usb-sysfs-root", default="/sys/bus/usb/devices", help=argparse.SUPPRESS)
+    p.add_argument("--usb-device-root", default="/dev/bus/usb", help=argparse.SUPPRESS)
     subs = p.add_subparsers(dest="command", required=True)
     subs.add_parser("doctor", help="check local prerequisites and private store")
     device = subs.add_parser("device", help="manage the local device registry")
@@ -627,9 +629,11 @@ def push_seed(args, root):
     return EXIT_OK
 
 
-def main(argv=None, *, usb_sysfs_root="/sys/bus/usb/devices", usb_device_root="/dev/bus/usb"):
+def main(argv=None, *, usb_sysfs_root=None, usb_device_root=None):
     args = parser().parse_args(argv)
     args.home = str(resolve_home(args.home))
+    usb_sysfs_root = usb_sysfs_root if usb_sysfs_root is not None else args.usb_sysfs_root
+    usb_device_root = usb_device_root if usb_device_root is not None else args.usb_device_root
     try:
         if args.command == "doctor":
             return doctor(args, usb_sysfs_root=usb_sysfs_root, usb_device_root=usb_device_root)

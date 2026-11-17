@@ -25,6 +25,14 @@ class EdlRunnerTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory(prefix="openstick-m2-")
         self.addCleanup(self.temp.cleanup)
         self.base = pathlib.Path(self.temp.name)
+        self.usb_sysfs_root = self.base / "sysfs"
+        self.usb_device_root = self.base / "dev"
+        usb = self.usb_sysfs_root / "1-1"
+        usb.mkdir(parents=True)
+        self.usb_device_root.mkdir()
+        for name, value in (("idVendor", "05c6"), ("idProduct", "9008"),
+                            ("busnum", "001"), ("devnum", "009")):
+            (usb / name).write_text(value + "\n", encoding="ascii")
         self.old_ceiling = os.environ.get("GIT_CEILING_DIRECTORIES")
         os.environ["GIT_CEILING_DIRECTORIES"] = str(self.base.parent)
         self.addCleanup(self._restore_ceiling)
@@ -41,6 +49,7 @@ class EdlRunnerTests(unittest.TestCase):
             "PATH": str(self.edl_dir) + os.pathsep + str(ROOT / "tests/shims/bin") + os.pathsep + "/usr/bin:/bin",
             "OPENSTICK_EDL_COMMAND_FILE": str(self.base / "edl-commands.log"),
             "OPENSTICK_EDL_CALL_FILE": str(self.base / "edl-count"),
+            "OPENSTICK_EDL_SESSION_FILE": str(self.base / "edl-session"),
             "OPENSTICK_FAKE_EMMC": str(self.base / "disk.img"),
         })
         subprocess.check_call([sys.executable, str(ROOT / "tests/make-fake-emmc.py"), self.env["OPENSTICK_FAKE_EMMC"], "--mib", "2"])
@@ -55,6 +64,8 @@ class EdlRunnerTests(unittest.TestCase):
         return mock.patch.object(edl_runner, "PINNED_LOADER_SHA256", hashlib.sha256(self.loader.read_bytes()).hexdigest())
 
     def run_cli_backup(self, home, options=(), env_extra=None, verbose=False):
+        subprocess.check_call([str(ROOT / "tests/shims/bin/edl-power-cycle"),
+                               self.env["OPENSTICK_EDL_SESSION_FILE"]])
         environment = dict(self.env)
         environment["OPENSTICK_EDL_CALL_FILE"] = str(self.base / ("calls-" + str(len(list(self.base.glob("calls-*"))))))
         environment.update(env_extra or {})
@@ -65,7 +76,8 @@ class EdlRunnerTests(unittest.TestCase):
         output = io.StringIO()
         with mock.patch.dict(os.environ, environment, clear=True), self._with_fixture_pin(), \
                 contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
-            status = cli.main(argv)
+            status = cli.main(argv, usb_sysfs_root=self.usb_sysfs_root,
+                              usb_device_root=self.usb_device_root)
         return status, output.getvalue(), environment
 
     def test_backup_identity_uses_sahara_serial_and_required_loader_flags(self):
@@ -131,10 +143,11 @@ class EdlRunnerTests(unittest.TestCase):
         with mock.patch.dict(os.environ, env, clear=True), self._with_fixture_pin(), \
                 mock.patch.object(edl_runner, "IDENTITY_READ_TIMEOUT_SECONDS", 0.15), \
                 contextlib.redirect_stderr(output), contextlib.redirect_stdout(output):
-            result = cli.main(args)
-        self.assertEqual(result, cli.EXIT_ERROR)
+            result = cli.main(args, usb_sysfs_root=self.usb_sysfs_root,
+                              usb_device_root=self.usb_device_root)
+        self.assertEqual(result, cli.EXIT_REFUSED)
         self.assertIn("Unplug USB for 30 s", output.getvalue())
-        self.assertIn("[!] Exiting cleanly", output.getvalue())
+        self.assertIn("The EDL client started the handshake but the board stopped responding", output.getvalue())
         self.assertTrue((self.base / "signal-seen").exists(), "shim did not observe SIGINT")
         self.assertFalse((home / "registry.json").exists())
         self.assertFalse(list((home / "backups").glob("**/manifest.json")))
@@ -169,6 +182,59 @@ class EdlRunnerTests(unittest.TestCase):
                                 capture_output=True, text=True)
         self.assertEqual(result.returncode, 91)
         self.assertIn("every call must include --loader", result.stderr)
+
+    def test_shim_models_fresh_then_consumed_session_and_power_cycle(self):
+        session = self.base / "session-state"
+        env = dict(self.env, OPENSTICK_EDL_SESSION_FILE=str(session))
+        first = subprocess.run([str(self.shim), "rs", "0", "1", str(self.base / "first.bin"),
+                                "--loader=" + str(self.loader), "--memory=emmc"],
+                               env=env, capture_output=True, text=True)
+        second = subprocess.run([str(self.shim), "rs", "1", "1", str(self.base / "second.bin"),
+                                 "--loader=" + str(self.loader), "--memory=emmc"],
+                                env=env, capture_output=True, text=True)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertIn("Mode detected: sahara", first.stdout)
+        self.assertIn("Loader successfully uploaded", first.stdout)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertIn("Mode detected: firehose", second.stdout)
+        self.assertNotIn("Serial:", second.stdout)
+
+        helper = ROOT / "tests/shims/bin/edl-power-cycle"
+        reset = subprocess.run([str(helper), str(session)], capture_output=True, text=True)
+        self.assertEqual(reset.returncode, 0, reset.stderr)
+        third = subprocess.run([str(self.shim), "rs", "2", "1", str(self.base / "third.bin"),
+                                "--loader=" + str(self.loader), "--memory=emmc"],
+                               env=env, capture_output=True, text=True)
+        self.assertIn("Mode detected: sahara", third.stdout)
+
+    def test_shim_absent_transcript_has_no_device_detected_marker(self):
+        env = dict(self.env, OPENSTICK_EDL_DEVICE_STATE="absent")
+        result = subprocess.run([str(self.shim), "rs", "0", "1", str(self.base / "absent.bin"),
+                                 "--loader=" + str(self.loader), "--memory=emmc"],
+                                env=env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Waiting for the device", result.stdout)
+        self.assertIn("Exiting cleanly", result.stdout)
+        self.assertNotIn("Device detected", result.stdout)
+
+    def test_shim_hung_mode_stops_after_sahara_loader_upload(self):
+        env = dict(self.env, OPENSTICK_EDL_HANG="sahara", OPENSTICK_EDL_SIGNAL_FILE=str(self.base / "hung-signal"))
+        process = subprocess.Popen([str(self.shim), "rs", "0", "1", str(self.base / "hung.bin"),
+                                     "--loader=" + str(self.loader), "--memory=emmc"],
+                                    env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            import time
+            time.sleep(0.1)
+            process.send_signal(signal.SIGINT)
+            stdout, stderr = process.communicate(timeout=3)
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                process.wait(timeout=3)
+        self.assertIn("Mode detected: sahara", stdout)
+        self.assertIn("Loader successfully uploaded", stdout)
+        self.assertNotIn("Mode detected: firehose", stdout)
+        self.assertIn("Exiting cleanly", stdout)
 
     def test_backup_again_paranoid_short_read_and_failures_keep_registry_atomic(self):
         home = self.base / "repeat-home"
