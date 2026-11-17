@@ -8,6 +8,14 @@ fi
 operation=${1:-}
 [[ -n $operation ]] || { echo 'FAKE EDL REFUSED: missing operation' >&2; exit 2; }
 shift
+session_file=${OPENSTICK_EDL_SESSION_FILE:-}
+session_calls=0
+if [[ -n $session_file && -f $session_file ]]; then read -r session_calls < "$session_file"; fi
+if [[ -n $session_file ]]; then
+  session_calls=$((session_calls + 1))
+  mkdir -p -- "$(dirname -- "$session_file")"
+  printf '%s\n' "$session_calls" > "$session_file"
+fi
 positional=()
 loader=
 memory=
@@ -57,14 +65,42 @@ if [[ $loader != /* || ! -f $loader ]]; then
   exit 91
 fi
 
-printf 'Qualcomm Sahara / Firehose Client V3.62 (c) B.Kerler 2018-2025.\n'
-printf 'main - Trying with loader given ...\nmain - Waiting for the device\n......\nmain - Device detected :)\n'
-printf 'sahara - Protocol version: 2, Version supported: 1\nmain - Mode detected: sahara\nsahara -\n\nVersion 0x2\n------------------------\n'
-printf 'HWID:              0x007050e100000000 (MSM_ID:0x007050e1,OEM_ID:0x0000,MODEL_ID:0x0000)\n'
-printf 'CPU detected:      "MSM8916"\nPK_HASH:           0x0000000000000000000000000000000000000000000000000000000000000000\nSerial:            0xdeadbeef\n\n'
-printf 'sahara - Uploading loader ...\nfirehose - MemoryName=emmc\nfirehose - Running configure...\nfirehose\n'
+if [[ ${OPENSTICK_EDL_DEVICE_STATE:-present} == absent ]]; then
+  printf 'Qualcomm Sahara / Firehose Client V3.62 (c) B.Kerler 2018-2025.\n'
+  printf 'main - Waiting for the device\n......\n'
+  printf 'main - Hint:   Press and hold vol up+dwn, connect usb. For some, only use vol up.\n'
+  printf 'main - Xiaomi: Press and hold vol dwn + pwr, in fastboot mode connect usb.\n'
+  printf 'main - Other:  Run "adb reboot edl"\n..............\n'
+  printf '[!] Exiting cleanly…\n'
+  exit 0
+fi
 
-if [[ ${OPENSTICK_EDL_HANG:-0} == 1 ]]; then
+fresh_session=1
+if [[ -n $session_file && $session_calls -gt 1 ]]; then fresh_session=0; fi
+if (( fresh_session )); then
+  printf 'Qualcomm Sahara / Firehose Client V3.62 (c) B.Kerler 2018-2025.\n'
+  printf 'main - Waiting for the device\n......\nmain - Device detected :)\n'
+  printf 'sahara - Protocol version: 2, Version supported: 1\nmain - Mode detected: sahara\nsahara -\n\nVersion 0x2\n------------------------\n'
+  printf 'HWID:              0x007050e100000000 (MSM_ID:0x007050e1,OEM_ID:0x0000,MODEL_ID:0x0000)\n'
+  printf 'CPU detected:      "MSM8916"\nPK_HASH:           0x0000000000000000000000000000000000000000000000000000000000000000\nSerial:            0xdeadbeef\n\n'
+  printf 'sahara - Uploading loader %s ...\nsahara - 32-Bit mode detected.\nsahara - Loader successfully uploaded.\n' "$loader"
+  if [[ ${OPENSTICK_EDL_HANG:-0} != 0 ]]; then
+    handle_interrupt() {
+      [[ -z ${OPENSTICK_EDL_SIGNAL_FILE:-} ]] || printf 'SIGINT\n' > "$OPENSTICK_EDL_SIGNAL_FILE"
+      printf '[!] Exiting cleanly…\n'
+      exit 130
+    }
+    trap handle_interrupt INT
+    while :; do sleep 0.1 & wait "$!" || true; done
+  fi
+else
+  printf 'Qualcomm Sahara / Firehose Client V3.62 (c) B.Kerler 2018-2025.\n'
+  printf 'main - Waiting for the device\n......\nmain - Device detected :)\n'
+  printf 'main - Mode detected: firehose\nfirehose - [LIB]: Host\047s payload to target size is too large\n'
+  printf 'Supported functions:\n'
+fi
+
+if [[ ${OPENSTICK_EDL_HANG:-0} == 1 && $fresh_session == 0 ]]; then
   handle_interrupt() {
     [[ -z ${OPENSTICK_EDL_SIGNAL_FILE:-} ]] || printf 'SIGINT\n' > "$OPENSTICK_EDL_SIGNAL_FILE"
     printf '[!] Exiting cleanly…\n'

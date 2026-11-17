@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -eu
+if (($# != 1)); then
+  echo 'usage: edl-power-cycle SESSION_FILE' >&2
+  exit 2
+fi
+session=$1
+if [[ -L $session ]]; then
+  echo 'FAKE EDL REFUSED: session state must not be a symlink' >&2
+  exit 97
+fi
+rm -f -- "$session"
