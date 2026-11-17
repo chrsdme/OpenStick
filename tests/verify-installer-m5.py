@@ -70,9 +70,17 @@ def seed_fake_session_identity(session):
 class M5Tests(unittest.TestCase):
     def setUp(self):
         self.tmp = pathlib.Path(tempfile.mkdtemp(prefix="openstick-m5-"))
+        self._old_git_ceiling = os.environ.get("GIT_CEILING_DIRECTORIES")
+        os.environ["GIT_CEILING_DIRECTORIES"] = str(self.tmp.parent)
         self.home = store.ensure_store(self.tmp / "private")
         self.disk = self.tmp / "fake-emmc.bin"
         self.parts = make_disk(self.disk)
+        self.sysfs = self.tmp / "sysfs"
+        device = self.sysfs / "1-1"
+        device.mkdir(parents=True)
+        for name, value in (("idVendor", "05c6"), ("idProduct", "9008"),
+                            ("busnum", "001"), ("devnum", "009")):
+            (device / name).write_text(value + "\n", encoding="ascii")
         self.identity = {n: hashlib.sha256(self.disk.read_bytes()[s * 512:(e + 1) * 512]).hexdigest()
                          for n, (s, e) in ((n, self.parts[n]) for n in m5.IDENTITY)}
         self.device = {"id": "deadbeef", "board": "ufi103s", "identity": self.identity,
@@ -224,6 +232,10 @@ exec /usr/bin/sha256sum "$@"
     def tearDown(self):
         import shutil
         shutil.rmtree(self.tmp, ignore_errors=True)
+        if self._old_git_ceiling is None:
+            os.environ.pop("GIT_CEILING_DIRECTORIES", None)
+        else:
+            os.environ["GIT_CEILING_DIRECTORIES"] = self._old_git_ceiling
 
     def _saved_restore_state(self, **overrides):
         data = {"schema": 1, "device_id": "deadbeef", "backup_id": "synthetic",
@@ -514,7 +526,7 @@ exec /usr/bin/sha256sum "$@"
              mock.patch.object(m5, "_live_identity_only"), \
              mock.patch.object(m5, "_confirm", side_effect=lambda phase, ident: "restore %s %s" % (ident[-8:], phase)), \
              mock.patch.object(m5, "_edl", side_effect=timeout_final):
-            self.assertEqual(m5.common.main(argv), m5.common.EXIT_VERIFY)
+            self.assertEqual(m5.common.main(argv, usb_sysfs_root=self.sysfs), m5.common.EXIT_VERIFY)
         state = json.loads((self.home / "devices/deadbeef/restore-state.json").read_text())
         self.assertEqual(state["status"], "final-readback-failed")
         self.assertIn("full-disk readback failed", state["failure"])
