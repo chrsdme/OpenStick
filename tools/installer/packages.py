@@ -556,10 +556,12 @@ _RESTORE_RUNNER_INSPECT = r'''#!/usr/bin/env python3
 import argparse, hashlib, json, os, re, shlex, shutil, signal, subprocess, sys, tempfile
 from pathlib import Path
 PINNED_LOADER_SHA256="959439aa5864685999b713c3ed12ad5fa408149648b670a9a9ef77bcc9dcab14"
-IDENTITY_READ_TIMEOUT_SECONDS=20
+IDENTITY_READ_TIMEOUT_SECONDS=60
 INTERRUPT_GRACE_SECONDS=10
 POWER_CYCLE_HINT='The board may be in a half-open EDL session. Unplug USB for 30 s and reconnect WITHOUT the button, then re-enter EDL.'
 EDL_FAILURE_HINT='Hint: verify EDL mode and the USB connection, confirm the pinned loader, correct the reported issue, and re-enter EDL before retrying.'
+EDL_SESSION_CALLS=0
+EDL_SESSION_USED_NOTE='EDL session used. Before the next command that talks to the board: unplug USB for 30 s, reconnect WITHOUT the button, re-enter EDL. Never use "edl reset".'
 def sha(path):
     h=hashlib.sha256()
     with open(path,'rb') as f:
@@ -587,6 +589,8 @@ def edl_failure(message,out='',err='',verbose=False,debug=False):
         if tail: detail+='\nEDL client output (last lines):\n'+tail
     return detail
 def run_edl(client,operation,loader,timeout,verbose=False,debug=False):
+    global EDL_SESSION_CALLS
+    EDL_SESSION_CALLS+=1
     cmd=client+operation+['--loader='+str(loader),'--memory=emmc']
     print('EDL command: '+shlex.join(cmd))
     p=subprocess.Popen(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
@@ -626,7 +630,7 @@ def resolve_client(requested=None):
  found=shutil.which(requested or 'edl')
  if found: return [str(Path(found).resolve())]
  raise RuntimeError('EDL client unavailable; set OPENSTICK_EDL_DIR or provide an executable path')
-def main():
+def _run_main():
     p=argparse.ArgumentParser(description='Offline verified OpenStick restore package')
     p.add_argument('--edl', help='explicit EDL client executable')
     p.add_argument('--loader', required=True, help='pinned Firehose loader')
@@ -675,6 +679,14 @@ def main():
         return 0
     print('REFUSED: no destructive restore phase is authorized by this standalone package version',file=sys.stderr)
     return 2
+
+def finish_session():
+    if EDL_SESSION_CALLS: print(EDL_SESSION_USED_NOTE)
+def main():
+    global EDL_SESSION_CALLS
+    EDL_SESSION_CALLS=0
+    try: return _run_main()
+    finally: finish_session()
 
 if __name__=='__main__': raise SystemExit(main())
 '''
@@ -807,8 +819,8 @@ from pathlib import Path
 # __STANDALONE_SNAPSHOT__
 PINNED_LOADER_SHA256="959439aa5864685999b713c3ed12ad5fa408149648b670a9a9ef77bcc9dcab14"
 CHUNK=1024*1024
-IDENTITY_READ_TIMEOUT_SECONDS=20
-RANGE_READ_TIMEOUT_SECONDS=120
+IDENTITY_READ_TIMEOUT_SECONDS=60
+RANGE_READ_TIMEOUT_SECONDS=60
 FULL_READ_TIMEOUT_SECONDS=3600
 WRITE_TIMEOUT_SECONDS=600
 INTERRUPT_GRACE_SECONDS=10
@@ -816,6 +828,11 @@ POWER_CYCLE_HINT='The board may be in a half-open EDL session. Unplug USB for 30
 EDL_FAILURE_HINT='Hint: verify EDL mode and the USB connection, confirm the pinned loader, correct the reported issue, and re-enter EDL before retrying.'
 EDL_CLIENT=[]; EDL_LOADER=None; VERBOSE=False; DEBUG=False
 EDL_LAST_OUT=''; EDL_LAST_ERR=''
+EDL_SESSION_IDENTITY=None
+EDL_SESSION_CALLS=0
+EDL_SESSION_USED_NOTE='EDL session used. Before the next command that talks to the board: unplug USB for 30 s, reconnect WITHOUT the button, re-enter EDL. Never use "edl reset".'
+EDL_SYSFS_ROOT='/sys/bus/usb/devices'
+EDL_SESSION_BUS_KEY=None
 def sha(p):
  h=hashlib.sha256()
  with open(p,'rb') as f:
@@ -831,6 +848,37 @@ def edl_failure(message,out=None,err=None):
   tail='\n'.join((str(out or '')+'\n'+str(err or '')).splitlines()[-12:])
   if tail: detail+='\nEDL client output (last lines):\n'+tail
  return detail
+def usb_preflight():
+ if EDL_SYSFS_ROOT is None: return None
+ root=Path(EDL_SYSFS_ROOT)
+ try: entries=sorted(root.iterdir(),key=lambda p:p.name)
+ except OSError: return None
+ normal=None
+ try:
+  for entry in entries:
+   vendor=entry/'idVendor'; product=entry/'idProduct'
+   if not vendor.is_file() or not product.is_file(): continue
+   v=vendor.read_text(encoding='ascii').strip().lower(); p=product.read_text(encoding='ascii').strip().lower()
+   if v!='05c6': continue
+   if p=='9008':
+    bus=entry/'busnum'; dev=entry/'devnum'
+    key=(bus.read_text(encoding='ascii').strip(),dev.read_text(encoding='ascii').strip()) if bus.is_file() and dev.is_file() else None
+    return ('EDL',p,key)
+   if normal is None: normal=p
+ except (OSError,UnicodeError): return None
+ if normal is not None: return ('NORMAL',normal,None)
+ return ('ABSENT','',None)
+def check_usb_session():
+ global EDL_SESSION_BUS_KEY
+ observed=usb_preflight()
+ if observed is None: return
+ state,product,key=observed
+ if EDL_SESSION_BUS_KEY is None:
+  if state=='ABSENT': raise RuntimeError('No Qualcomm EDL device (05c6:9008) is connected. Put the board in EDL mode, then run this command again as the first EDL command of that session.')
+  if state=='NORMAL': raise RuntimeError('The board is connected in normal mode (05c6:%s), not EDL. Enter EDL mode, then run this command again.'%product)
+  EDL_SESSION_BUS_KEY=key
+ elif state!='EDL' or (key is not None and key!=EDL_SESSION_BUS_KEY):
+  raise RuntimeError('The 05c6:9008 USB bus/device number changed during this command; possible board swap. Stop and reconnect the original board before retrying.')
 def edl_refusal(message,result=None):
  out=result.stdout if result is not None else None
  err=result.stderr if result is not None else None
@@ -850,9 +898,11 @@ def resolve_client(requested=None):
  if found: return [str(Path(found).resolve())]
  raise RuntimeError('EDL client unavailable; set OPENSTICK_EDL_DIR or provide an executable path')
 def edl_call(operation,timeout=300,allow_failure=False):
- global EDL_LAST_OUT, EDL_LAST_ERR
+ global EDL_LAST_OUT, EDL_LAST_ERR, EDL_SESSION_IDENTITY, EDL_SESSION_CALLS
+ check_usb_session()
  cmd=EDL_CLIENT+operation+['--loader='+str(EDL_LOADER),'--memory=emmc']
  print('EDL command: '+shlex.join(cmd))
+ EDL_SESSION_CALLS+=1
  p=subprocess.Popen(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,start_new_session=True)
  try: out,err=p.communicate(timeout=timeout)
  except subprocess.TimeoutExpired:
@@ -871,6 +921,20 @@ def edl_call(operation,timeout=300,allow_failure=False):
   EDL_LAST_OUT=out; EDL_LAST_ERR=err
   raise RuntimeError(edl_failure('EDL client timed out. '+POWER_CYCLE_HINT,out,err))
  EDL_LAST_OUT=out; EDL_LAST_ERR=err
+ transcript=out+'\n'+err
+ if EDL_SESSION_IDENTITY is None:
+  if 'Waiting for the device' in transcript and 'Device detected :)' not in transcript:
+   raise RuntimeError('No Qualcomm EDL device (05c6:9008) is connected. Put the board in EDL mode, then run this command again as the first EDL command of that session.')
+  if 'Mode detected: firehose' in transcript and 'Serial:' not in transcript:
+   raise RuntimeError('The board is in EDL, but its Sahara session was already used by an earlier command, so its identity cannot be read again. Unplug USB for 30 s, reconnect WITHOUT the button, re-enter EDL, and run this command first.')
+  if 'Mode detected: sahara' not in transcript:
+   raise RuntimeError(edl_failure('EDL client did not report a fresh Sahara identity block',out,err))
+  EDL_SESSION_IDENTITY=parse_sahara(transcript)
+ elif 'Mode detected: firehose' not in transcript:
+  if 'Mode detected: sahara' in transcript:
+   current=parse_sahara(transcript)
+   if current!=EDL_SESSION_IDENTITY: raise RuntimeError('EDL identity changed during this command; possible board swap.')
+  else: raise RuntimeError(edl_failure('EDL client did not report firehose mode for a later invocation',out,err))
  if p.returncode and not allow_failure:
   raise RuntimeError(edl_failure('EDL client exited unsuccessfully. '+POWER_CYCLE_HINT,out,err))
  return subprocess.CompletedProcess(cmd,p.returncode,out,err)
@@ -884,8 +948,8 @@ def read_identity(directory,expected_id):
  target=Path(directory)/'identity-primary-gpt.bin'
  result=edl_call(['rs','0','34',str(target)],IDENTITY_READ_TIMEOUT_SECONDS)
  if not target.is_file() or target.stat().st_size!=34*512: raise RuntimeError(edl_failure('EDL primary GPT identity range was incomplete',result.stdout,result.stderr))
- try: identity=parse_sahara(result.stdout+'\n'+result.stderr)
- except RuntimeError as exc: raise RuntimeError(edl_failure(str(exc),result.stdout,result.stderr))
+ identity=EDL_SESSION_IDENTITY
+ if not identity: raise RuntimeError(edl_failure('EDL session identity was not captured',result.stdout,result.stderr))
  if expected_id and identity['serial']!=expected_id.lower(): raise RuntimeError('live EDL serial mismatch. Hint: reconnect the intended board in EDL mode.')
  return identity
 def read_range(edl,loader,start,count,path):
@@ -1025,7 +1089,10 @@ def package_ok(root):
   checked=_snapshot_package(root,'restore')
   return checked if checked and validate_transition(checked[0],checked[1],json.loads((checked[0]/'payload/manifest.json').read_text())) else None
  except (OSError,ValueError,KeyError,TypeError,RuntimeError): return None
-def main():
+def _run_main(sysfs_root='/sys/bus/usb/devices'):
+ global EDL_SYSFS_ROOT, EDL_SESSION_BUS_KEY, EDL_SESSION_IDENTITY, EDL_SESSION_CALLS
+ EDL_SYSFS_ROOT=sysfs_root; EDL_SESSION_BUS_KEY=None
+ EDL_SESSION_IDENTITY=None; EDL_SESSION_CALLS=0
  ap=argparse.ArgumentParser(description='Portable, fail-closed phased restore from a complete verified backup. UNVALIDATED on hardware; writes require the normal typed restore confirmation.')
  ap.add_argument('--edl'); ap.add_argument('--loader',required=True); ap.add_argument('--device',required=True)
  ap.add_argument('--phase',default='inspect'); ap.add_argument('--dry-run',action='store_true'); ap.add_argument('--state')
@@ -1187,7 +1254,12 @@ def main():
   edl_refusal(str(e)); return 2
  finally:
   if lock_fd is not None: os.close(lock_fd)
-if __name__=='__main__': raise SystemExit(main())
+def finish_session():
+ if EDL_SESSION_CALLS: print(EDL_SESSION_USED_NOTE)
+def main(sysfs_root='/sys/bus/usb/devices'):
+ try: return _run_main(sysfs_root)
+ finally: finish_session()
+if __name__=='__main__': raise SystemExit(main('/sys/bus/usb/devices'))
 '''
 
 _INSTALL_RUNNER = r'''#!/usr/bin/env python3
@@ -1222,7 +1294,7 @@ def acquire_lock(path):
  except BlockingIOError:
   os.close(fd); raise RuntimeError('another package operation is active; no write was attempted')
  return fd
-def main():
+def main(sysfs_root='/sys/bus/usb/devices'):
  p=argparse.ArgumentParser(description='Portable legacy GPT-B install via the bundled OpenStick flash gates. UNVALIDATED on hardware; writes require the normal typed flash confirmation.')
  p.add_argument('--edl',required=True); p.add_argument('--loader',required=True); p.add_argument('--device',required=True)
  p.add_argument('--state-dir',required=True); p.add_argument('--dry-run',action='store_true'); p.add_argument('--reconcile-state',action='store_true')
@@ -1283,12 +1355,15 @@ def main():
     os.chdir(work)
     args=type('Args',(),{'flash_device':m['device_id'],'image_set':str(staged),'board':m['board'],
       'i_accept_untested':False,'dry_run':a.dry_run,'reconcile_state':a.reconcile_state})()
-    return flash.flash_command(args,state,runtime)
+    session=flash.edl_runner.Session(sysfs_root=sysfs_root)
+    try: return flash.flash_command(args,state,runtime,usb_sysfs_root=sysfs_root,session=session)
+    finally:
+     if session.invocation_count: print(flash.edl_runner.EDL_SESSION_USED_NOTE)
   finally:
    os.close(lock_fd)
  except Exception as exc:
   print('REFUSED: '+str(exc),file=sys.stderr); return 2
-if __name__=='__main__': raise SystemExit(main())
+if __name__=='__main__': raise SystemExit(main('/sys/bus/usb/devices'))
 '''
 
 
