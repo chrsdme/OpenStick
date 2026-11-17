@@ -3,7 +3,8 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 PYTHON=${PYTHON:-python3}
 if [[ -z ${INSTALLER_TEST_TMP-} ]]; then
-  TEST_TMP=$(mktemp -d /tmp/openstick-installer-tests.XXXXXX)
+  TEST_TMP_PARENT=$(cd -- "${TMPDIR:-/tmp}" && pwd -P)
+  TEST_TMP=$(mktemp -d "$TEST_TMP_PARENT/openstick-installer-tests.XXXXXX")
   mkdir -p "$TEST_TMP/shims/bin"
   cp "$ROOT"/tests/shims/bin/* "$TEST_TMP/shims/bin/"
   chmod u+x "$TEST_TMP/shims/bin/"*
@@ -11,10 +12,12 @@ if [[ -z ${INSTALLER_TEST_TMP-} ]]; then
   RUN_LANG=${LANG:-C.UTF-8}
   exec /usr/bin/env -i HOME="$RUN_HOME" PATH="$TEST_TMP/shims/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
     LANG="$RUN_LANG" TMPDIR="$TEST_TMP" INSTALLER_TEST_TMP="$TEST_TMP" \
+    INSTALLER_TEST_TMP_PARENT="$TEST_TMP_PARENT" \
     /bin/bash "$0" "$@" </dev/null
 fi
 TMP=$INSTALLER_TEST_TMP
-unset INSTALLER_TEST_TMP
+TMP_PARENT=$INSTALLER_TEST_TMP_PARENT
+unset INSTALLER_TEST_TMP INSTALLER_TEST_TMP_PARENT
 trap 'rm -rf -- "$TMP"' EXIT
 export TMPDIR="$TMP"
 export GIT_CEILING_DIRECTORIES="$(dirname "$TMP")"
@@ -32,9 +35,12 @@ run() {
   if timeout --signal=TERM --kill-after=5 300 "$@" </dev/null; then printf 'PASS %s\n' "$name"; pass=$((pass + 1)); else printf 'FAIL %s\n' "$name"; fail=$((fail + 1)); fi
 }
 
-run host-usb-path-guard python3 - "$ROOT" "$TMP" <<'PY'
+run host-usb-path-guard python3 - "$ROOT" "$TMP" "$TMP_PARENT" <<'PY'
 import os, pathlib, subprocess, sys
-root, tmp = sys.argv[1:]
+root, tmp, requested_parent = sys.argv[1:]
+assert pathlib.Path(tmp).resolve().parent == pathlib.Path(requested_parent).resolve()
+assert pathlib.Path(tmp).name.startswith("openstick-installer-tests.")
+assert pathlib.Path(os.environ["TMPDIR"]).resolve() == pathlib.Path(tmp).resolve()
 assert not ("OPENSTICK_EDL_DIR" in os.environ or "OPENSTICK_HOME" in os.environ)
 assert os.environ.get("GIT_CEILING_DIRECTORIES") == str(pathlib.Path(tmp).parent)
 assert not any(name.startswith("GIT_") and name != "GIT_CEILING_DIRECTORIES" for name in os.environ)
