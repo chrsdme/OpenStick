@@ -1,7 +1,9 @@
 """Safe process boundary for the external Qualcomm EDL client."""
 import hashlib
+import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -17,7 +19,12 @@ LOADER_NAME = "prog_emmc_firehose_8916.mbn"
 IDENTITY_READ_TIMEOUT_SECONDS = 60
 RANGE_READ_TIMEOUT_SECONDS = 60
 FULL_READ_TIMEOUT_SECONDS = 3600
+WRITE_TIMEOUT_SECONDS = 600
 INTERRUPT_GRACE_SECONDS = 10
+EDL_SESSION_USED_NOTE = (
+    'EDL session used. Before the next command that talks to the board: unplug USB for 30 s, '
+    'reconnect WITHOUT the button, re-enter EDL. Never use "edl reset".'
+)
 POWER_CYCLE_HINT = (
     "The board may be in a half-open EDL session. Unplug USB for 30 s and "
     "reconnect WITHOUT the button, then re-enter EDL."
@@ -129,6 +136,16 @@ class Session:
         self.identity = None
         self._bus_key = None
         self.invocations = 0
+        self._proxy_state = None
+        self._proxy_command = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        if self.invocation_count:
+            print(EDL_SESSION_USED_NOTE)
+        return False
 
     def _before_call(self):
         observed = preflight(self.sysfs_root)
@@ -196,6 +213,165 @@ class Session:
         else:
             raise store.StoreError("EDL client did not report firehose mode for a later session invocation")
         return result
+
+    def proxy_command(self, script_path):
+        """Create a private EDL_CMD adapter for proven shell engines.
+
+        The proxy carries the already captured identity and USB bus/devnum into
+        each engine subprocess, checking sysfs before it starts the client.
+        """
+        if not self.identity or not self.identity.get("serial"):
+            raise store.RefusedError("cannot create an EDL command proxy before capturing Sahara identity")
+        if self._proxy_command is not None:
+            return list(self._proxy_command)
+        script = Path(script_path).absolute()
+        directory = script.parent
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if directory.is_symlink() or not directory.is_dir():
+            raise store.RefusedError("EDL proxy directory must be a regular private directory")
+        os.chmod(directory, 0o700)
+        config_path = script.with_suffix(script.suffix + ".json")
+        config = {
+            "client": _checked_client(self.client),
+            "loader": str(_checked_loader(self.loader)),
+            "loader_sha256": PINNED_LOADER_SHA256,
+            "sysfs_root": os.fspath(self.sysfs_root) if self.sysfs_root is not None else None,
+            "bus_key": list(self._bus_key) if self._bus_key else None,
+            "identity": self.identity,
+            "calls": 0,
+        }
+        for path, contents, mode in (
+            (config_path, json.dumps(config, sort_keys=True) + "\n", 0o600),
+            (script, "#!/usr/bin/env python3\nimport sys\n"
+             "sys.path.insert(0, %r)\nfrom tools.installer.edl_runner import proxy_main\n"
+             "raise SystemExit(proxy_main(%r))\n" %
+             (str(Path(__file__).resolve().parents[2]), str(config_path)), 0o700),
+        ):
+            if path.exists() or path.is_symlink():
+                raise store.RefusedError("EDL proxy output already exists")
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), mode)
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                stream.write(contents)
+            os.chmod(path, mode)
+        self._proxy_state = config_path
+        self._proxy_command = [sys.executable, str(script)]
+        return list(self._proxy_command)
+
+    @property
+    def invocation_count(self):
+        count = self.invocations
+        if self._proxy_state is not None:
+            try:
+                state = json.loads(self._proxy_state.read_text(encoding="utf-8"))
+                count += int(state.get("calls", 0))
+            except (OSError, ValueError, TypeError):
+                pass
+        return count
+
+
+def _save_proxy_state(path, state):
+    temp = Path(path).with_name(Path(path).name + ".tmp-%d" % os.getpid())
+    fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(state, stream, sort_keys=True)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp, path)
+    except BaseException:
+        try:
+            temp.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def proxy_main(config_path):
+    """Entry point for the private EDL_CMD adapter created by Session."""
+    config_path = Path(config_path)
+    if config_path.is_symlink() or not config_path.is_file():
+        print("REFUSED: EDL proxy session state is unavailable", file=sys.stderr)
+        return 2
+    try:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        identity = config.get("identity")
+        if not isinstance(identity, dict) or not identity.get("serial"):
+            raise store.RefusedError("EDL proxy has no captured Sahara identity")
+        client = _checked_client(config.get("client"))
+        loader = Path(config.get("loader", ""))
+        if (loader.is_symlink() or not loader.is_absolute() or not loader.is_file() or
+                _hash(loader) != config.get("loader_sha256")):
+            raise store.RefusedError("pinned Firehose loader SHA-256 does not match EDL proxy state")
+        loader = loader.resolve(strict=True)
+        observed = preflight(config.get("sysfs_root"))
+        expected_bus = tuple(config["bus_key"]) if config.get("bus_key") else None
+        if observed.state == "ABSENT":
+            raise _absent_error()
+        if observed.state == "NORMAL-MODE":
+            raise NormalModeError(
+                "The board is connected in normal mode (05c6:%s), not EDL. Enter EDL mode, then run this command again." % observed.product_id
+            )
+        if expected_bus and observed.state == "EDL-PRESENT":
+            if (observed.busnum, observed.devnum) != expected_bus:
+                raise BoardSwapError(
+                    "The 05c6:9008 USB bus/device number changed during this command; possible board swap. Stop and reconnect the original board before retrying."
+                )
+        elif expected_bus and observed.state != "UNKNOWN":
+            raise BoardSwapError(
+                "The original 05c6:9008 USB device disappeared during this command; possible board swap. Stop and reconnect the original board before retrying."
+            )
+        operation = []
+        saw_loader = saw_memory = False
+        for arg in sys.argv[1:]:
+            if arg.startswith("--loader="):
+                if arg != "--loader=" + str(loader):
+                    raise store.RefusedError("EDL engine requested a loader different from the verified loader")
+                saw_loader = True
+            elif arg.startswith("--memory="):
+                if arg != "--memory=emmc":
+                    raise store.RefusedError("EDL engine requested a non-eMMC memory target")
+                saw_memory = True
+            else:
+                operation.append(arg)
+        if not saw_loader or not saw_memory or not operation:
+            raise store.RefusedError("EDL engine call must include an operation, the verified loader, and --memory=emmc")
+        command = client + operation + ["--loader=" + str(loader), "--memory=emmc"]
+        print("EDL command: " + shlex.join(command))
+        operation_name = operation[0]
+        timeout = (FULL_READ_TIMEOUT_SECONDS if operation_name == "rf" else
+                   WRITE_TIMEOUT_SECONDS if operation_name == "ws" else
+                   RANGE_READ_TIMEOUT_SECONDS)
+        result = None
+        failure = None
+        try:
+            result = run(operation, timeout=timeout, client=client, loader=loader,
+                         _expected_loader_sha256=config.get("loader_sha256"),
+                         verbose=os.environ.get("OPENSTICK_EDL_VERBOSE") == "1",
+                         debug=os.environ.get("OPENSTICK_EDL_DEBUG") == "1")
+        except (EdlRunnerError, store.RefusedError, OSError) as exc:
+            failure = exc
+        finally:
+            config["calls"] = int(config.get("calls", 0)) + 1
+            _save_proxy_state(config_path, config)
+        if failure is not None:
+            print(str(failure), file=sys.stderr)
+            return 1
+        transcript = result.stdout + "\n" + result.stderr
+        if _has_firehose(transcript):
+            pass
+        elif _has_sahara(transcript):
+            current = parse_sahara_info(transcript)
+            if current != identity:
+                raise BoardSwapError("The EDL client reported a different identity during this command; possible board swap.")
+        else:
+            raise store.StoreError("EDL client did not report firehose mode for a later invocation")
+        sys.stdout.write(result.stdout)
+        sys.stderr.write(result.stderr)
+        return result.returncode
+    except (store.StoreError, OSError, ValueError, TypeError) as exc:
+        print("REFUSED: " + str(exc), file=sys.stderr)
+        return 2
 
 
 def _hash(path):
@@ -292,26 +468,27 @@ def _checked_client(client):
     raise store.RefusedError("EDL script command must be Python plus an absolute regular script path")
 
 
-def _checked_loader(loader):
+def _checked_loader(loader, expected_sha256=None):
     if loader is None:
         return resolve_loader()
     path = Path(loader)
     if path.is_symlink() or not path.is_absolute() or not path.is_file():
         raise store.RefusedError("Firehose loader must be an absolute regular non-symlink file")
     absolute = path.resolve(strict=True)
-    if _hash(absolute) != PINNED_LOADER_SHA256:
+    if _hash(absolute) != (expected_sha256 or PINNED_LOADER_SHA256):
         raise store.RefusedError("pinned Firehose loader SHA-256 does not match")
     return absolute
 
 
-def run(args, timeout, *, env=None, cwd=None, verbose=False, debug=False, client=None, loader=None):
+def run(args, timeout, *, env=None, cwd=None, verbose=False, debug=False, client=None,
+        loader=None, _expected_loader_sha256=None):
     """Run the real client with the verified absolute loader and eMMC mode.
 
     Callers pass only EDL operation arguments, for example ``["rs", "0",
     "34", output_path]``. The loader and memory arguments are always added by
     this boundary, so an installer call cannot accidentally use auto-selection.
     """
-    loader = _checked_loader(loader)
+    loader = _checked_loader(loader, _expected_loader_sha256)
     client = _checked_client(client)
     operation = [os.fspath(item) for item in args]
     if any(item == "--loader" or item.startswith("--loader=") or

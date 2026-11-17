@@ -432,7 +432,7 @@ def _confirm(phase, device_id):
     return expected
 
 
-def restore_command(args, home, repo, *, usb_sysfs_root=None):
+def restore_command(args, home, repo, *, usb_sysfs_root=None, session=None):
     registry = store.load_registry(home)
     device = common._find_device(registry, args.restore_device)
     if not device:
@@ -463,8 +463,9 @@ def restore_command(args, home, repo, *, usb_sysfs_root=None):
                             "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"}
             identity_env["OPENSTICK_EDL_VERBOSE"] = "1" if getattr(args, "verbose", False) else "0"
             identity_env["OPENSTICK_EDL_DEBUG"] = "1" if getattr(args, "debug", False) else "0"
-            session = edl_runner.Session(sysfs_root=usb_sysfs_root, client=edl,
-                                         loader=loader, env=identity_env)
+            session = session or edl_runner.Session(sysfs_root=usb_sysfs_root, client=edl,
+                                                    loader=loader, env=identity_env)
+            session.client = edl; session.loader = loader; session.env = identity_env
             _live_identity_only(edl, identity_env, loader, Path(temp), device_id,
                                 parsed, manifest["identity"], session=session)
             start, end = _phase_span(phase, manifest, parsed)
@@ -541,8 +542,9 @@ def restore_command(args, home, repo, *, usb_sysfs_root=None):
         env["OPENSTICK_EDL_VERBOSE"] = "1" if getattr(args, "verbose", False) else "0"
         env["OPENSTICK_EDL_DEBUG"] = "1" if getattr(args, "debug", False) else "0"
         loader = edl_runner.resolve_loader()
-        session = edl_runner.Session(sysfs_root=usb_sysfs_root, client=edl,
-                                     loader=loader, env=env)
+        session = session or edl_runner.Session(sysfs_root=usb_sysfs_root, client=edl,
+                                                loader=loader, env=env)
+        session.client = edl; session.loader = loader; session.env = env
         serial, live_identity, live_dump, live_parts = _live(
             edl, env, loader, work, device_id, session=session)
         if serial != device_id or live_identity != manifest.get("identity") or live_identity != device.get("identity"):
@@ -575,7 +577,8 @@ def restore_command(args, home, repo, *, usb_sysfs_root=None):
             print("Rollback plan phase %s: LBA %d..%d (%d sectors), SHA-256 %s" %
                   (phase, step["start"], step["end"], step["end"] - step["start"] + 1,
                    prepared["expected_sha256"]))
-            _run_fwlib_phase(engine, edl, env, loader, prepared, work, write=False)
+            _run_fwlib_phase(engine, edl, env, loader, prepared, work, write=False,
+                             session=session)
             print("DRY RUN PASS for %s; no write has been invoked." % phase)
             state["confirmation"] = _confirm(phase, device_id)
             if _sha(backup_dir / "emmc-full.bin") != manifest["sha256"]:
@@ -585,7 +588,8 @@ def restore_command(args, home, repo, *, usb_sysfs_root=None):
             state["status"] = "in-progress"
             _save_state(state_path, state)
             try:
-                _run_fwlib_phase(engine, edl, env, loader, prepared, work, write=True)
+                _run_fwlib_phase(engine, edl, env, loader, prepared, work, write=True,
+                                 session=session)
                 readback = work / "fwlib-logs" / ("after-" + phase + ".bin")
                 if not readback.is_file() or readback.stat().st_size != (prepared["end"] - prepared["start"] + 1) * 512 or _sha(readback) != prepared["expected_sha256"]:
                     raise store.RefusedError("existing rollback helper readback mismatch")
@@ -704,13 +708,16 @@ put "$LABEL" "$LBA" "$SECTORS" "$SOURCE" "$MODE"
     return {"directory": directory, "runner": runner}
 
 
-def _run_fwlib_phase(engine, edl, env, loader, prepared, work, write, verbose=False, debug=False):
+def _run_fwlib_phase(engine, edl, env, loader, prepared, work, write,
+                     verbose=False, debug=False, session=None):
     env_verbose, env_debug = _edl_verbose(env)
     verbose = verbose or env_verbose
     debug = debug or env_debug
     phase = prepared["phase"]
     try:
-        edl_prefix = [os.fspath(item) for item in edl] if isinstance(edl, (list, tuple)) else shlex.split(edl)
+        edl_prefix = (session.proxy_command(Path(work) / "fwlib-logs" / "edl-session-proxy.py")
+                      if session is not None else
+                      [os.fspath(item) for item in edl] if isinstance(edl, (list, tuple)) else shlex.split(edl))
     except ValueError:
         edl_prefix = []
     if (not edl_prefix or any(not Path(item).is_absolute() or not re.fullmatch(r"/[A-Za-z0-9._/-]+", item)
@@ -725,6 +732,9 @@ def _run_fwlib_phase(engine, edl, env, loader, prepared, work, write, verbose=Fa
     child_env = {"PATH": _fwlib_path(), "HOME": str(helper_home), "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8",
                  "LDR": str(loader), "W": str(logs), "EDL_CMD": shlex.join(edl_prefix),
                  "PYTHONDONTWRITEBYTECODE": "1"}
+    if session is not None and isinstance(session.env, dict):
+        for name, value in session.env.items():
+            child_env.setdefault(name, value)
     # Never inherit fwlib's test-only loader override from a caller environment.
     child_env.pop("FWLIB_TEST_LDR_SHA", None)
     mode = "write" if write else "dry"

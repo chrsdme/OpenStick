@@ -199,7 +199,7 @@ def _invoke(command, env):
     return returncode
 
 
-def flash_command(args, home, repo, *, usb_sysfs_root=None):
+def flash_command(args, home, repo, *, usb_sysfs_root=None, session=None):
     image_input = Path(args.image_set).absolute()
     if image_input.is_symlink() or store._has_symlink_component(image_input):
         raise store.RefusedError("image-set path contains a symlink")
@@ -262,13 +262,17 @@ def flash_command(args, home, repo, *, usb_sysfs_root=None):
                "OPENSTICK_EDL_VERBOSE": "1" if getattr(args, "verbose", False) else "0",
                "OPENSTICK_EDL_DEBUG": "1" if getattr(args, "debug", False) else "0"}
         env["BACKUP_DIR"] = str(flash_backup)
-        session = edl_runner.Session(sysfs_root=usb_sysfs_root, client=edl_command,
-                                     loader=edl_loader, env=env)
+        session = session or edl_runner.Session(sysfs_root=usb_sysfs_root, client=edl_command,
+                                                loader=edl_loader, env=env)
+        session.client = edl_command
+        session.loader = edl_loader
+        session.env = env
         serial, identity = _live_identity(edl_command, edl_loader, env, temp,
                                           backup_manifest.get("partitions", {}), session=session)
         if serial != device_id or identity != backup_manifest.get("identity") or identity != device.get("identity"):
             raise store.RefusedError("live EDL identity fingerprints do not match the registered verified backup")
         print("Live EDL identity and fsg/sec/fsc fingerprints match the verified backup.")
+        env["EDL_CMD"] = shlex.join(session.proxy_command(Path(temp) / "edl-session-proxy.py"))
         # Preserve the source-tree Path A engines but supply firmware only from
         # the explicitly selected, hash-verified image set.
         source_patha = repo / "tools" / "pathA"
@@ -402,7 +406,8 @@ def flash_command(args, home, repo, *, usb_sysfs_root=None):
             patha_current = _checked_sum_file(data_patha, "SHA256SUMS")
             if not patha_required.issubset(patha_current):
                 raise store.RefusedError("Path A firmware/GPT/rollback hashes are incomplete")
-            serial, identity = _live_identity(edl_command, edl_loader, env, temp, backup_manifest.get("partitions", {}))
+            serial, identity = _live_identity(edl_command, edl_loader, env, temp,
+                                              backup_manifest.get("partitions", {}), session=session)
             if serial != device_id or identity != backup_manifest.get("identity") or identity != device.get("identity"):
                 raise store.RefusedError("live EDL identity fingerprints changed after confirmation")
             phase_env["COMMIT"] = "1"

@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Focused session-state tests with fixture sysfs and the fake EDL client."""
 import hashlib
+import contextlib
+import io
 import json
 import os
 import pathlib
@@ -9,7 +11,6 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from unittest import mock
 from unittest import mock
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -24,6 +25,9 @@ class SessionPreflightTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory(prefix="openstick-edl-session-")
         self.addCleanup(self.temp.cleanup)
         self.base = pathlib.Path(self.temp.name)
+        self.old_ceiling = os.environ.get("GIT_CEILING_DIRECTORIES")
+        os.environ["GIT_CEILING_DIRECTORIES"] = str(self.base.parent)
+        self.addCleanup(self._restore_ceiling)
         self.sysfs = self.base / "sysfs"
         self.sysfs.mkdir()
         self.edl_dir = self.base / "edl-tools"
@@ -38,6 +42,12 @@ class SessionPreflightTests(unittest.TestCase):
                                str(self.disk), "--mib", "2"])
         self.env = dict(os.environ, OPENSTICK_FAKE_EMMC=str(self.disk),
                         OPENSTICK_EDL_SESSION_FILE=str(self.base / "session-state"))
+
+    def _restore_ceiling(self):
+        if self.old_ceiling is None:
+            os.environ.pop("GIT_CEILING_DIRECTORIES", None)
+        else:
+            os.environ["GIT_CEILING_DIRECTORIES"] = self.old_ceiling
 
     def make_session(self):
         return edl_runner.Session(sysfs_root=self.sysfs,
@@ -147,6 +157,10 @@ class SessionPreflightTests(unittest.TestCase):
         self.assertEqual(namespace.get("EDL_SESSION_IDENTITY", {}).get("serial"), "deadbeef")
         self.assertEqual(namespace.get("EDL_SESSION_CALLS"), 2)
         self.assertEqual(int((self.base / "session-state").read_text()), 2)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            namespace["finish_session"]()
+        self.assertEqual(output.getvalue(), edl_runner.EDL_SESSION_USED_NOTE + "\n")
 
     def test_generated_restore_runner_blocks_board_swap_before_later_call(self):
         namespace = self.restore_runner_namespace()
@@ -158,6 +172,110 @@ class SessionPreflightTests(unittest.TestCase):
                 namespace["edl_call"](["rf", str(self.base / "full.bin")], 2)
         self.assertEqual(namespace.get("EDL_SESSION_CALLS"), 1)
         self.assertEqual(int((self.base / "session-state").read_text()), 1)
+
+    def test_session_proxy_checks_board_swap_before_later_client_call(self):
+        session = self.fresh_edl_session()
+        output = io.StringIO()
+        with self.patch_loader_pin():
+            with contextlib.redirect_stdout(output), mock.patch.dict(os.environ, self.env, clear=True):
+                with session:
+                    session.run(["rs", "0", "34", str(self.base / "identity.bin")],
+                                timeout=2, env=self.env)
+                    proxy = session.proxy_command(self.base / "edl-session-proxy.py")
+                    target = self.base / "proxy-read.bin"
+                    args = proxy + ["rf", str(target), "--loader=" + str(self.loader), "--memory=emmc"]
+                    first = subprocess.run(args, capture_output=True, text=True)
+                    self.assertEqual(first.returncode, 0, first.stderr)
+                    self.assertTrue(target.is_file())
+                    (self.sysfs / "1-1" / "devnum").write_text("010\n")
+                    changed = subprocess.run(args, capture_output=True, text=True)
+        self.assertNotEqual(changed.returncode, 0)
+        self.assertIn("bus/device number changed", changed.stderr)
+        self.assertEqual(int((self.base / "session-state").read_text()), 2)
+        self.assertEqual(output.getvalue(), edl_runner.EDL_SESSION_USED_NOTE + "\n")
+
+    def test_flash_identity_refusal_emits_exact_session_note(self):
+        parts = cli._parse_gpt(self.disk)
+        recorded = {name: {"start_lba": start, "end_lba": end}
+                    for name, (start, end) in parts.items()}
+        session = self.fresh_edl_session()
+        output = io.StringIO()
+        with self.patch_loader_pin(), contextlib.redirect_stdout(output):
+            try:
+                with session:
+                    flash._live_identity(session.client, self.loader, self.env, self.base,
+                                         recorded, session=session)
+                    raise store.RefusedError("synthetic pre-write refusal")
+            except store.RefusedError:
+                pass
+        self.assertEqual(output.getvalue(), edl_runner.EDL_SESSION_USED_NOTE + "\n")
+
+    def test_restore_fwlib_engine_uses_session_proxy(self):
+        session = self.fresh_edl_session()
+        target = self.base / "engine-read.bin"
+        runner = self.base / "fake-fwlib-runner.sh"
+        runner.write_text("#!/bin/bash\nset -eu\n$EDL_CMD rf %s --loader=$LDR --memory=emmc\n" % target)
+        runner.chmod(0o700)
+        engine = {"runner": runner}
+        source = self.base / "phase-source.bin"
+        source.write_bytes(b"synthetic phase")
+        prepared = {"phase": "userdata", "start": 0, "end": 0, "source": source}
+        with self.patch_loader_pin():
+            session.run(["rs", "0", "34", str(self.base / "identity.bin")],
+                        timeout=2, env=self.env)
+            verify_restore._run_fwlib_phase(engine, session.client, self.env, self.loader,
+                                            prepared, self.base, write=False, session=session)
+        self.assertTrue(target.is_file())
+        self.assertEqual(session.invocation_count, 2)
+        self.assertEqual(int((self.base / "session-state").read_text()), 2)
+
+    def test_backup_registry_refusal_emits_exact_session_note(self):
+        self.add_usb("1-1", "05c6", "9008", "001", "009")
+        cli_edl_dir = self.base / "cli-edl-tools"
+        cli_edl_dir.mkdir()
+        cli_client = cli_edl_dir / "edl"
+        shutil.copy2(self.shim, cli_client); cli_client.chmod(0o700)
+        cli_loader = cli_edl_dir / edl_runner.LOADER_NAME
+        shutil.copy2(self.loader, cli_loader)
+        home = self.base / "cli-home"
+        store.ensure_store(home)
+        store.save_registry(home, {"schema": 1, "devices": [{
+            "id": "deadbeef", "edl": {"serial": "deadbeef"},
+            "backups": [{"id": "existing"}],
+        }]})
+        environment = dict(self.env, OPENSTICK_EDL_DIR=str(cli_edl_dir))
+        output, errors = io.StringIO(), io.StringIO()
+        with self.patch_loader_pin(), mock.patch.dict(os.environ, environment, clear=True), \
+                contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+            result = cli.main(["--home", str(home), "--dry-run", "backup"],
+                              usb_sysfs_root=self.sysfs)
+        self.assertEqual(result, cli.EXIT_REFUSED)
+        self.assertEqual(output.getvalue().splitlines()[-1], edl_runner.EDL_SESSION_USED_NOTE)
+        self.assertIn("a verified backup already exists", errors.getvalue())
+
+    def test_cli_restore_refusal_after_edl_emits_exact_session_note(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "synthetic_m5_fixture", ROOT / "tests/verify-installer-m5.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        fixture = module.M5Tests()
+        fixture.setUp()
+        self.addCleanup(fixture.tearDown)
+        self.add_usb("1-1", "05c6", "9008", "001", "009")
+        with fixture.disk.open("r+b") as stream:
+            stream.seek(fixture.parts["fsg"][0] * 512)
+            stream.write(b"live-difference")
+        output, errors = io.StringIO(), io.StringIO()
+        with mock.patch.object(edl_runner, "PINNED_LOADER_SHA256",
+                               hashlib.sha256(fixture.fake_loader_path.read_bytes()).hexdigest()), \
+                mock.patch.dict(os.environ, fixture.env, clear=True), \
+                contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+            result = cli.main(["--home", str(fixture.home), "restore", "--device", "deadbeef"],
+                              usb_sysfs_root=self.sysfs)
+        self.assertEqual(result, cli.EXIT_REFUSED)
+        self.assertIn("live EDL serial and fsg/sec/fsc fingerprints must match", errors.getvalue())
+        self.assertEqual(output.getvalue().splitlines()[-1], edl_runner.EDL_SESSION_USED_NOTE)
 
 
 STATEFUL_EDL_SHIM = r'''#!/usr/bin/env python3
