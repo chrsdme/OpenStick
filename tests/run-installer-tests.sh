@@ -2,237 +2,141 @@
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 PYTHON=${PYTHON:-python3}
-if [[ -z ${INSTALLER_TEST_TMP-} ]]; then
+# Stage handling (R-5.2). Externally supplied INSTALLER_TEST_TMP / INSTALLER_TEST_TMP_PARENT are
+# never read. Stage 2 is recognised only by a private nonce that stage 1 wrote INSIDE the temp dir
+# it created itself (and passed through env -i), so a caller cannot skip the scrub or abort the
+# script by exporting any of these variables.
+STAGE2_OK=0
+if [[ -n ${_OSRUNNER_TMP-} && -n ${_OSRUNNER_NONCE-} && -n ${_OSRUNNER_PARENT-} \
+      && -f ${_OSRUNNER_TMP}/.runner-nonce && -O ${_OSRUNNER_TMP} ]] \
+   && [[ $(cat -- "${_OSRUNNER_TMP}/.runner-nonce" 2>/dev/null) == "${_OSRUNNER_NONCE}" ]]; then
+  STAGE2_OK=1
+fi
+if (( STAGE2_OK == 0 )); then
   TEST_TMP_PARENT=$(cd -- "${TMPDIR:-/tmp}" && pwd -P)
   TEST_TMP=$(mktemp -d "$TEST_TMP_PARENT/openstick-installer-tests.XXXXXX")
+  NONCE="$$.$RANDOM.$RANDOM.$(date +%s%N)"
+  printf '%s' "$NONCE" > "$TEST_TMP/.runner-nonce"
   mkdir -p "$TEST_TMP/shims/bin"
   cp "$ROOT"/tests/shims/bin/* "$TEST_TMP/shims/bin/"
   chmod u+x "$TEST_TMP/shims/bin/"*
   RUN_HOME=${HOME:-$TEST_TMP/home}
   RUN_LANG=${LANG:-C.UTF-8}
   exec /usr/bin/env -i HOME="$RUN_HOME" PATH="$TEST_TMP/shims/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
-    LANG="$RUN_LANG" TMPDIR="$TEST_TMP" INSTALLER_TEST_TMP="$TEST_TMP" \
-    INSTALLER_TEST_TMP_PARENT="$TEST_TMP_PARENT" \
+    LANG="$RUN_LANG" TMPDIR="$TEST_TMP" _OSRUNNER_TMP="$TEST_TMP" _OSRUNNER_NONCE="$NONCE" \
+    _OSRUNNER_PARENT="$TEST_TMP_PARENT" \
     /bin/bash "$0" "$@" </dev/null
 fi
-TMP=$INSTALLER_TEST_TMP
-TMP_PARENT=$INSTALLER_TEST_TMP_PARENT
-unset INSTALLER_TEST_TMP INSTALLER_TEST_TMP_PARENT
+TMP=$_OSRUNNER_TMP
+TMP_PARENT=$_OSRUNNER_PARENT
+unset OPENSTICK_USB_SYSFS_ROOT OPENSTICK_USB_DEVICE_ROOT OPENSTICK_TEST_USB_ROOTS_DIR _OSRUNNER_TMP _OSRUNNER_NONCE _OSRUNNER_PARENT INSTALLER_TEST_TMP INSTALLER_TEST_TMP_PARENT
 trap 'rm -rf -- "$TMP"' EXIT
 export TMPDIR="$TMP"
 export GIT_CEILING_DIRECTORIES="$(dirname "$TMP")"
-mkdir -p "$TMP/usb/sys/bus/usb/devices" "$TMP/usb/dev/bus/usb"
+mkdir -p "$TMP/usb/sys/bus/usb/devices" "$TMP/usb/dev/bus/usb" "$TMP/counts"
 export OPENSTICK_USB_SYSFS_ROOT="$TMP/usb/sys/bus/usb/devices"
 export OPENSTICK_USB_DEVICE_ROOT="$TMP/usb/dev/bus/usb"
+# Marker that makes the product honour the two roots above (only roots inside this dir are accepted).
+export OPENSTICK_TEST_USB_ROOTS_DIR="$TMP"
 export PYTHONPATH="$ROOT/tests/host-path-guard:$ROOT${PYTHONPATH:+:$PYTHONPATH}"
 export OPENSTICK_EDL_SESSION_FILE="$TMP/edl-session"
+# Runner-visible guard hit file (R-5.4): any line in it fails the whole run.
+export OPENSTICK_GUARD_HIT_FILE="$TMP/guard-hits"
+: > "$OPENSTICK_GUARD_HIT_FILE"
 shopt -s nullglob
 m4_tmp_before=("$TMP"/openstick-m4-test-*)
 
+ONLY=
+if [[ ${1-} == --only ]]; then ONLY=${2:?--only needs an extended regex}; fi
 pass=0 fail=0 skip=0
+GROUP_TIMEOUT=300
+GROUP_GRACE=5
+CANARY=0
+LAST_STATUS=
+LAST_COUNT=0
+declare -a SUMMARY=()
+# run NAME CMD...      one group, own process group (tests/run-group.py), timeout 300s, TERM then KILL after grace.
+# runx NAME CMD...     same, but the group is a Python file run through the assert-counting harness.
 run() {
   local name=$1; shift
-  if timeout --signal=TERM --kill-after=5 300 "$@" </dev/null; then printf 'PASS %s\n' "$name"; pass=$((pass + 1)); else printf 'FAIL %s\n' "$name"; fail=$((fail + 1)); fi
+  if (( CANARY == 0 )) && [[ -n $ONLY ]] && ! [[ $name =~ $ONLY ]]; then return 0; fi
+  local rc=0 count=0 extra=()
+  [[ ${EXIT_CHECK:-0} == 1 ]] && extra=(--exit-check)
+  "$PYTHON" "$ROOT/tests/run-group.py" --count-file "$TMP/counts/$name" --timeout "$GROUP_TIMEOUT" \
+    --grace "$GROUP_GRACE" "${extra[@]}" -- "$@" </dev/null >"$TMP/last-group.log" 2>&1 || rc=$?
+  if (( CANARY == 0 )); then cat -- "$TMP/last-group.log"; fi
+  count=$(cat "$TMP/counts/$name" 2>/dev/null || echo 0)
+  LAST_COUNT=$count
+  if (( rc == 242 )); then LAST_STATUS="FAIL (timeout)"
+  elif (( rc == 243 )); then LAST_STATUS="FAIL (orphan processes left behind)"
+  elif (( rc != 0 )); then LAST_STATUS=FAIL
+  elif (( count == 0 )); then LAST_STATUS="FAIL (vacuous: 0 checks ran)"
+  else LAST_STATUS=PASS; fi
+  if (( CANARY == 1 )); then return 0; fi
+  printf '%s %s (checks=%s)\n' "$LAST_STATUS" "$name" "$count"
+  SUMMARY+=("$name $count")
+  if [[ $LAST_STATUS == PASS ]]; then pass=$((pass + 1)); else fail=$((fail + 1)); fi
 }
+runx() { local name=$1 file=$2; shift 2; run "$name" "$PYTHON" "$ROOT/tests/groups/_harness.py" "$ROOT/tests/groups/$file" "$@"; }
 
-run host-usb-path-guard python3 - "$ROOT" "$TMP" "$TMP_PARENT" <<'PY'
-import os, pathlib, subprocess, sys
-root, tmp, requested_parent = sys.argv[1:]
-assert pathlib.Path(tmp).resolve().parent == pathlib.Path(requested_parent).resolve()
-assert pathlib.Path(tmp).name.startswith("openstick-installer-tests.")
-assert pathlib.Path(os.environ["TMPDIR"]).resolve() == pathlib.Path(tmp).resolve()
-assert not ("OPENSTICK_EDL_DIR" in os.environ or "OPENSTICK_HOME" in os.environ)
-assert os.environ.get("GIT_CEILING_DIRECTORIES") == str(pathlib.Path(tmp).parent)
-assert not any(name.startswith("GIT_") and name != "GIT_CEILING_DIRECTORIES" for name in os.environ)
-assert os.environ["PATH"].split(os.pathsep)[0].endswith("/shims/bin")
-assert os.environ.get("LANG")
-assert os.environ.get("TMPDIR")
-for path in ("/sys/bus/usb/devices", "/dev/bus/usb"):
-    try:
-        os.open(path, os.O_RDONLY)
-    except RuntimeError as exc:
-        assert "TEST SAFETY GUARD" in str(exc), str(exc)
-    else:
-        raise AssertionError("host USB path access was not blocked")
-outside_client = pathlib.Path(root) / "tests/shims/bin/edl"
-try:
-    subprocess.run([str(outside_client), "rs", "0", "1", str(pathlib.Path(tmp) / "out.bin")],
-                   stdin=subprocess.DEVNULL, timeout=5)
-except RuntimeError as exc:
-    assert "TEST SAFETY GUARD" in str(exc), str(exc)
-else:
-    raise AssertionError("EDL client outside the test temp directory was allowed")
-try:
-    subprocess.run(["sudo", str(outside_client), "rs", "0", "1", str(pathlib.Path(tmp) / "sudo-out.bin")],
-                   stdin=subprocess.DEVNULL, timeout=5)
-except RuntimeError as exc:
-    assert "TEST SAFETY GUARD" in str(exc), str(exc)
-else:
-    raise AssertionError("wrapped EDL client outside the test temp directory was allowed")
-planner = pathlib.Path(tmp) / "rollback-plan.py"
-planner.write_text("raise SystemExit(0)\n", encoding="ascii")
-metadata = subprocess.run([sys.executable, "-I", str(planner), "--edl", "/outside/edl-client",
-                           "--loader", "/outside/pinned-loader"],
-                          stdin=subprocess.DEVNULL, timeout=5, capture_output=True, text=True)
-assert metadata.returncode == 0, (metadata.returncode, metadata.stdout, metadata.stderr)
-allowed_client = pathlib.Path(tmp) / "edl-child-stub"
-allowed_loader = pathlib.Path(tmp) / "synthetic-loader.mbn"
-allowed_client = allowed_client.with_suffix(".py")
-preserved_pythonpath = str(pathlib.Path(tmp) / "existing-pythonpath")
-allowed_client.write_text(
-    "#!/usr/bin/env python3\n"
-    "import os, pathlib, subprocess, sys\n"
-    "assert pathlib.Path(os.environ['TMPDIR']).resolve() == pathlib.Path(__file__).parent.resolve()\n"
-    "paths = os.environ['PYTHONPATH'].split(os.pathsep)\n"
-    "assert pathlib.Path(paths[0]).name == 'host-path-guard'\n"
-    "assert paths[1] == " + repr(preserved_pythonpath) + "\n"
-    "if 'nested' not in sys.argv:\n"
-    "    env = {'PATH': os.environ['PATH']}\n"
-    "    try:\n"
-    "        subprocess.run([sys.executable, __file__, 'nested', '--loader=/nonexistent/outside-loader'],\n"
-    "                       env=env, stdin=subprocess.DEVNULL, timeout=5)\n"
-    "    except RuntimeError as exc:\n"
-    "        sys.exit(0 if 'TEST SAFETY GUARD' in str(exc) else 3)\n"
-    "    sys.exit(4)\n"
-    "sys.exit(5)\n",
-    encoding="utf-8",
-)
-allowed_client.chmod(0o700)
-allowed_loader.write_bytes(b"synthetic-loader")
-child_env = {"PATH": os.environ["PATH"], "PYTHONPATH": preserved_pythonpath}
-allowed = subprocess.run([str(allowed_client), "rs", "0", "1", str(pathlib.Path(tmp) / "allowed.bin"),
-                          "--loader=" + str(allowed_loader)], env=child_env,
-                         stdin=subprocess.DEVNULL, timeout=5, capture_output=True, text=True)
-assert allowed.returncode == 0, (allowed.returncode, allowed.stdout, allowed.stderr)
-try:
-    subprocess.run([str(allowed_client), "rs", "0", "1", str(pathlib.Path(tmp) / "outside-loader.bin"),
-                    "--loader=/nonexistent/outside-loader"], env=child_env,
-                   stdin=subprocess.DEVNULL, timeout=5)
-except RuntimeError as exc:
-    assert "TEST SAFETY GUARD" in str(exc), str(exc)
-else:
-    raise AssertionError("EDL loader outside the test temp directory was allowed")
-child_code = (
-    "import subprocess, sys\n"
-    "try:\n"
-    "    subprocess.run([sys.argv[1], 'rs', '0', '1', sys.argv[2], '--loader=' + sys.argv[3]],\n"
-    "                   stdin=subprocess.DEVNULL, timeout=5)\n"
-    "except RuntimeError as exc:\n"
-    "    sys.exit(0 if 'TEST SAFETY GUARD' in str(exc) else 3)\n"
-    "sys.exit(4)\n"
-)
-inside_client = pathlib.Path(tmp) / "shims/bin/edl"
-child = subprocess.run([sys.executable, "-c", child_code, str(inside_client), str(pathlib.Path(tmp) / "child.bin"), "/nonexistent/outside-loader"],
-                       stdin=subprocess.DEVNULL, timeout=10, capture_output=True, text=True)
-assert child.returncode == 0, (child.returncode, child.stdout, child.stderr)
-env = dict(os.environ)
-env.pop("OPENSTICK_EDL_DIR", None)
-p = subprocess.run([sys.executable, str(pathlib.Path(root) / "openstick"),
-                    "--home", str(pathlib.Path(tmp) / "default-roots"), "doctor"],
-                   env=env, capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=20)
-assert "TEST SAFETY GUARD" not in p.stdout + p.stderr, (p.stdout, p.stderr)
-assert "no EDL device attached" in p.stdout, p.stdout
-child = subprocess.run([sys.executable, "-c",
-                       "from tools.installer.edl_runner import preflight; assert preflight().state == 'ABSENT'"],
-                      env=env, capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=20)
-assert child.returncode == 0, (child.stdout, child.stderr)
-PY
+# Canaries (R-5.1): groups known to be broken must come out as FAIL through the very same run() path.
+# If either passes, the runner is blind (vacuous pass) and the whole run aborts.
+CANARY=1
+runx canary-fail canary-fail.py "$ROOT" "$TMP"
+canary_fail_status=$LAST_STATUS
+runx canary-vacuous canary-vacuous.py "$ROOT" "$TMP"
+canary_vacuous_status=$LAST_STATUS
+CANARY=0
+if [[ $canary_fail_status != FAIL || $canary_vacuous_status != "FAIL (vacuous: 0 checks ran)" ]]; then
+  printf 'ABORT: vacuous pass detected (canary-fail=%s canary-vacuous=%s); this runner cannot be trusted\n' \
+    "$canary_fail_status" "$canary_vacuous_status"
+  exit 2
+fi
+printf 'CANARY ok: failing group => FAIL, assertion-free group => vacuous FAIL\n'
 
-run store-refuses-git python3 - "$ROOT" "$TMP" <<'PY'
-import os, pathlib, subprocess, sys
-root, tmp = sys.argv[1:]
-repo = pathlib.Path(tmp) / "synthetic-repo"
-(repo / ".git").mkdir(parents=True)
-env = dict(os.environ)
-env.pop("GIT_CEILING_DIRECTORIES", None)
-p = subprocess.run([root + "/openstick", "--home", str(repo / "store"), "device", "list"],
-                   text=True, capture_output=True, env=env, stdin=subprocess.DEVNULL, timeout=20)
-assert p.returncode == 2, (p.returncode, p.stdout, p.stderr)
-assert "REFUSED" in p.stderr
-PY
-run store-permissions python3 - "$ROOT" "$TMP" <<'PY'
-import json, os, pathlib, sys
-from tools.installer.store import ensure_store, save_registry, load_registry, append_event
-root = pathlib.Path(sys.argv[2]) / "private"
-ensure_store(root)
-assert root.stat().st_mode & 0o777 == 0o700
-save_registry(root, {"schema": 1, "devices": [{"id": "DEADBEEF", "label": "test"}]})
-assert (root / "registry.json").stat().st_mode & 0o777 == 0o600
-assert load_registry(root)["devices"][0]["label"] == "test"
-append_event(root, {"type": "test", "device_id": "DEADBEEF"})
-assert (root / "events.jsonl").stat().st_mode & 0o777 == 0o600
-events = [json.loads(line) for line in (root / "events.jsonl").read_text().splitlines()]
-assert events == [{"type": "test", "device_id": "DEADBEEF"}]
-PY
-run store-refuses-symlink python3 - "$ROOT" "$TMP" <<'PY'
-import pathlib, sys
-from tools.installer.store import ensure_store, RefusedError
-tmp = pathlib.Path(sys.argv[2]); target = tmp / "target"; target.mkdir()
-link = tmp / "linked"; link.symlink_to(target, target_is_directory=True)
-try: ensure_store(link / "store")
-except RefusedError: pass
-else: raise AssertionError("symlink path was accepted")
-PY
-run registry-device-operations python3 - "$ROOT" "$TMP" <<'PY'
-import json, pathlib, subprocess, sys
-root, tmp = sys.argv[1:]
-home = pathlib.Path(tmp) / "registry"
-from tools.installer.store import ensure_store, save_registry
-ensure_store(home)
-save_registry(home, {"schema": 1, "devices": [{"id": "DEADBEEF", "label": "stick", "note": ""}]})
-for args in (("device", "label", "DEADBEEF", "desk"), ("device", "note", "DEADBEEF", "baseline backup")):
- p = subprocess.run([root + "/openstick", "--home", str(home), *args], capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=20)
- assert p.returncode == 0, (p.stdout, p.stderr)
-p = subprocess.run([root + "/openstick", "--home", str(home), "device", "show", "DEADBEEF"], capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=20)
-d = json.loads(p.stdout)
-assert d["label"] == "desk" and d["note"] == "baseline backup"
-assert (home / "events.jsonl").read_text().count("\n") == 2
-PY
-run doctor-missing-dependencies python3 - "$ROOT" "$TMP" <<'PY'
-import os, pathlib, subprocess, sys
-root, tmp = sys.argv[1:]
-sysfs = pathlib.Path(tmp) / "sysfs"; sysfs.mkdir()
-dev = pathlib.Path(tmp) / "dev"; dev.mkdir()
-env = dict(os.environ, PATH="/nonexistent", OPENSTICK_EDL_DIR=str(pathlib.Path(tmp) / "absent"))
-p = subprocess.run([sys.executable, root + "/openstick", "--usb-sysfs-root", str(sysfs),
-                    "--usb-device-root", str(dev), "--home", str(pathlib.Path(tmp) / "doctor"), "doctor"],
-                   env=env, capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=20)
-assert p.returncode == 1
-for term in ("python3", "bash", "e2fsprogs", "fastboot", "EDL client", "Firehose loader"):
- assert "FAIL " + term in p.stdout, (term, p.stdout)
-PY
-run shim-fastboot-fails-closed env OPENSTICK_FAKE_DEVICE=1 PATH="$ROOT/tests/shims/bin:/usr/bin:/bin" fastboot devices
-run shim-build-script-stub env PATH="$ROOT/tests/shims/bin:/usr/bin:/bin" 50-boot-img.sh
-run fake-emmc-deterministic python3 - "$ROOT" "$TMP" <<'PY'
-import hashlib, pathlib, subprocess, sys
-root, tmp = sys.argv[1:]
-a, b = pathlib.Path(tmp)/"a.img", pathlib.Path(tmp)/"b.img"
-for p in (a, b): subprocess.check_call([sys.executable, str(pathlib.Path(root)/"tests/make-fake-emmc.py"), str(p), "--mib", "2"], stdin=subprocess.DEVNULL, timeout=20)
-assert hashlib.sha256(a.read_bytes()).digest() == hashlib.sha256(b.read_bytes()).digest()
-assert a.read_bytes()[512:520] == b"EFI PART"
-assert "userdata".encode("utf-16le") in a.read_bytes()
-PY
+# Timeout and orphan self-test (R-5.3): a group that hangs and leaves a TERM-ignoring grandchild.
+GROUP_TIMEOUT=3 GROUP_GRACE=1 CANARY=1
+RANDOM_TAG=$RANDOM
+selftest_marker="orphan-marker-$$-$RANDOM_TAG"
+cat > "$TMP/hang-group.py" <<PYH
+import signal, subprocess, sys, time
+child_code = "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(600)  # $selftest_marker"
+subprocess.Popen([sys.executable, "-c", child_code])
+time.sleep(600)
+PYH
+run timeout-selftest "$PYTHON" "$TMP/hang-group.py"
+timeout_status=$LAST_STATUS
+GROUP_TIMEOUT=300 GROUP_GRACE=5 CANARY=0
+sleep 0.3
+# the bracket keeps grep's own command line from matching its own pattern
+orphans=$(grep -l -- "orphan-[m]arker-$$-$RANDOM_TAG" /proc/[0-9]*/cmdline 2>/dev/null | wc -l || true)
+if [[ $timeout_status != "FAIL (timeout)" ]] || (( orphans != 0 )); then
+  printf 'ABORT: timeout self-test failed (status=%s orphans=%s)\n' "$timeout_status" "$orphans"
+  exit 2
+fi
+printf 'SELFTEST ok: hanging group => FAIL (timeout), no orphan process left\n'
+
+runx host-usb-path-guard host-usb-path-guard.py "$ROOT" "$TMP" "$TMP_PARENT"
+
+runx store-refuses-git store-refuses-git.py "$ROOT" "$TMP"
+runx store-permissions store-permissions.py "$ROOT" "$TMP"
+runx store-refuses-symlink store-refuses-symlink.py "$ROOT" "$TMP"
+runx registry-device-operations registry-device-operations.py "$ROOT" "$TMP"
+runx doctor-missing-dependencies doctor-missing-dependencies.py "$ROOT" "$TMP"
+EXIT_CHECK=1 run shim-fastboot-fails-closed env OPENSTICK_FAKE_DEVICE=1 PATH="$ROOT/tests/shims/bin:/usr/bin:/bin" fastboot devices
+EXIT_CHECK=1 run shim-build-script-stub env PATH="$ROOT/tests/shims/bin:/usr/bin:/bin" 50-boot-img.sh
+runx guard-coverage guard-coverage.py "$ROOT" "$TMP"
+runx guard-known-limits guard-known-limits.py "$ROOT" "$TMP" "$TMP_PARENT"
+runx fake-emmc-deterministic fake-emmc-deterministic.py "$ROOT" "$TMP"
 run m2-backup-edl-runner python3 "$ROOT/tests/verify-installer-m2.py"
 run m2-doctor-edl-usb python3 "$ROOT/tests/verify-installer-doctor.py"
 run m2-edl-session-lifecycle python3 "$ROOT/tests/verify-installer-edl-session.py"
-run shim-edl-read-and-failure-injection python3 - "$ROOT" "$TMP" <<'PY'
-import os, pathlib, subprocess, sys
-root, tmp = sys.argv[1:]
-tmp = pathlib.Path(tmp); disk = tmp / "disk.img"; out = tmp / "read.bin"
-subprocess.check_call([sys.executable, str(pathlib.Path(root)/"tests/make-fake-emmc.py"), str(disk), "--mib", "2"], stdin=subprocess.DEVNULL, timeout=20)
-loader = tmp / "synthetic-loader.mbn"; loader.write_bytes(b"test-only shim loader")
-env = dict(os.environ, OPENSTICK_FAKE_EMMC=str(disk), PATH=str(pathlib.Path(root)/"tests/shims/bin") + ":/usr/bin:/bin")
-subprocess.check_call(["edl", "rs", "0", "2", str(out), "--loader=" + str(loader), "--memory=emmc"], env=env, stdin=subprocess.DEVNULL, timeout=20)
-assert out.stat().st_size == 1024
-env["OPENSTICK_EDL_CALL_FILE"] = str(tmp / "calls"); env["OPENSTICK_EDL_FAIL_AT"] = "1"
-p = subprocess.run(["edl", "rs", "0", "2", str(tmp / "failed.bin"), "--loader=" + str(loader), "--memory=emmc"], env=env, capture_output=True, stdin=subprocess.DEVNULL, timeout=20)
-assert p.returncode == 90 and b"injected failure" in p.stderr
-PY
+runx shim-edl-read-and-failure-injection shim-edl-read-and-failure-injection.py "$ROOT" "$TMP"
 
 run m3-configure-seed-apply-injection-push python3 "$ROOT/tests/verify-installer-m3.py" "$ROOT"
 run m4-build-flash-wrappers python3 "$ROOT/tests/verify-installer-m4.py"
 run m5-verify-restore python3 "$ROOT/tests/verify-installer-m5.py"
-run m6-portable-packages python3 "$ROOT/tests/verify-installer-m6.py"
+run m6-portable-packages "$PYTHON" "$ROOT/tests/groups/_harness.py" "$ROOT/tests/verify-installer-m6.py"
 run m7-wizard python3 "$ROOT/tests/verify-installer-m7.py"
 
 # Retain the M0 passing regression set. Known baseline failures remain documented and are not installer failures.
@@ -251,5 +155,12 @@ if (( ${#m4_tmp_after[@]} > ${#m4_tmp_before[@]} )); then
   fail=$((fail + 1))
 fi
 
+if [[ -s $OPENSTICK_GUARD_HIT_FILE ]]; then
+  printf 'FAIL guard hit file is not empty (the EDL/USB guard fired outside a deliberate self-test):\n'
+  sed 's/^/  guard-hit: /' "$OPENSTICK_GUARD_HIT_FILE"
+  fail=$((fail + 1))
+fi
+printf 'CHECKS PER GROUP:\n'
+printf '  %s\n' "${SUMMARY[@]}"
 printf 'TOTAL PASS=%d FAIL=%d SKIP=%d\n' "$pass" "$fail" "$skip"
 (( fail == 0 ))
