@@ -20,6 +20,7 @@ import fcntl
 from unittest import mock
 from contextlib import redirect_stdout
 import io
+from functools import wraps
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -443,6 +444,24 @@ raise SystemExit(2)
     return edl, fastboot_log
 
 
+def isolate_git_ceiling(function):
+    """Make the runner independent of the caller's ceiling-directory setting."""
+    @wraps(function)
+    def wrapped(*args, **kwargs):
+        prior = os.environ.get("GIT_CEILING_DIRECTORIES")
+        ceiling = pathlib.Path(tempfile.gettempdir()).resolve()
+        os.environ["GIT_CEILING_DIRECTORIES"] = str(ceiling)
+        try:
+            return function(*args, **kwargs)
+        finally:
+            if prior is None:
+                os.environ.pop("GIT_CEILING_DIRECTORIES", None)
+            else:
+                os.environ["GIT_CEILING_DIRECTORIES"] = prior
+    return wrapped
+
+
+@isolate_git_ceiling
 def run():
     with tempfile.TemporaryDirectory(prefix="ostpkg-test-") as td:
         root = pathlib.Path(td)
