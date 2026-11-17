@@ -95,3 +95,15 @@ No physical device flash was attempted by this work. Before a human performs har
 ## Exit status and recovery
 
 The launcher uses exit `0` for success, `1` for operational error or interruption, `2` for a refused safety gate, and `3` for a specific integrity or read-back verification failure. Unexpected exceptions exit `1`; add `--debug` to request a traceback. The launcher does not redact arbitrary exception text, so secrets must never be included in exception messages. Preserve the event log and phase state after any failure. For uncertain destructive state, stop, keep the device in its current mode if safe, and have the owner inspect it against the phase plan before any explicit reconciliation. Do not clear state by editing registry files.
+
+## Easy mode (`openstick easy`)
+
+One linear, interactive flow for board #6 (`ufi103s`): tool check, wait for EDL (05c6:9008), full backup into `backups/<device-id>/<UTC-stamp>/` of the private store, mode (default or custom), build or image set, cold re-entry into EDL, one `YES`, write (GPT, boot, userdata, then preserved partitions), finish. It is an additional command: backup, flash, restore, wizard and doctor are unchanged and keep their own gates. Easy mode does not use their typed per-phase tokens, the GPT-T refusal or the stop after the GPT phase.
+
+Flags: `--yes` (accept defaults, skip the YES), `--image-set DIR` (prepared GPT-T set), `--build ID` (registered build), `--verify-full` (read the whole eMMC after writing and compare, about 4 minutes). Without `--image-set`/`--build` it builds through the existing wrapper, which asks for sudo once.
+
+Write data: `boot.img` to `boot`, `rootfs.img` to `userdata`, the planned GPT-T (secondary first, then primary), each read back. `fsg sec fsc modemst1 modemst2 persist` are matched BY NAME between the backup GPT and the planned GPT-T and restored from the backup into the planned position only if the live bytes differ. If a name or size cannot be matched, easy mode stops before the first write (NEEDS-HARDWARE). With `tools/gen-gpt-tz1m.py` layouts these partitions keep their LBAs.
+
+`REENTER_EDL_AFTER_BACKUP = True` in `tools/installer/easy.py` makes step 6 ask for a cold EDL re-entry after the backup (writes in a later EDL session are not proven on hardware). Any failure stops at once and prints the phase, the backup path and the restore command, with exit code 1.
+
+Test knobs: `OPENSTICK_EDL_DIR`/`PATH` (shim edl, loader), `OPENSTICK_USB_SYSFS_ROOT`, `OPENSTICK_USB_DEVICE_ROOT`, `OPENSTICK_TEST_USB_ROOTS_DIR` (fake USB tree, the device node must be readable and writable), `OPENSTICK_EASY_POLL_TIMEOUT`, `OPENSTICK_EASY_POLL_INTERVAL`, `OPENSTICK_EASY_ASSUME_REPLUGGED=1` (step 6 does not wait for the fake device to disappear). Prompts use `input()` and `getpass`, so scripted stdin or a pty works. The fake EDL shim must accept `ws` writes and its session file must be reset at the fake re-entry.

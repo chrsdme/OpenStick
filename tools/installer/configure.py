@@ -63,6 +63,11 @@ def _public_keys():
     path = _ask("SSH public key file (blank to skip)")
     if not path:
         return ""
+    return read_public_key_file(path)
+
+
+def read_public_key_file(path):
+    """Read, check and base64-encode an SSH public key file (shared with easy mode)."""
     file = Path(path).expanduser()
     try:
         content = file.read_text(encoding="ascii")
