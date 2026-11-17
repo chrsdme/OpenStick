@@ -627,4 +627,3 @@ def prepare_command(args, home, repo):
     except BaseException:
         _cleanup_staging(staging)
         raise
-

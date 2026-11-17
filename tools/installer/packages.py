@@ -1652,4 +1652,3 @@ def package_command(args, home, repo):
     print("WARNING: packaged install/restore write scripts are UNVALIDATED on hardware; writes require typed confirmation.")
     print("Created SENSITIVE %s package: %s" % (action, output))
     return 0
-

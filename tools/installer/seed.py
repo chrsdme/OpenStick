@@ -150,4 +150,3 @@ def parse(text):
 def serialize(data):
     validate(data)
     return "".join("%s=%s\n" % (key, data[key]) for key in sorted(data))
-
