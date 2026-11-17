@@ -427,6 +427,22 @@ exec /usr/bin/sha256sum "$@"
         with self.assertRaisesRegex(store.RefusedError, "EDL client path"):
             m5._run_fwlib_phase(engine, "/tmp/edl;touch", {}, self.loader, prepared, self.tmp, write=False)
 
+    def test_helper_failure_appends_masked_stderr_without_external_paths(self):
+        runner = self.tmp / "synthetic-failing-helper.sh"
+        runner.write_text("#!/bin/bash\nprintf 'Serial: 0xdeadbeef synthetic failure at /tmp/private-helper.log\n' >&2\nexit 1\n")
+        runner.chmod(0o700)
+        source = self.tmp / "helper-source.bin"; source.write_bytes(b"x" * 512)
+        engine = {"runner": runner}
+        prepared = {"phase": "pad", "start": 0, "end": 0, "source": source}
+        with self.assertRaises(store.RefusedError) as failure:
+            m5._run_fwlib_phase(engine, [str(self.fake_edl_path)], self.env, self.loader,
+                                prepared, self.tmp, write=False)
+        message = str(failure.exception)
+        self.assertIn("existing rollback helper refused or failed phase pad", message)
+        self.assertIn("Serial: 0xde****ef synthetic failure at [path]", message)
+        self.assertNotIn("0xdeadbeef", message)
+        self.assertNotIn("/tmp/private-helper.log", message)
+
     def test_verify_reports_each_check_and_does_not_claim_absent_services(self):
         stdout = "".join("%s\t%s\tevidence\n" % ("SKIP" if key in ("modem", "wifi") else "PASS", key)
                           for key in sorted({"firewall_state", "firewall_syntax", "watchdog", "modem", "ntp", "wifi", "versions"}))

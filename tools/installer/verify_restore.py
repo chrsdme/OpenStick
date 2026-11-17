@@ -708,6 +708,17 @@ put "$LABEL" "$LBA" "$SECTORS" "$SOURCE" "$MODE"
     return {"directory": directory, "runner": runner}
 
 
+def _safe_helper_stderr_line(stderr):
+    """Return one useful helper error line without serials or filesystem paths."""
+    lines = [line.strip() for line in str(stderr or "").splitlines() if line.strip()]
+    if not lines:
+        return ""
+    line = edl_runner._tail("", lines[-1]).splitlines()[-1]
+    # The helper's scratch files live outside the user's store. Do not expose
+    # any absolute path the helper may include in its diagnostic.
+    return re.sub(r"(?<![A-Za-z0-9_.-])/(?:[^\s]+)", "[path]", line)[:240]
+
+
 def _run_fwlib_phase(engine, edl, env, loader, prepared, work, write,
                      verbose=False, debug=False, session=None):
     env_verbose, env_debug = _edl_verbose(env)
@@ -786,7 +797,11 @@ def _run_fwlib_phase(engine, edl, env, loader, prepared, work, write,
             tail = edl_runner._tail(stdout, stderr)
             if tail:
                 print("EDL engine output (last lines):\n" + tail, file=sys.stderr)
-        raise store.RefusedError("existing rollback helper refused or failed phase " + phase + ". Hint: check EDL mode, USB stability, and the phase log before reconciling state.")
+        message = "existing rollback helper refused or failed phase " + phase + ". Hint: check EDL mode, USB stability, and the phase log before reconciling state."
+        helper_error = _safe_helper_stderr_line(stderr)
+        if helper_error:
+            message += " Helper: " + helper_error
+        raise store.RefusedError(message)
 
 
 def _verify_final_disk(edl, env, loader, work, manifest, state, session=None):
