@@ -122,6 +122,42 @@ if [[ ${OPENSTICK_EDL_FAIL_AT:-0} != 0 && ${OPENSTICK_EDL_FAIL_AT:-0} == "$calls
   exit 90
 fi
 
+# Opt-in write support (tests of the easy flow only). Default stays read-only.
+# OPENSTICK_EDL_ALLOW_WRITES=1 enables ws (start sector, file) and w (partition name, file) against
+# the fake image; OPENSTICK_EDL_WRITE_LOG records one line per attempted write;
+# OPENSTICK_EDL_FAIL_WRITE_AT=N makes the Nth write attempt fail (exit 90) without touching the image.
+fake_write() {
+  local op=$1 target=$2 data=$3 n=0
+  [[ -f $data ]] || { echo "FAKE EDL write: data file missing" >&2; exit 2; }
+  local counter=${OPENSTICK_EDL_WRITE_COUNT_FILE:-${OPENSTICK_FAKE_EMMC}.writes}
+  [[ ! -f $counter ]] || read -r n < "$counter"
+  n=$((n + 1)); printf '%s\n' "$n" > "$counter"
+  if [[ -n ${OPENSTICK_EDL_WRITE_LOG:-} ]]; then printf '%s %s %s\n' "$op" "$target" "$(stat -c %s "$data")" >> "$OPENSTICK_EDL_WRITE_LOG"; fi
+  if [[ ${OPENSTICK_EDL_FAIL_WRITE_AT:-0} != 0 && ${OPENSTICK_EDL_FAIL_WRITE_AT} == "$n" ]]; then
+    echo "FAKE EDL injected write failure at write $n" >&2; exit 90
+  fi
+  local sector=$target
+  if [[ $op == w ]]; then
+    sector=$(python3 - "$OPENSTICK_FAKE_EMMC" "$target" <<'PYW'
+import struct, sys
+disk, name = sys.argv[1:]
+with open(disk, "rb") as f:
+    f.seek(512); hdr = f.read(92)
+    elba, n, sz = struct.unpack_from("<Q", hdr, 72)[0], struct.unpack_from("<I", hdr, 80)[0], struct.unpack_from("<I", hdr, 84)[0]
+    f.seek(elba * 512); tab = f.read(n * sz)
+for i in range(n):
+    e = tab[i * sz:(i + 1) * sz]
+    if e[56:128].decode("utf-16le").rstrip("\0") == name:
+        print(struct.unpack_from("<Q", e, 32)[0]); break
+else:
+    sys.exit(3)
+PYW
+) || { echo "FAKE EDL write: unknown partition $target" >&2; exit 3; }
+  fi
+  dd if="$data" of="$OPENSTICK_FAKE_EMMC" bs=512 seek="$sector" conv=notrunc status=none
+  echo "FAKE EDL wrote $(stat -c %s "$data") bytes at sector $sector"
+}
+
 case "$operation" in
   getstorageinfo)
     echo "GetStorageInfo command isn't supported."
@@ -152,7 +188,13 @@ case "$operation" in
     ((${#positional[@]} >= 2)) || exit 2
     if [[ -n ${OPENSTICK_EDL_BYTES_FILE:-} ]]; then printf 'ws %s 0 0\n' "${positional[0]}" >> "$OPENSTICK_EDL_BYTES_FILE"; fi
     if [[ " ${positional[*]} " == *' --skipwrite '* ]]; then echo 'FAKE EDL dry run'; exit 0; fi
-    echo 'FAKE EDL refuses writes in M1'; exit 98
+    if [[ ${OPENSTICK_EDL_ALLOW_WRITES:-0} != 1 ]]; then echo 'FAKE EDL refuses writes in M1'; exit 98; fi
+    fake_write "$operation" "${positional[0]}" "${positional[1]}"
+    ;;
+  w)
+    ((${#positional[@]} >= 2)) || exit 2
+    if [[ ${OPENSTICK_EDL_ALLOW_WRITES:-0} != 1 ]]; then echo 'FAKE EDL refuses writes in M1'; exit 98; fi
+    fake_write "$operation" "${positional[0]}" "${positional[1]}"
     ;;
   getsha256|gpt)
     echo 'FAKE EDL storage=TEST-ONLY'
