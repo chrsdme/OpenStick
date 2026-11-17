@@ -26,7 +26,7 @@
 
 ## Remaining and offline limits
 
-- The positive generated install runner E2E remains **PARTIAL**: the fixture reached the install runner but it refused with `EDL client exited with status 1`; the final diagnostic rerun was interrupted before producing the logged fake-client call tail. No real device path was opened; the guard remained loaded. The bounded repair budget was exhausted, so this path is recorded rather than retried.
+- The generated install runner's first focused test failure was a shim defect: the production flash engine intentionally sanitizes its child environment, so the fake client could not read `OPENSTICK_EDL_SESSION_FILE` and exited with status 1. The test shim now derives its session marker from the embedded synthetic call-log path, preserving first-Sahara/later-firehose behavior without changing production environment handling.
 - No real board, USB device, EDL client, sudo, or network was used. Hardware behavior remains unverified offline.
 
 ## Phase 2 — Session and identity behavior
@@ -34,7 +34,7 @@
 - Added G-1 Session lifecycle tests for ABSENT, NORMAL-MODE, FRESH Sahara identity, CONSUMED firehose, HUNG handshake, bus/devnum swap, serial masking, and doctor zero client invocations.
 - Added R7 integration coverage: create and verify a backup using the stateful synthetic EDL client, clear fake session state to model power-cycle, then verify `backup --dry-run` refuses because the registered verified backup exists and prints the EDL session-used note.
 - The focused lifecycle suite passes **17/17**. It is now included in `tests/run-installer-tests.sh`.
-- M6 EDL package subprocesses now call generated `main(sysfs_root)` through a temporary `runpy` wrapper. Wrapper, fixture sysfs, and session state live under the runner's throwaway `TMPDIR`, outside the package tree, and are removed in `finally`. Synthetic package EDL transcripts now report Sahara identity only on the first invocation and firehose thereafter. The aggregate host-path guard stayed enabled. The positive install runner remains PARTIAL as documented above.
+- M6 EDL package subprocesses now call generated `main(sysfs_root)` through a temporary `runpy` wrapper. Wrapper, fixture sysfs, and session state live under the runner's throwaway `TMPDIR`, outside the package tree, and are removed in `finally`. Synthetic package EDL transcripts report Sahara identity only on the first invocation and firehose thereafter. The aggregate host-path guard stayed enabled.
 
 ## Invocation audit
 
@@ -51,7 +51,7 @@ Counts below are fake EDL client invocations per operation; `rs`/`rf` are indivi
 | flash `--dry-run` | 4 identity reads, plus phase-engine skip-write calls | GPT plus `fsg`, `sec`, `fsc` reads share one Session; identity is Sahara serial and fingerprint ranges |
 | package create/verify | 0 | Registered verified backup/image-set metadata; no EDL identity |
 | packaged restore runner | Variable; at least GPT + full read before phase flow | First `rs` captures identity; generated runner reuses it for later calls and checks bus/devnum before each call |
-| packaged install runner | PARTIAL; positive E2E refused after an EDL client returned status 1 | Fixture sysfs is injected; no identity was accepted by the wrapper flow |
+| packaged install runner | **VERIFIED-WITH-SHIMS**; positive fake-board flow completes through the documented GPT stop | Fixture sysfs is injected; fake client state persists through its synthetic call-log path because the production runner sanitizes child env |
 | image-set verify | 0 | Local manifest/member hashes; no EDL identity |
 | wizard: doctor | 0 | Delegates to doctor; no client invocation |
 | wizard: backup | 2 (3 with `--paranoid`) | Same capture and full-read sequence as `backup` |
@@ -59,7 +59,7 @@ Counts below are fake EDL client invocations per operation; `rs`/`rf` are indivi
 | wizard: flash | Same as flash | Delegates to flash; one Session for identity and engine calls |
 | wizard: restore | Variable; 2 initial reads plus per-phase calls | Delegates to restore; one Session through live reads and all phase-engine calls |
 
-The M6 generated restore runner reuses captured identity across its multi-call restore flow. The generated install runner reaches its positive EDL flow but the synthetic client exits status 1; this remains PARTIAL pending a later targeted diagnosis.
+The M6 generated restore runner reuses captured identity across its multi-call restore flow. The install test also asserts that the synthetic session marker was written and multiple client invocations occurred before the documented GPT stop. Hardware installation remains unverified offline.
 
 ## Phase 2 validation
 
@@ -67,5 +67,5 @@ The M6 generated restore runner reuses captured identity across its multi-call r
 - Final focused suites after integration-test repairs: M2 **13/13**, M4 **25/25**, M5 **25/25**, and M7 **27/27**.
 - M2 now asserts the typed HUNG refusal and uses fixture sysfs/dev roots; M4 verifies that the generated EDL proxy config points to the resolved fake client and pinned loader, while actual proxy calls preserve loader and memory flags. M5 fake-live helpers seed the passed Session identity before proxy use.
 - Wizard backup now passes its injected sysfs root into a scoped Session. The M7 fake-board integration creates and removes its synthetic 05c6:9008 sysfs entry around the backup flow.
-- M6 was not green: the last completed focused run failed in the generated install positive E2E with fake client exit status 1. A later diagnostic attempt was interrupted and produced no further evidence. The host path guard blocked no attempted access in the completed run; fixture roots were injected and cleaned.
+- Focused M6 after the fake-client marker fix: **PASS** (`M6 synthetic package checks PASS`), run by the orchestrator under the host path guard, throwaway `TMPDIR`, shim-first `PATH`, and Git ceiling. The host path guard remained enabled; fixture roots were injected and cleaned.
 - Phase 2 secret-scan classifications: **SCAN-HIT FAKE-FIXTURE only** for synthetic transcript identifiers and test-only serial strings. No stop-class secret hit was found.
