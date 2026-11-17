@@ -10,6 +10,21 @@
 - `cli.main` accepts Python-level sysfs and device-root injection so tests can stay off host USB paths. No new environment variable was added.
 - GPT-T first-install refusal and flash stop-after-GPT behavior were not changed.
 
+## R3 caller follow-up
+
+- `flash._live_identity` now uses one `Session` for the primary GPT identity read and all three fsg/sec/fsc reads.
+- `verify_restore._live` shares one `Session` across its identity and full-disk reads. `_live_identity_only`, `_edl`, `_prepare_plan_phase`, and `_verify_final_disk` accept and reuse the command's session. Top-level restore passes the injected sysfs root from `cli.main`.
+- The generated standalone restore runner now captures Sahara identity on its first EDL call, requires firehose markers on later calls, and preflights sysfs before every EDL invocation. Its Python `main(sysfs_root=...)` parameter provides test injection; direct CLI execution uses `/sys/bus/usb/devices`. No test-only environment variable or public CLI override was added.
+- The generated one-call restore inspector remains a single invocation and already validates its Sahara identity. Package install delegates to the flash wrapper for identity reads, then runs the proven Path A shell engine with `EDL_CMD` directly. That engine process does not share the Python `Session` bus/device guard. Extending the guard across that boundary requires an EDL command proxy; this remains UNFIXED and is reported to the orchestrator for an ownership decision. No proven engine was edited.
+
+### R3 tests
+
+- `test_flash_identity_ranges_share_one_session_and_reuse_identity` failed against the parent `flash.py` with `_live_identity` rejecting the `session` argument, then passed after the shared-session change.
+- `test_verify_restore_full_read_and_identity_ranges_share_sessions` failed before the verify/restore changes because `_live` rejected the `session` argument, then passed.
+- `test_generated_restore_runner_reuses_identity_across_edl_calls` failed before the package runner change because two calls captured no session identity, then passed.
+- `test_generated_restore_runner_blocks_board_swap_before_later_call` changes the fixture USB devnum after the first invocation and proves the next client call is rejected before process execution.
+- Full focused session suite after R3: 7/7 passed. Production and focused test Python compilation passed; `git diff --check` passed.
+
 ## Tests and validation
 
 - Added `tests/verify-installer-edl-session.py`.
@@ -23,8 +38,9 @@
 ## Status and remaining work
 
 - Session preflight and board-swap checks: VERIFIED-WITH-SHIMS at unit/fixture level.
-- Backup dry-run refusal, backup serial masking, and session-used note need the WS-I integration tests against the stateful shim before they can be marked VERIFIED-WITH-SHIMS.
-- R3 still needs an orchestrator decision for other call sites. `tools/installer/flash.py` and `tools/installer/verify_restore.py` call `edl_runner.run` directly for multiple invocations rather than sharing `Session`; generated package runners also embed direct per-call runner code. These are outside WS-H ownership and should be audited before final acceptance.
+- R3 direct Python flows in flash and restore are VERIFIED-WITH-SHIMS by the synthetic stateful client tests.
+- Backup dry-run refusal, backup serial masking, and session-used note need the WS-I integration tests against its full shim before they can be marked VERIFIED-WITH-SHIMS.
+- Package install's proven shell engine does not share the parent Python bus/devnum guard and remains UNFIXED pending an orchestrator decision on a safe proxy boundary.
 - Hardware/client behavior remains NEEDS-HARDWARE.
 
 ## Secret scan

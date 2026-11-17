@@ -61,14 +61,14 @@ def _resolve_edl_command():
     return command
 
 
-def _live_identity(edl_command, loader, env, temp, recorded_parts):
+def _live_identity(edl_command, loader, env, temp, recorded_parts, session=None):
+    session = session or edl_runner.Session(client=edl_command, loader=loader, env=env)
     gpt_path = Path(temp) / "live-primary-gpt.bin"
-    result = edl_runner.run(["rs", "0", "34", str(gpt_path)],
-                            timeout=edl_runner.IDENTITY_READ_TIMEOUT_SECONDS,
-                            env=env, client=edl_command, loader=loader)
+    session.run(["rs", "0", "34", str(gpt_path)],
+                timeout=edl_runner.IDENTITY_READ_TIMEOUT_SECONDS, env=env)
     if not gpt_path.is_file() or gpt_path.stat().st_size != 34 * 512:
         raise store.RefusedError("could not read the live primary GPT range. Hint: verify EDL mode and reconnect USB before retrying.")
-    identity = edl_runner.parse_sahara_info(result.stdout + "\n" + result.stderr)
+    identity = session.identity
     observed = {}
     for name in IDENTITY_PARTS:
         row = recorded_parts.get(name, {})
@@ -77,9 +77,8 @@ def _live_identity(edl_command, loader, env, temp, recorded_parts):
             raise store.RefusedError("verified backup has invalid identity partition geometry for " + name)
         target = Path(temp) / ("live-identity-" + name + ".bin")
         count = end - start + 1
-        edl_runner.run(["rs", str(start), str(count), str(target)],
-                       timeout=edl_runner.RANGE_READ_TIMEOUT_SECONDS, env=env,
-                       client=edl_command, loader=loader)
+        session.run(["rs", str(start), str(count), str(target)],
+                    timeout=edl_runner.RANGE_READ_TIMEOUT_SECONDS, env=env)
         if not target.is_file() or target.stat().st_size != count * 512:
             raise store.RefusedError("could not read live EDL identity partition " + name)
         observed[name] = _hash(target)
@@ -200,7 +199,7 @@ def _invoke(command, env):
     return returncode
 
 
-def flash_command(args, home, repo):
+def flash_command(args, home, repo, *, usb_sysfs_root=None):
     image_input = Path(args.image_set).absolute()
     if image_input.is_symlink() or store._has_symlink_component(image_input):
         raise store.RefusedError("image-set path contains a symlink")
@@ -263,7 +262,10 @@ def flash_command(args, home, repo):
                "OPENSTICK_EDL_VERBOSE": "1" if getattr(args, "verbose", False) else "0",
                "OPENSTICK_EDL_DEBUG": "1" if getattr(args, "debug", False) else "0"}
         env["BACKUP_DIR"] = str(flash_backup)
-        serial, identity = _live_identity(edl_command, edl_loader, env, temp, backup_manifest.get("partitions", {}))
+        session = edl_runner.Session(sysfs_root=usb_sysfs_root, client=edl_command,
+                                     loader=edl_loader, env=env)
+        serial, identity = _live_identity(edl_command, edl_loader, env, temp,
+                                          backup_manifest.get("partitions", {}), session=session)
         if serial != device_id or identity != backup_manifest.get("identity") or identity != device.get("identity"):
             raise store.RefusedError("live EDL identity fingerprints do not match the registered verified backup")
         print("Live EDL identity and fsg/sec/fsc fingerprints match the verified backup.")

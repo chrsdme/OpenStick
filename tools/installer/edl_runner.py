@@ -67,6 +67,8 @@ class PreflightResult:
 
 def preflight(sysfs_root="/sys/bus/usb/devices"):
     """Inspect fixture-injectable USB sysfs metadata without opening /dev nodes."""
+    if sysfs_root is None:
+        return PreflightResult("UNKNOWN")
     root = Path(sysfs_root)
     try:
         entries = sorted(root.iterdir(), key=lambda item: item.name)

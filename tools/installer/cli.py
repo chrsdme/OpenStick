@@ -664,10 +664,12 @@ def main(argv=None, *, usb_sysfs_root="/sys/bus/usb/devices", usb_device_root="/
             return build_module.build_command(args, root, Path(__file__).resolve().parents[2])
         if args.command == "flash":
             from . import flash as flash_module
-            return flash_module.flash_command(args, root, Path(__file__).resolve().parents[2])
+            return flash_module.flash_command(args, root, Path(__file__).resolve().parents[2],
+                                              usb_sysfs_root=usb_sysfs_root)
         if args.command == "restore":
             from . import verify_restore
-            return verify_restore.restore_command(args, root, Path(__file__).resolve().parents[2])
+            return verify_restore.restore_command(args, root, Path(__file__).resolve().parents[2],
+                                                  usb_sysfs_root=usb_sysfs_root)
         if args.command == "package":
             from . import packages
             return packages.package_command(args, root, Path(__file__).resolve().parents[2])

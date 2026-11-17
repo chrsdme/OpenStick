@@ -249,18 +249,19 @@ def _parse_plan(plan, planner_dir, manifest, parsed):
     return rows
 
 
-def _live(edl, env, loader, directory, expected_id):
+def _live(edl, env, loader, directory, expected_id, session=None):
     verbose, debug = _edl_verbose(env)
+    session = session or edl_runner.Session(sysfs_root=None, client=edl, loader=loader, env=env)
     identity_path = directory / "live-primary-gpt.bin"
-    info = edl_runner.run(["rs", "0", "34", str(identity_path)],
-                          timeout=IDENTITY_READ_TIMEOUT_SECONDS, env=env,
-                          client=edl, loader=loader, verbose=verbose, debug=debug)
+    session.run(["rs", "0", "34", str(identity_path)],
+                timeout=IDENTITY_READ_TIMEOUT_SECONDS, env=env,
+                verbose=verbose, debug=debug)
     if not identity_path.is_file() or identity_path.stat().st_size != 34 * 512:
         raise store.RefusedError("live EDL primary GPT identity read was incomplete; hint: check EDL mode and USB before retrying")
-    identity = edl_runner.parse_sahara_info(info.stdout + "\n" + info.stderr)
+    identity = session.identity
     dump = directory / "live-before.bin"
-    edl_runner.run(["rf", str(dump)], timeout=INITIAL_FULL_READ_TIMEOUT_SECONDS,
-                   env=env, client=edl, loader=loader, verbose=verbose, debug=debug)
+    session.run(["rf", str(dump)], timeout=INITIAL_FULL_READ_TIMEOUT_SECONDS,
+                env=env, verbose=verbose, debug=debug)
     if not dump.is_file() or dump.stat().st_size % 512:
         raise store.RefusedError("live EDL full-disk read failed")
     parts = common._parse_gpt(dump)
@@ -268,24 +269,25 @@ def _live(edl, env, loader, directory, expected_id):
     return identity["serial"], fingerprints, dump, parts
 
 
-def _live_identity_only(edl, env, loader, directory, expected_id, parsed, expected):
+def _live_identity_only(edl, env, loader, directory, expected_id, parsed, expected, session=None):
     verbose, debug = _edl_verbose(env)
+    session = session or edl_runner.Session(sysfs_root=None, client=edl, loader=loader, env=env)
     identity_path = directory / "identity-primary-gpt.bin"
-    info = edl_runner.run(["rs", "0", "34", str(identity_path)],
-                          timeout=IDENTITY_READ_TIMEOUT_SECONDS, env=env,
-                          client=edl, loader=loader, verbose=verbose, debug=debug)
+    session.run(["rs", "0", "34", str(identity_path)],
+                timeout=IDENTITY_READ_TIMEOUT_SECONDS, env=env,
+                verbose=verbose, debug=debug)
     if not identity_path.is_file() or identity_path.stat().st_size != 34 * 512:
         raise store.RefusedError("live EDL identity range read was incomplete")
-    identity = edl_runner.parse_sahara_info(info.stdout + "\n" + info.stderr)
+    identity = session.identity
     if identity["serial"] != expected_id:
         raise store.RefusedError("live EDL serial changed before destructive phase")
     observed = {}
     for name in IDENTITY:
         start, end = parsed[name]
         target = directory / ("identity-" + name + ".bin")
-        edl_runner.run(["rs", str(start), str(end - start + 1), str(target)],
-                       timeout=RANGE_READ_TIMEOUT_SECONDS, env=env, client=edl, loader=loader,
-                       verbose=verbose, debug=debug)
+        session.run(["rs", str(start), str(end - start + 1), str(target)],
+                    timeout=RANGE_READ_TIMEOUT_SECONDS, env=env,
+                    verbose=verbose, debug=debug)
         if not target.is_file() or target.stat().st_size != (end - start + 1) * 512:
             raise store.RefusedError("live EDL identity partition read failed")
         observed[name] = _sha(target)
@@ -430,7 +432,7 @@ def _confirm(phase, device_id):
     return expected
 
 
-def restore_command(args, home, repo):
+def restore_command(args, home, repo, *, usb_sysfs_root=None):
     registry = store.load_registry(home)
     device = common._find_device(registry, args.restore_device)
     if not device:
@@ -461,11 +463,15 @@ def restore_command(args, home, repo):
                             "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"}
             identity_env["OPENSTICK_EDL_VERBOSE"] = "1" if getattr(args, "verbose", False) else "0"
             identity_env["OPENSTICK_EDL_DEBUG"] = "1" if getattr(args, "debug", False) else "0"
-            _live_identity_only(edl, identity_env, loader, Path(temp), device_id, parsed, manifest["identity"])
+            session = edl_runner.Session(sysfs_root=usb_sysfs_root, client=edl,
+                                         loader=loader, env=identity_env)
+            _live_identity_only(edl, identity_env, loader, Path(temp), device_id,
+                                parsed, manifest["identity"], session=session)
             start, end = _phase_span(phase, manifest, parsed)
             readback = Path(temp) / "phase-reconcile.bin"
             _edl(edl, ["rs", str(start), str(end - start + 1), str(readback),
                        "--loader=" + str(loader), "--memory=emmc"], identity_env, loader,
+                 session=session,
                   )
             if not readback.is_file() or readback.stat().st_size != (end - start + 1) * 512:
                 raise store.RefusedError("read-only phase reconciliation readback failed")
@@ -473,7 +479,8 @@ def restore_command(args, home, repo):
             if phase == "gpt-primary":
                 final_state = {}
                 try:
-                    _verify_final_disk(edl, identity_env, loader, Path(temp), manifest, final_state)
+                    _verify_final_disk(edl, identity_env, loader, Path(temp), manifest,
+                                       final_state, session=session)
                 except ValueError:
                     prior_state.update({"status": "final-readback-failed", "reconciliation_result": "full-disk-mismatch"})
                     _save_state(state_path, prior_state)
@@ -534,7 +541,10 @@ def restore_command(args, home, repo):
         env["OPENSTICK_EDL_VERBOSE"] = "1" if getattr(args, "verbose", False) else "0"
         env["OPENSTICK_EDL_DEBUG"] = "1" if getattr(args, "debug", False) else "0"
         loader = edl_runner.resolve_loader()
-        serial, live_identity, live_dump, live_parts = _live(edl, env, loader, work, device_id)
+        session = edl_runner.Session(sysfs_root=usb_sysfs_root, client=edl,
+                                     loader=loader, env=env)
+        serial, live_identity, live_dump, live_parts = _live(
+            edl, env, loader, work, device_id, session=session)
         if serial != device_id or live_identity != manifest.get("identity") or live_identity != device.get("identity"):
             raise store.RefusedError("live EDL serial and fsg/sec/fsc fingerprints must match verified backup")
         if live_dump.stat().st_size != manifest["size"]:
@@ -561,7 +571,7 @@ def restore_command(args, home, repo):
             state.update({"phase": phase, "status": "awaiting-confirmation", "started_at": int(time.time()),
                           "live_size": live_dump.stat().st_size})
             prepared = _prepare_plan_phase(edl, env, loader, step, backup_dir / "emmc-full.bin",
-                                           manifest, live_dump, work)
+                                           manifest, live_dump, work, session=session)
             print("Rollback plan phase %s: LBA %d..%d (%d sectors), SHA-256 %s" %
                   (phase, step["start"], step["end"], step["end"] - step["start"] + 1,
                    prepared["expected_sha256"]))
@@ -570,7 +580,8 @@ def restore_command(args, home, repo):
             state["confirmation"] = _confirm(phase, device_id)
             if _sha(backup_dir / "emmc-full.bin") != manifest["sha256"]:
                 raise store.RefusedError("verified backup changed after phase confirmation")
-            _live_identity_only(edl, env, loader, work, device_id, parsed, manifest["identity"])
+            _live_identity_only(edl, env, loader, work, device_id, parsed,
+                                manifest["identity"], session=session)
             state["status"] = "in-progress"
             _save_state(state_path, state)
             try:
@@ -580,7 +591,8 @@ def restore_command(args, home, repo):
                     raise store.RefusedError("existing rollback helper readback mismatch")
                 print("PASS write and per-phase readback: %s" % phase)
                 if phase == "gpt-primary":
-                    _verify_final_disk(edl, env, loader, work, manifest, state)
+                    _verify_final_disk(edl, env, loader, work, manifest,
+                                       state, session=session)
             except KeyboardInterrupt:
                 state.update({"status": "in-progress", "interrupted_at": int(time.time()),
                               "interruption": "keyboard-interrupt-during-destructive-phase"})
@@ -618,7 +630,7 @@ def _phase_span(phase, manifest, parsed):
     raise store.RefusedError("unknown rollback planner phase")
 
 
-def _prepare_plan_phase(edl, env, loader, step, backup, manifest, live_dump, work):
+def _prepare_plan_phase(edl, env, loader, step, backup, manifest, live_dump, work, session=None):
     phase, start, end = step["phase"], step["start"], step["end"]
     count = end - start + 1
     if phase == "pad":
@@ -650,7 +662,7 @@ def _prepare_plan_phase(edl, env, loader, step, backup, manifest, live_dump, wor
     if phase == "pad":
         # Gate 0 read -> hash -> dry-run noop -> write same bytes -> readback hash.
         _edl(edl, ["rs", str(start), str(count), str(work / "pad-current.bin"), "--loader=" + str(loader), "--memory=emmc"], env, loader,
-             verbose=_edl_verbose(env)[0], debug=_edl_verbose(env)[1])
+             verbose=_edl_verbose(env)[0], debug=_edl_verbose(env)[1], session=session)
         if _sha(work / "pad-current.bin") != want:
             raise store.RefusedError("pad pre-write hash mismatch")
     return {"phase": phase, "name": phase, "start": start, "end": end,
@@ -767,11 +779,12 @@ def _run_fwlib_phase(engine, edl, env, loader, prepared, work, write, verbose=Fa
         raise store.RefusedError("existing rollback helper refused or failed phase " + phase + ". Hint: check EDL mode, USB stability, and the phase log before reconciling state.")
 
 
-def _verify_final_disk(edl, env, loader, work, manifest, state):
+def _verify_final_disk(edl, env, loader, work, manifest, state, session=None):
     final = work / "final-full.bin"
     try:
         _edl(edl, ["rf", str(final), "--loader=" + str(loader), "--memory=emmc"], env, loader,
-             timeout=FINAL_FULL_READ_TIMEOUT_SECONDS, verbose=_edl_verbose(env)[0], debug=_edl_verbose(env)[1])
+             timeout=FINAL_FULL_READ_TIMEOUT_SECONDS, verbose=_edl_verbose(env)[0],
+             debug=_edl_verbose(env)[1], session=session)
         matched = final.is_file() and final.stat().st_size == manifest["size"] and _sha(final) == manifest["sha256"]
     except (store.RefusedError, edl_runner.EdlRunnerError, OSError, subprocess.TimeoutExpired):
         matched = False
@@ -782,7 +795,8 @@ def _verify_final_disk(edl, env, loader, work, manifest, state):
     print("PASS final full-disk readback exactly matches the verified backup SHA-256")
 
 
-def _edl(edl, args, env, loader, timeout=EDL_COMMAND_TIMEOUT_SECONDS, verbose=False, debug=False):
+def _edl(edl, args, env, loader, timeout=EDL_COMMAND_TIMEOUT_SECONDS,
+         verbose=False, debug=False, session=None):
     env_verbose, env_debug = _edl_verbose(env)
     verbose = verbose or env_verbose
     debug = debug or env_debug
@@ -796,5 +810,8 @@ def _edl(edl, args, env, loader, timeout=EDL_COMMAND_TIMEOUT_SECONDS, verbose=Fa
                 raise store.RefusedError("EDL phase requested a non-eMMC memory target")
         else:
             operation.append(item)
+    if session is not None:
+        return session.run(operation, timeout=timeout, env=env,
+                           verbose=verbose, debug=debug)
     return edl_runner.run(operation, timeout=timeout, env=env, client=edl, loader=loader,
                           verbose=verbose, debug=debug)
