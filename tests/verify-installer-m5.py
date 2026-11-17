@@ -502,8 +502,10 @@ exec /usr/bin/sha256sum "$@"
                 with mock.patch.dict(os.environ, dict(base, **extra), clear=True):
                     self.assertEqual(m5.edl_runner.default_usb_sysfs_root(), want, extra)
                     self.assertEqual(cli_mod.parser().parse_args(["doctor"]).usb_sysfs_root, want, extra)
-                    state = m5.edl_runner.preflight().state
-                    self.assertEqual(state == "EDL-PRESENT", want == inside, (extra, state))
+                    if want == inside:
+                        # Never walk the real host USB root here (the guard forbids it).
+                        state = m5.edl_runner.preflight().state
+                        self.assertEqual(state, "EDL-PRESENT", extra)
                     self.assertEqual(m5.edl_runner.Session().sysfs_root, want, extra)
             # Device root follows the same rule.
             with mock.patch.dict(os.environ, dict(base, OPENSTICK_USB_DEVICE_ROOT=inside), clear=True):
