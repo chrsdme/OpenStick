@@ -364,15 +364,15 @@ class Board:
         else:
             (self.fake_build_dir / "rootfs.img").write_bytes(synthetic_ext4_stub())
 
-    def make_image_set(self, name="image-set"):
-        """GPT-T image set for this fake board: layout derived from the fake board's own GPT by tools/gen-gpt-tz1m.py."""
+    def register_build(self, name, tag=b"easy"):
+        """Register a fake build (boot.img + rootfs.img + build.json) the way `openstick build` does; returns (build_id, boot, rootfs)."""
         import hashlib
         store, imageset = self._tools()
         store.ensure_store(self.home)
         build_id = "easy-set-build-" + name
         build_dir = self.home / "builds" / build_id
         build_dir.mkdir(mode=0o700)
-        boot, rootfs = synthetic_boot_image(), synthetic_ext4_stub()
+        boot, rootfs = synthetic_boot_image(tag), synthetic_ext4_stub()
         (build_dir / "boot.img").write_bytes(boot)
         (build_dir / "rootfs.img").write_bytes(rootfs)
         manifest = {"schema_version": 1, "build_id": build_id, "board": "ufi103s", "profile": "dev",
@@ -383,6 +383,12 @@ class Board:
         registry.setdefault("builds", []).append({"build_id": build_id, "path": str(build_dir), "board": "ufi103s",
                                                   "profile": "dev"})
         store.save_registry(self.home, registry)
+        return build_id, boot, rootfs
+
+    def make_image_set(self, name="image-set"):
+        """GPT-T image set for this fake board: layout derived from the fake board's own GPT by tools/gen-gpt-tz1m.py."""
+        store, imageset = self._tools()
+        build_id, _boot, _rootfs = self.register_build(name)
         primary = self.base / ("primary-" + name + ".bin")
         with self.initial.open("rb") as disk:
             primary.write_bytes(disk.read(34 * SECTOR))
