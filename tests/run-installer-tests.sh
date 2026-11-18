@@ -147,6 +147,7 @@ runx easy-poll-timeout easy-poll-timeout.py "$ROOT" "$TMP"
 runx easy-phase-failure easy-phase-failure.py "$ROOT" "$TMP"
 runx easy-yes-flag easy-yes-flag.py "$ROOT" "$TMP"
 runx easy-image-set easy-image-set.py "$ROOT" "$TMP"
+runx easy-build-id easy-build-id.py "$ROOT" "$TMP"
 
 # Retain the M0 passing regression set. Known baseline failures remain documented and are not installer failures.
 for test in verify-fetch-firehose.sh verify-flash-board.sh verify-harden.sh verify-initramfs-fail.sh verify-nft-ruleset.sh verify-rollback-plan.sh verify-sshd-config.sh; do
