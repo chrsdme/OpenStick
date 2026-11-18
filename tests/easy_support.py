@@ -11,6 +11,7 @@ import os
 import pathlib
 import re
 import select
+import shlex
 import shutil
 import signal
 import struct
@@ -207,6 +208,11 @@ FAKE_PARTITIONS = [
     ("aboot", 6144, 8191), ("fsg", 8192, 9215), ("sec", 9216, 9727), ("fsc", 9728, 10239),
     ("modemst1", 10240, 12287), ("modemst2", 12288, 14335), ("persist", 14336, 30719),
     ("boot", 396384, 429151), ("system", 429152, 2067551), ("cache", 2067552, 2427999), ("userdata", 2428000, 7634910),
+    # The remaining stock names the rollback planner (tools/rollback-plan.py) requires. They sit in free space below boot,
+    # so no LBA above moves and the existing layout oracles are unchanged.
+    ("modem", 32768, 33791), ("sbl1bak", 34816, 35839), ("abootbak", 36864, 37887), ("rpmbak", 38912, 39935),
+    ("hypbak", 40960, 41983), ("pad", 43008, 43519), ("misc", 44032, 44543), ("ssd", 45056, 45119),
+    ("splash", 46080, 47103), ("DDR", 48128, 48639), ("recovery", 49152, 50175),
 ]
 
 
@@ -441,6 +447,28 @@ class Board:
                 "--usb-sysfs-root", str(self.sysfs), "--usb-device-root", str(self.devroot)] + EASY_COMMAND + list(extra_args)
         return run_pty(argv, self.env(**(env_overrides or {})), rules, timeout=timeout, cwd=str(self.root))
 
+    def bake_edl_env(self):
+        """The guarded `restore` hands the EDL client a minimal environment (PATH, HOME, LANG). Test-only: replace the
+        board's edl by a wrapper that supplies the fake-board variables itself, then runs the unchanged shim."""
+        real = self.edl_dir / "edl.shim"
+        if not real.exists():
+            shutil.move(str(self.edl_dir / "edl"), str(real))
+        lines = ["#!/usr/bin/env bash"]
+        for name in ("OPENSTICK_FAKE_EMMC", "OPENSTICK_EDL_ALLOW_WRITES", "OPENSTICK_EDL_WRITE_LOG",
+                     "OPENSTICK_EDL_COMMAND_FILE", "OPENSTICK_EDL_SESSION_FILE"):
+            lines.append("export %s=${%s:-%s}" % (name, name, shlex.quote(self.env()[name])))
+        lines.append("exec %s \"$@\"" % shlex.quote(str(real)))
+        (self.edl_dir / "edl").write_text("\n".join(lines) + "\n")
+        (self.edl_dir / "edl").chmod(0o755)
+        shims = self.base / "fwlib-shims"
+        shims.mkdir(exist_ok=True)
+        (shims / "sha256sum").write_text(
+            '#!/bin/bash\nset -eu\nfor arg in "$@"; do\n  if [[ "$arg" == %s ]]; then\n'
+            "    printf '959439aa5864685999b713c3ed12ad5fa408149648b670a9a9ef77bcc9dcab14  %%s\\n' \"$arg\"; exit 0\n  fi\ndone\n"
+            'exec /usr/bin/sha256sum "$@"\n' % shlex.quote(str(self.loader)))
+        (shims / "sha256sum").chmod(0o755)
+        self.extra_env["OPENSTICK_TEST_FWLIB_SHIM_DIR"] = str(shims)
+
     # -- observations
     def writes(self):
         return [line.split() for line in self.write_log.read_text().splitlines() if line.strip()]
@@ -522,3 +550,71 @@ def check_order(targets, boot_lba=396384, userdata_lba=2428000):
     gpt = max(at({"0"}), at({str(EMMC_SECTORS - 33)}))
     boot, userdata = at({str(boot_lba)}), at({str(userdata_lba)})
     assert gpt < boot < userdata, "write order is not gpt, boot, userdata: %s" % targets
+
+
+# ---------------------------------------------------------------- the printed restore command (guarded `restore`)
+RESTORE_PHASES = ("pad", "userdata", "cache", "persist", "boot", "modemst1", "modemst2", "sbl1", "rpm", "tz", "tzbak",
+                  "hyp", "aboot", "gpt-secondary", "gpt-primary")
+
+
+def printed_restore_command(output):
+    """The command exactly as easy mode printed it ('Restore command: ...' after a flash, 'To go back: ...' after a failure)."""
+    match = re.search(r"(?m)^(?:Restore command: |To go back: )(openstick --home .* restore --device \S+ --backup \S+?)\.?(?: First unplug.*)?$", output)
+    assert match, "no restore command printed:\n" + output[-800:]
+    return match.group(1)
+
+
+def run_printed_restore(board, command, dry_run=False, timeout=900):
+    """Run the printed command (argv[0] 'openstick' replaced by the test launcher), answering each phase prompt exactly as
+    the guarded command demands. A fresh cold EDL session is simulated first, as the printed advice says."""
+    board.bake_edl_env()
+    board.plug()
+    (board.base / "edl-session").unlink(missing_ok=True)
+    words = shlex.split(command)
+    assert words[0] == "openstick" and words[1] == "--home" and words[3] == "restore", words
+    argv = [sys.executable, str(board.root / "tests/easy_launcher.py"), "--no-color", "--usb-sysfs-root", str(board.sysfs),
+            "--usb-device-root", str(board.devroot)] + words[1:]
+    if dry_run:
+        argv.insert(2, "--dry-run")
+    rules = [Rule(r"Type exactly: restore \S+ %s\b" % re.escape(phase), None, action=None) for phase in ()]
+    rules = []
+    for phase in RESTORE_PHASES:
+        rules.append(Rule(r"Type exactly: restore [0-9a-f]+ %s\b" % re.escape(phase), "restore %s %s" % (_device_suffix(words), phase)))
+    return run_pty(argv, board.env(), rules, timeout=timeout, cwd=str(board.root))
+
+
+def _device_suffix(words):
+    return words[words.index("--device") + 1][-8:]
+
+
+def registry(board):
+    sys.path.insert(0, str(board.root))
+    from tools.installer import store
+    return store.load_registry(board.home)
+
+
+def flash_entries(board):
+    devices = registry(board)["devices"]
+    assert len(devices) == 1, "expected one registered device, found %d" % len(devices)
+    return devices[0].get("flashes", [])
+
+
+def events(board):
+    path = board.home / "events.jsonl"
+    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()] if path.exists() else []
+
+
+def check_restored(board, rc, out):
+    """After the printed restore command: exit 0, the product's own final full-disk readback passed, and the fake disk is
+    byte-identical to the verified backup (sparse compare with the original AND the backup manifest's SHA-256)."""
+    import hashlib
+    assert rc == 0, "printed restore command failed (rc=%s):\n%s" % (rc, out[-1500:])
+    assert "PASS final full-disk readback exactly matches the verified backup SHA-256" in out, "no final readback pass printed"
+    assert same_files(board.disk, board.initial), "fake disk differs from the original after restore"
+    backup = board.backup_dirs()[0]
+    want = json.loads((backup / "manifest.json").read_text())["sha256"]
+    digest = hashlib.sha256()
+    with board.disk.open("rb") as handle:
+        for block in iter(lambda: handle.read(8 << 20), b""):
+            digest.update(block)
+    assert digest.hexdigest() == want, "fake disk SHA-256 differs from the verified backup SHA-256"
