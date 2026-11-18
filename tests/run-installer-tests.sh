@@ -147,6 +147,10 @@ runx easy-poll-timeout easy-poll-timeout.py "$ROOT" "$TMP"
 runx easy-phase-failure easy-phase-failure.py "$ROOT" "$TMP"
 runx easy-yes-flag easy-yes-flag.py "$ROOT" "$TMP"
 runx easy-image-set easy-image-set.py "$ROOT" "$TMP"
+# restore after an easy flash: each group runs the real guarded restore (about 80 s each) on the fake board, so a longer timeout.
+GROUP_TIMEOUT=900 runx easy-restore-after-flash easy-restore-after-flash.py "$ROOT" "$TMP"
+GROUP_TIMEOUT=900 runx easy-restore-after-failure easy-restore-after-failure.py "$ROOT" "$TMP"
+GROUP_TIMEOUT=900 runx easy-restore-twice easy-restore-twice.py "$ROOT" "$TMP"
 
 # Retain the M0 passing regression set. Known baseline failures remain documented and are not installer failures.
 for test in verify-fetch-firehose.sh verify-flash-board.sh verify-harden.sh verify-initramfs-fail.sh verify-nft-ruleset.sh verify-rollback-plan.sh verify-sshd-config.sh; do

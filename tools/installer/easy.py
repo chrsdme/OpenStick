@@ -77,6 +77,7 @@ class Context:
         self.backup_manifest = None
         self.board = getattr(args, "board", None) or SUPPORTED_BOARD
         self.seed_data = None
+        self.flash_index = None                   # position of this run's entry in device["flashes"]
 
     @property
     def backup_id(self):
@@ -641,6 +642,130 @@ def _verify_full(ctx, temp, plan):
     _say("  full verification passed")
 
 
+# Firmware partitions the guarded restore classifies (tools/installer/verify_restore.py _known_rollback_state).
+# fw file, stock file, partition name.
+_FW_EVIDENCE = (("sbl1.img", "stock-sbl1.bin", "sbl1"), ("rpm.img", "stock-rpm.bin", "rpm"),
+                ("tz.img", "stock-tz-tzbak.bin", "tz"), ("hyp.img", "stock-hyp.bin", "hyp"),
+                ("aboot.img", "stock-aboot.bin", "aboot"))
+
+
+def _private_file(path, data):
+    path = Path(path)
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    store._atomic_private_write(path, data)
+
+
+def _sums_lines(root, skip):
+    lines = []
+    for item in sorted(Path(root).rglob("*")):
+        if item.is_file() and not item.is_symlink() and item != skip:
+            lines.append("%s  %s" % (_sha_file(item), item.relative_to(root).as_posix()))
+    return "\n".join(lines) + "\n"
+
+
+def _build_rollback_evidence(ctx, plan):
+    """Private evidence set that the guarded `restore` accepts, describing what THIS easy flash does.
+
+    Same layout the guarded flash records for its image set: pathA/{gpt,fw,rollback} plus two SHA256SUMS files.
+    Easy mode writes no firmware (aboot, sbl1, rpm, tz, hyp), so for each firmware range of the PLANNED GPT-T the
+    "new" file and the "stock" file are the same bytes: the backup's bytes at that range. That is true only if no easy
+    write touches the range; otherwise nothing is recorded and easy mode stops before the first write.
+    """
+    dump = ctx.backup_dir / "emmc-full.bin"
+    total = plan.total_sectors
+    planned = _planned_rows(plan.primary.read_bytes())
+    written = [(0, GPT_PRIMARY_SECTORS - 1), (total - GPT_SECONDARY_SECTORS, total - 1),
+               (plan.boot_lba, plan.partitions["boot"]["end_lba"]),
+               (plan.userdata_lba, plan.partitions["userdata"]["end_lba"])]
+    written += [(new_start, new_end) for _n, _a, _b, new_start, new_end in plan.preserved]
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    root = ctx.home / "images" / ("evidence-%s-%s" % (ctx.device_id[-8:], stamp))
+    root.mkdir(mode=0o700)
+    patha = root / "pathA"
+    with dump.open("rb") as source:
+        def backup_bytes(first, last):
+            source.seek(first * SECTOR)
+            data = source.read((last - first + 1) * SECTOR)
+            if len(data) != (last - first + 1) * SECTOR:
+                raise EasyError("the backup is truncated at LBA %d" % first)
+            return data
+        primary, secondary = backup_bytes(0, GPT_PRIMARY_SECTORS - 1), backup_bytes(total - GPT_SECONDARY_SECTORS, total - 1)
+        _private_file(patha / "gpt" / "gpt-T-primary.bin", plan.primary.read_bytes())
+        _private_file(patha / "gpt" / "gpt-T-secondary.bin", plan.secondary.read_bytes())
+        _private_file(patha / "rollback" / "gpt-orig-primary.bin", primary)
+        _private_file(patha / "rollback" / "gpt-orig-secondary.bin", secondary)
+        for fw_name, stock_name, part in _FW_EVIDENCE:
+            span = planned.get(part)
+            if span is None:
+                raise EasyError("NEEDS-HARDWARE: %s is missing in the planned GPT-T, so no rollback evidence can be recorded. Not writing." % part)
+            if any(span[0] <= end and start <= span[1] for start, end in written):
+                raise EasyError("NEEDS-HARDWARE: %s overlaps an easy-mode write range, so its content is not known. Not writing." % part)
+            data = backup_bytes(*span)
+            _private_file(patha / "fw" / fw_name, data)
+            _private_file(patha / "rollback" / stock_name, data)
+    _private_file(patha / "SHA256SUMS", _sums_lines(patha, patha / "SHA256SUMS").encode("ascii"))
+    _private_file(root / "SHA256SUMS", _sums_lines(root, root / "SHA256SUMS").encode("ascii"))
+    return root
+
+
+def _update_flash_entry(ctx, **changes):
+    from . import cli as common
+    registry = store.load_registry(ctx.home)
+    device = common._find_device(registry, ctx.device_id)
+    entry = device["flashes"][ctx.flash_index]
+    phase = changes.pop("phase", None)
+    if phase:
+        entry["phases"].append(phase)
+    entry.update(changes)
+    store.save_registry(ctx.home, registry)
+
+
+def _flash_event(ctx, phase, outcome, **details):
+    event = {"at": int(time.time()), "type": "flash.phase", "device_id": ctx.device_id,
+             "phase": phase, "outcome": outcome, "mode": "easy"}
+    event.update(details)
+    store.append_event(ctx.home, event)
+
+
+def _archive_completed_restore_state(ctx):
+    """A restore that already ran to completion refuses to run again for the same backup ("will not replay destructive
+    phases"). A NEW flash makes that record stale: without this, flash -> restore -> flash again -> restore is refused.
+    Only a state whose status is exactly "complete" is moved aside (renamed, never deleted); in-progress, partial and
+    reconciliation states are left alone so the guarded restore still sees them. The restore code is not changed."""
+    from . import verify_restore
+    path = verify_restore._state_path(ctx.home, ctx.device_id)
+    if not path.exists():
+        return
+    state = store._read_json(path, {})
+    if not isinstance(state, dict) or state.get("status") != "complete":
+        return
+    archived = path.with_name("restore-state.complete-%s.json" % datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ"))
+    os.rename(path, archived)
+    _flash_event(ctx, "restore-state", "completed-restore-state-archived", archived=archived.name)
+
+
+def _register_flash(ctx, plan):
+    """Record the flash in the registry BEFORE the first write, in the form the guarded `restore` reads."""
+    from . import cli as common
+    evidence = _build_rollback_evidence(ctx, plan)
+    _archive_completed_restore_state(ctx)
+    registry = store.load_registry(ctx.home)
+    device = common._find_device(registry, ctx.device_id)
+    if not device:
+        raise EasyError("the stick is not registered, so no flash record can be written. Nothing was written.")
+    device.setdefault("flashes", []).append({"ts": int(time.time()), "image_set": str(evidence), "mode": "easy",
+                                             "source_image_set": str(plan.set_dir), "phases": [],
+                                             "outcome": "in-progress"})
+    ctx.flash_index = len(device["flashes"]) - 1
+    store.save_registry(ctx.home, registry)
+    _flash_event(ctx, "flash", "registered", evidence=str(evidence))
+
+
+def _flash_phase_done(ctx, name):
+    _update_flash_entry(ctx, phase={"name": name, "result": "easy-readback-pass", "verified": True})
+    _flash_event(ctx, name, "easy-readback-pass", verified=True)
+
+
 def step8_flash(ctx, plan):
     from . import flash as flash_module
     ctx.session = edl_runner.Session(sysfs_root=ctx.usb_sysfs_root)
@@ -654,19 +779,31 @@ def step8_flash(ctx, plan):
         if serial != ctx.device_id or observed != ctx.backup_manifest.get("identity"):
             raise EasyError("this is not the stick that was backed up (identity differs). Nothing was written.")
         _say("  identity matches the backup")
-        _phase(ctx, "gpt")
-        ctx.wrote = True
-        _write_and_check(ctx, temp, "gpt secondary", plan.total_sectors - GPT_SECONDARY_SECTORS, plan.secondary, True)
-        _write_and_check(ctx, temp, "gpt primary", 0, plan.primary, True)
-        _phase(ctx, "boot")
-        _write_and_check(ctx, temp, "boot", plan.boot_lba, plan.boot, True)
-        _phase(ctx, "userdata")
-        _write_and_check(ctx, temp, "userdata", plan.userdata_lba, plan.rootfs, False)
-        _phase(ctx, "preserved partitions")
-        _restore_preserved(ctx, temp, plan)
-        if ctx.args.verify_full:
-            _phase(ctx, "full verification")
-            _verify_full(ctx, temp, plan)
+        _register_flash(ctx, plan)
+        try:
+            _phase(ctx, "gpt")
+            ctx.wrote = True
+            _write_and_check(ctx, temp, "gpt secondary", plan.total_sectors - GPT_SECONDARY_SECTORS, plan.secondary, True)
+            _write_and_check(ctx, temp, "gpt primary", 0, plan.primary, True)
+            _flash_phase_done(ctx, "gpt")
+            _phase(ctx, "boot")
+            _write_and_check(ctx, temp, "boot", plan.boot_lba, plan.boot, True)
+            _flash_phase_done(ctx, "boot")
+            _phase(ctx, "userdata")
+            _write_and_check(ctx, temp, "userdata", plan.userdata_lba, plan.rootfs, False)
+            _flash_phase_done(ctx, "userdata")
+            _phase(ctx, "preserved partitions")
+            _restore_preserved(ctx, temp, plan)
+            _flash_phase_done(ctx, "preserved partitions")
+            if ctx.args.verify_full:
+                _phase(ctx, "full verification")
+                _verify_full(ctx, temp, plan)
+        except BaseException:
+            _update_flash_entry(ctx, outcome="partial-failure-reconciliation-required",
+                                phase={"name": ctx.phase, "result": "failed", "verified": False})
+            _flash_event(ctx, ctx.phase, "failed", verified=False)
+            raise
+    _update_flash_entry(ctx, outcome="easy-pass-not-boot-verified")
     _event(ctx, "flash", "complete-not-boot-verified")
 
 

@@ -31,6 +31,24 @@ if loader:
                 if hasattr(module, attribute):
                     setattr(module, attribute, digest)
 
+# Test-only, like OPENSTICK_TEST_LOADER: tools/pathA/fwlib.sh (run by the guarded restore) compares the loader to the real
+# pinned hash through `sha256sum`. restore's PATH for it is a fixed helper that tests are told to patch (see
+# verify_restore._fwlib_path); this prepends a private shim dir whose sha256sum answers the pinned hash for the synthetic loader.
+fwlib_shims = os.environ.get("OPENSTICK_TEST_FWLIB_SHIM_DIR")
+if fwlib_shims:
+    from tools.installer import verify_restore as _vr
+    _vr._fwlib_path = lambda: fwlib_shims + ":/usr/bin:/bin"
+
+# Test-only mutation switch (mutation proofs in tests/groups/easy-restore-after-flash.py): drop one product step.
+if os.environ.get("OPENSTICK_TEST_MUTATE") == "no-flash-entry":
+    from tools.installer import easy as _easy
+    _easy._register_flash = lambda ctx, plan: None
+    _easy._flash_phase_done = lambda ctx, name: None
+    _easy._update_flash_entry = lambda ctx, **changes: None
+if os.environ.get("OPENSTICK_TEST_MUTATE") == "no-archive":
+    from tools.installer import easy as _easy
+    _easy._archive_completed_restore_state = lambda ctx: None
+
 fixture = os.environ.get("OPENSTICK_TEST_FAKE_BUILD")
 if fixture:
     from tools.installer import build as build_module
