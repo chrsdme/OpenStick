@@ -298,7 +298,7 @@ class Board:
         _make_removable(self.base)
         self.base.mkdir(mode=0o700)
         import atexit
-        atexit.register(_make_removable, self.base, False)  # image sets and builds are created read-only
+        atexit.register(_make_removable, self.base, True)  # image sets and builds are created read-only; free the 3.9 GB fake disks when the group exits
         self.home = self.base / "private"
         self.sysfs = self.base / "usb/sys/bus/usb/devices"
         self.devroot = self.base / "usb/dev/bus/usb"
