@@ -28,6 +28,7 @@ import argparse
 import os
 import shlex
 import shutil
+import signal
 import struct
 import subprocess
 import sys
@@ -57,6 +58,18 @@ PRESERVED = ("fsg", "sec", "fsc", "modemst1", "modemst2", "persist")
 SUPPORTED_BOARD = "ufi103s"
 GPT_PRIMARY_SECTORS, GPT_SECONDARY_SECTORS = 34, 33
 EXIT_OK, EXIT_ERROR = 0, 1
+
+# Stock signature of the supported layout (ufi103s-gpt-t-board6-v1). Derived from imageset.EXPECTED_PARTITIONS (boot,
+# userdata), FLASH-PLAN.md / ROLLBACK.md (27 named partitions, firmware sizes, tz and tzbak adjacent) and
+# tools/gen-gpt-tz1m.py. Other LBAs are NOT pinned here: the check that no unwritten partition moves compares the
+# planned GPT-T with the board's own backup GPT instead.
+STOCK_NAMES = frozenset((
+    "sbl1", "rpm", "tz", "tzbak", "hyp", "aboot", "fsg", "sec", "fsc", "modemst1", "modemst2", "persist", "boot",
+    "system", "cache", "userdata", "modem", "sbl1bak", "abootbak", "rpmbak", "hypbak", "pad", "misc", "ssd",
+    "splash", "DDR", "recovery"))
+STOCK_FIRMWARE_SECTORS = {"sbl1": 1024, "rpm": 1024, "tz": 1024, "tzbak": 1024, "hyp": 1024, "aboot": 2048}
+WRITTEN_NAMES = ("boot", "userdata")
+INTERRUPT_NOTE = "Ctrl-C ignored: do not interrupt, wait. The stick is being written."
 
 
 class EasyError(Exception):
@@ -99,6 +112,8 @@ class Plan:
         self.partitions = {}                      # imageset manifest partitions
         self.preserved = []                       # (name, old_start, old_end, new_start, new_end)
         self.total_sectors = None
+        self.layout_id = None
+        self.board = None
 
 
 # ---------------------------------------------------------------- small helpers
@@ -326,6 +341,8 @@ def step3_backup(ctx):
         ctx.backup_dir, ctx.backup_manifest = _find_verified_backup(ctx, device)
         if ctx.backup_dir is None:
             raise EasyError("the new backup could not be verified")
+    _check_restore_state(ctx)
+    _check_stock_signature(ctx)
     _say("Backup folder: %s" % ctx.backup_dir)
     _say("To go back to the original state later, run:")
     _say("  %s" % ctx.restore_command())
@@ -391,6 +408,191 @@ def step4_choose_mode(ctx):
         raise EasyError("custom mode needs debugfs and e2fsck (package e2fsprogs). Install it and run again.")
     ctx.seed_data = _custom_seed(ctx)
     return ctx.seed_data["PROFILE"]
+
+
+# ---------------------------------------------------------------- checks that run before any write
+
+class _Terminated(EasyError):
+    """SIGTERM or SIGHUP reached easy mode."""
+
+
+def _backup_dump(ctx):
+    return ctx.backup_dir / "emmc-full.bin"
+
+
+def _backup_slice(ctx, first, count):
+    with _backup_dump(ctx).open("rb") as dump:
+        dump.seek(first * SECTOR)
+        data = dump.read(count * SECTOR)
+    if len(data) != count * SECTOR:
+        raise EasyError("the backup is truncated at LBA %d. Nothing was written." % first)
+    return data
+
+
+def _backup_rows(ctx):
+    """name -> (start, end) read from the backup's own primary GPT (not from the planned one)."""
+    try:
+        return _planned_rows(_backup_slice(ctx, 0, GPT_PRIMARY_SECTORS))
+    except (struct.error, UnicodeDecodeError, ValueError):
+        raise EasyError("the backup GPT cannot be read. Nothing was written.")
+
+
+def _check_stock_signature(ctx):
+    """The backup must look like the stock board the selected layout was made for; otherwise stop."""
+    from . import imageset
+    total = ctx.backup_manifest["sectors"]
+    if total != imageset.EMMC_SECTORS or _backup_dump(ctx).stat().st_size != total * SECTOR:
+        raise EasyError("the backup has %d sectors (file %d bytes); layout %s is for %d sectors. Nothing was written."
+                        % (total, _backup_dump(ctx).stat().st_size, imageset.LAYOUT_ID, imageset.EMMC_SECTORS))
+    rows = _backup_rows(ctx)
+    if set(rows) != STOCK_NAMES:
+        raise EasyError("the backup partition names do not match the stock signature of layout %s (missing: %s; extra: %s). "
+                        "Nothing was written." % (imageset.LAYOUT_ID, ", ".join(sorted(STOCK_NAMES - set(rows))) or "none",
+                                                  ", ".join(sorted(set(rows) - STOCK_NAMES)) or "none"))
+    for name, want in imageset.EXPECTED_PARTITIONS.items():
+        if rows[name] != want:
+            raise EasyError("backup partition %s is at LBA %d..%d; layout %s needs %d..%d. Nothing was written."
+                            % (name, rows[name][0], rows[name][1], imageset.LAYOUT_ID, want[0], want[1]))
+    for name, sectors in STOCK_FIRMWARE_SECTORS.items():
+        if rows[name][1] - rows[name][0] + 1 != sectors:
+            raise EasyError("backup partition %s has %d sectors; the stock signature says %d. Nothing was written."
+                            % (name, rows[name][1] - rows[name][0] + 1, sectors))
+    if rows["tzbak"][0] != rows["tz"][1] + 1:
+        raise EasyError("backup tz and tzbak are not adjacent. Nothing was written.")
+    recorded = ctx.backup_manifest.get("partitions", {})
+    for name, (start, end) in rows.items():
+        row = recorded.get(name)
+        if row is not None and (row.get("start_lba"), row.get("end_lba")) != (start, end):
+            raise EasyError("the backup manifest and the backup GPT disagree about %s. Nothing was written." % name)
+    return rows
+
+
+def _check_firmware_unchanged(backup_rows, planned):
+    """Every partition easy mode does not write keeps its LBA range and size in the planned GPT-T.
+
+    The ONE documented change is tz (tools/gen-gpt-tz1m.py): tz grows to end where tzbak ended and tzbak is removed.
+    No bytes of either are written, so their content stays the backup's. Boot and userdata (written) and the PRESERVED
+    partitions (rewritten by name, same size checked in _derive_plan) are not part of this comparison."""
+    exempt = set(WRITTEN_NAMES) | set(PRESERVED)
+    for name, old in backup_rows.items():
+        if name in exempt:
+            continue
+        if name == "tzbak":
+            if "tzbak" in planned:
+                raise EasyError("the planned GPT-T keeps tzbak, but the documented layout removes it. Nothing was written.")
+            continue
+        want = (old[0], backup_rows["tzbak"][1]) if name == "tz" else old
+        if planned.get(name) != want:
+            raise EasyError("the planned GPT-T moves or resizes %s (backup %s, planned %s). Partitions that easy mode "
+                            "does not write must keep their LBA range and size. Nothing was written."
+                            % (name, "%d..%d" % old, "missing" if name not in planned else "%d..%d" % planned[name]))
+    extra = sorted(set(planned) - set(backup_rows))
+    if extra:
+        raise EasyError("the planned GPT-T adds partitions that are not in the backup (%s). Nothing was written." % ", ".join(extra))
+
+
+def _check_payload_sizes(plan):
+    """boot.img must fit the boot partition; rootfs.img the userdata partition."""
+    for name, path, label in (("boot", plan.boot, "boot.img"), ("userdata", plan.rootfs, "rootfs.img")):
+        capacity = plan.partitions[name]["sectors"] * SECTOR
+        size = Path(path).stat().st_size
+        if size > capacity:
+            raise EasyError("%s is %d bytes, larger than the %s partition (%d bytes). Nothing was written."
+                            % (label, size, name, capacity))
+
+
+def _check_restore_state(ctx):
+    """A restore that is not complete must be finished by the guarded restore before anything new is written."""
+    from . import verify_restore
+    path = verify_restore._state_path(ctx.home, ctx.device_id)
+    if not (path.exists() or path.is_symlink()):
+        return
+    try:
+        state = store._read_json(path, {})
+    except Exception:
+        state = None
+    status = state.get("status") if isinstance(state, dict) else None
+    if status != "complete":
+        raise EasyError("a restore of this stick is not complete (state: %s). Finish it with the guarded restore first: %s. "
+                        "Nothing was written." % (status if isinstance(status, str) else "unreadable", ctx.restore_command()))
+
+
+def _check_live_gpt(ctx, temp):
+    """Before the first write the stick's current GPT (primary and secondary) must equal the backup's."""
+    total = ctx.backup_manifest["sectors"]
+    for label, lba, count in (("primary", 0, GPT_PRIMARY_SECTORS), ("secondary", total - GPT_SECONDARY_SECTORS, GPT_SECONDARY_SECTORS)):
+        live = _read_sectors(ctx, temp, lba, count)
+        if live.read_bytes() != _backup_slice(ctx, lba, count):
+            raise EasyError("the GPT (%s) on the stick differs from the backup's: the stick changed after the backup "
+                            "(or an earlier flash is in place). Make a new backup. Nothing was written." % label)
+
+
+class _SigintShield:
+    """Ctrl-C is ignored while the stick is written.
+
+    SIGINT is BLOCKED (not handled): a blocked signal mask is inherited across fork and exec, so the edl client and its
+    children also do not see the terminal's Ctrl-C (a handler would be reset by exec and the client would die mid-write).
+    A watcher thread consumes pending SIGINTs and prints the note; leftovers are drained before the mask is restored."""
+
+    def __enter__(self):
+        signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT})
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._watch, daemon=True)
+        self._thread.start()
+        return self
+
+    def _watch(self):
+        while not self._stop.is_set():
+            if signal.sigtimedwait({signal.SIGINT}, 0.2) is not None:
+                _say(INTERRUPT_NOTE)
+
+    def __exit__(self, *exc):
+        self._stop.set()
+        self._thread.join()
+        while signal.sigtimedwait({signal.SIGINT}, 0) is not None:
+            _say(INTERRUPT_NOTE)
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGINT})
+        return False
+
+
+def _descendants():
+    """Pids of every process below this one (from /proc; Linux only)."""
+    children = {}
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            fields = (entry / "stat").read_text().rpartition(")")[2].split()
+        except OSError:
+            continue
+        if len(fields) > 1 and fields[0] != "Z":
+            children.setdefault(int(fields[1]), []).append(int(entry.name))
+    found, queue = [], [os.getpid()]
+    while queue:
+        for pid in children.get(queue.pop(), []):
+            found.append(pid)
+            queue.append(pid)
+    return found
+
+
+def _kill_children():
+    """No edl client (or helper of it) outlives easy mode."""
+    for sig, wait in ((signal.SIGTERM, 3.0), (signal.SIGKILL, 2.0)):
+        pids = _descendants()
+        if not pids:
+            return
+        for pid in pids:
+            try:
+                os.kill(pid, sig)
+            except OSError:
+                pass
+        deadline = time.monotonic() + wait
+        while _descendants() and time.monotonic() < deadline:
+            time.sleep(0.05)
+
+
+def _on_terminate(signum, frame):
+    raise _Terminated("terminated by signal %d" % signum)
 
 
 # ---------------------------------------------------------------- step 5
@@ -486,12 +688,18 @@ def _derive_plan(ctx, set_dir, rootfs_override):
     plan.partitions = manifest["partitions"]
     plan.boot_lba = plan.partitions["boot"]["start_lba"]
     plan.userdata_lba = plan.partitions["userdata"]["start_lba"]
+    plan.layout_id, plan.board = manifest["layout_id"], manifest["board"]
     plan.total_sectors = ctx.backup_manifest["sectors"]
     if plan.total_sectors != imageset.EMMC_SECTORS:
         raise EasyError("this stick has %d sectors; the GPT-T layout is for %d. Not writing." % (plan.total_sectors, imageset.EMMC_SECTORS))
+    if plan.board != ctx.board:
+        raise EasyError("the image set is for board %s, not %s. Nothing was written." % (plan.board, ctx.board))
+    backup_rows = _check_stock_signature(ctx)
+    _check_payload_sizes(plan)
     if rootfs_override:
         imageset._validate_ext4(plan.rootfs, plan.partitions["userdata"]["sectors"] * SECTOR)
     planned = _planned_rows(plan.primary.read_bytes())
+    _check_firmware_unchanged(backup_rows, planned)
     backup_parts = ctx.backup_manifest["partitions"]
     written = [(plan.partitions[n]["start_lba"], plan.partitions[n]["end_lba"]) for n in ("boot", "userdata")]
     for name in PRESERVED:
@@ -534,6 +742,8 @@ def step7_confirm(ctx, plan):
     _say("")
     _say("Step 7/9: confirmation")
     _say("About to WRITE to the stick (device %s):" % ctx.device_id)
+    _say("  board    : %s, layout %s (backup matches its stock signature: %d sectors, %d partitions)"
+         % (ctx.board, plan.layout_id, plan.total_sectors, len(STOCK_NAMES)))
     _say("  GPT      : planned GPT-T, primary and secondary")
     _say("  boot     : %s, %d bytes, at LBA %d" % (plan.boot.name, plan.boot.stat().st_size, plan.boot_lba))
     _say("  userdata : %s, %d bytes, at LBA %d" % (plan.rootfs.name, plan.rootfs.stat().st_size, plan.userdata_lba))
@@ -774,37 +984,48 @@ def step8_flash(ctx, plan):
     with tempfile.TemporaryDirectory(prefix="openstick-easy-flash-", dir=str(ctx.home / "images")) as temp:
         os.chmod(temp, 0o700)
         ctx.phase = "identity check"
+        _check_restore_state(ctx)
+        _check_stock_signature(ctx)
+        _check_payload_sizes(plan)
         serial, observed = flash_module._live_identity(None, None, os.environ.copy(), temp,
                                                        ctx.backup_manifest["partitions"], session=ctx.session)
         if serial != ctx.device_id or observed != ctx.backup_manifest.get("identity"):
             raise EasyError("this is not the stick that was backed up (identity differs). Nothing was written.")
         _say("  identity matches the backup")
-        _register_flash(ctx, plan)
-        try:
-            _phase(ctx, "gpt")
-            ctx.wrote = True
-            _write_and_check(ctx, temp, "gpt secondary", plan.total_sectors - GPT_SECONDARY_SECTORS, plan.secondary, True)
-            _write_and_check(ctx, temp, "gpt primary", 0, plan.primary, True)
-            _flash_phase_done(ctx, "gpt")
-            _phase(ctx, "boot")
-            _write_and_check(ctx, temp, "boot", plan.boot_lba, plan.boot, True)
-            _flash_phase_done(ctx, "boot")
-            _phase(ctx, "userdata")
-            _write_and_check(ctx, temp, "userdata", plan.userdata_lba, plan.rootfs, False)
-            _flash_phase_done(ctx, "userdata")
-            _phase(ctx, "preserved partitions")
-            _restore_preserved(ctx, temp, plan)
-            _flash_phase_done(ctx, "preserved partitions")
-            if ctx.args.verify_full:
-                _phase(ctx, "full verification")
-                _verify_full(ctx, temp, plan)
-        except BaseException:
-            _update_flash_entry(ctx, outcome="partial-failure-reconciliation-required",
-                                phase={"name": ctx.phase, "result": "failed", "verified": False})
-            _flash_event(ctx, ctx.phase, "failed", verified=False)
-            raise
-    _update_flash_entry(ctx, outcome="easy-pass-not-boot-verified")
-    _event(ctx, "flash", "complete-not-boot-verified")
+        ctx.phase = "GPT check"
+        _check_live_gpt(ctx, temp)
+        _say("  the GPT on the stick equals the backup's")
+        with _SigintShield():
+            _write_phases(ctx, temp, plan)
+            _update_flash_entry(ctx, outcome="easy-pass-not-boot-verified")
+            _event(ctx, "flash", "complete-not-boot-verified")
+
+
+def _write_phases(ctx, temp, plan):
+    _register_flash(ctx, plan)
+    try:
+        _phase(ctx, "gpt")
+        ctx.wrote = True
+        _write_and_check(ctx, temp, "gpt secondary", plan.total_sectors - GPT_SECONDARY_SECTORS, plan.secondary, True)
+        _write_and_check(ctx, temp, "gpt primary", 0, plan.primary, True)
+        _flash_phase_done(ctx, "gpt")
+        _phase(ctx, "boot")
+        _write_and_check(ctx, temp, "boot", plan.boot_lba, plan.boot, True)
+        _flash_phase_done(ctx, "boot")
+        _phase(ctx, "userdata")
+        _write_and_check(ctx, temp, "userdata", plan.userdata_lba, plan.rootfs, False)
+        _flash_phase_done(ctx, "userdata")
+        _phase(ctx, "preserved partitions")
+        _restore_preserved(ctx, temp, plan)
+        _flash_phase_done(ctx, "preserved partitions")
+        if ctx.args.verify_full:
+            _phase(ctx, "full verification")
+            _verify_full(ctx, temp, plan)
+    except BaseException:
+        _update_flash_entry(ctx, outcome="partial-failure-reconciliation-required",
+                            phase={"name": ctx.phase, "result": "failed", "verified": False})
+        _flash_event(ctx, ctx.phase, "failed", verified=False)
+        raise
 
 
 # ---------------------------------------------------------------- step 9
@@ -850,6 +1071,21 @@ def run(args, home, repo, *, usb_sysfs_root=None, usb_device_root=None):
     ctx = Context(args, home, repo, usb_sysfs_root,
                   usb_device_root or edl_runner.default_usb_device_root())
     from . import cli as common
+    previous = {}
+    for number in (signal.SIGTERM, signal.SIGHUP):
+        try:
+            previous[number] = signal.signal(number, _on_terminate)
+        except ValueError:                        # not the main thread: keep the defaults
+            pass
+    try:
+        return _run_steps(ctx, args, common)
+    finally:
+        _kill_children()
+        for number, handler in previous.items():
+            signal.signal(number, handler)
+
+
+def _run_steps(ctx, args, common):
     try:
         step1_check_tools(ctx)
         if args.dry_run:
