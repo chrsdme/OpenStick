@@ -49,6 +49,26 @@ if os.environ.get("OPENSTICK_TEST_MUTATE") == "no-archive":
     from tools.installer import easy as _easy
     _easy._archive_completed_restore_state = lambda ctx: None
 
+# Round 8 mutation switches (tests/groups/easy-*-guard*.py): each disables ONE new pre-write check so a test can show that
+# the check, and nothing else, is what stops the run.
+_mutate = os.environ.get("OPENSTICK_TEST_MUTATE")
+if _mutate:
+    from tools.installer import easy as _easy
+    _noop = {"no-live-gpt-check": ("_check_live_gpt", lambda ctx, temp: None),
+             "no-identity-compare": ("_check_identity", lambda ctx, serial, observed: None),
+             "no-restore-state-check": ("_check_restore_state", lambda ctx: None),
+             "no-payload-size-check": ("_check_payload_sizes", lambda plan: None),
+             "no-firmware-check": ("_check_firmware_unchanged", lambda backup_rows, planned: None),
+             "no-stock-signature": ("_check_stock_signature", lambda ctx: _easy._backup_rows(ctx)),
+             "no-child-reap": ("_kill_children", lambda: None)}
+    if _mutate in _noop:
+        setattr(_easy, _noop[_mutate][0], _noop[_mutate][1])
+    if _mutate == "no-sigint-shield":
+        class _NoShield:
+            def __enter__(self): return self
+            def __exit__(self, *exc): return False
+        _easy._SigintShield = _NoShield
+
 fixture = os.environ.get("OPENSTICK_TEST_FAKE_BUILD")
 if fixture:
     from tools.installer import build as build_module

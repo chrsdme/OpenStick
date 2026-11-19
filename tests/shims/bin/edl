@@ -88,7 +88,9 @@ if (( fresh_session )); then
   printf 'main - Waiting for the device\n......\nmain - Device detected :)\n'
   printf 'sahara - Protocol version: 2, Version supported: 1\nmain - Mode detected: sahara\nsahara -\n\nVersion 0x2\n------------------------\n'
   printf 'HWID:              0x007050e100000000 (MSM_ID:0x007050e1,OEM_ID:0x0000,MODEL_ID:0x0000)\n'
-  printf 'CPU detected:      "MSM8916"\nPK_HASH:           0x0000000000000000000000000000000000000000000000000000000000000000\nSerial:            0xdeadbeef\n\n'
+  serial=0xdeadbeef
+  if [[ -n ${OPENSTICK_EDL_SERIAL_FILE:-} && -f ${OPENSTICK_EDL_SERIAL_FILE} ]]; then read -r serial < "$OPENSTICK_EDL_SERIAL_FILE"; fi
+  printf 'CPU detected:      "MSM8916"\nPK_HASH:           0x0000000000000000000000000000000000000000000000000000000000000000\nSerial:            %s\n\n' "$serial"
   printf 'sahara - Uploading loader %s ...\nsahara - 32-Bit mode detected.\nsahara - Loader successfully uploaded.\n' "$loader"
   if [[ ${OPENSTICK_EDL_HANG:-0} != 0 ]]; then
     handle_interrupt() {
@@ -135,6 +137,14 @@ fake_write() {
   if [[ -n ${OPENSTICK_EDL_WRITE_LOG:-} ]]; then printf '%s %s %s\n' "$op" "$target" "$(stat -c %s "$data")" >> "$OPENSTICK_EDL_WRITE_LOG"; fi
   if [[ ${OPENSTICK_EDL_FAIL_WRITE_AT:-0} != 0 && ${OPENSTICK_EDL_FAIL_WRITE_AT} == "$n" ]]; then
     echo "FAKE EDL injected write failure at write $n" >&2; exit 90
+  fi
+  # Test-only (easy SIGINT tests): OPENSTICK_EDL_SLOW_WRITE=<target>:<seconds> sleeps before that write is applied and
+  # records this shell's pid in OPENSTICK_EDL_PID_FILE, so a test can check that no client outlives easy mode.
+  if [[ -n ${OPENSTICK_EDL_SLOW_WRITE:-} && ${OPENSTICK_EDL_SLOW_WRITE%%:*} == "$target" ]]; then
+    # a test pty makes easy the session leader, so its exit would HUP this shell; ignore HUP so only easy's own cleanup can end it
+    trap '' HUP
+    [[ -z ${OPENSTICK_EDL_PID_FILE:-} ]] || printf '%s\n' "$$" >> "$OPENSTICK_EDL_PID_FILE"
+    sleep "${OPENSTICK_EDL_SLOW_WRITE#*:}"
   fi
   local sector=$target
   if [[ $op == w ]]; then

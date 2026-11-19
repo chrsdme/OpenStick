@@ -148,6 +148,11 @@ runx easy-phase-failure easy-phase-failure.py "$ROOT" "$TMP"
 runx easy-yes-flag easy-yes-flag.py "$ROOT" "$TMP"
 runx easy-image-set easy-image-set.py "$ROOT" "$TMP"
 runx easy-build-id easy-build-id.py "$ROOT" "$TMP"
+# round 8: refusals before the first write, each with a mutation proof.
+runx easy-identity-guards easy-identity-guards.py "$ROOT" "$TMP"
+runx easy-plan-guards easy-plan-guards.py "$ROOT" "$TMP"
+runx easy-restore-state-guard easy-restore-state-guard.py "$ROOT" "$TMP"
+runx easy-sigint-write easy-sigint-write.py "$ROOT" "$TMP"
 # restore after an easy flash: each group runs the real guarded restore (about 80 s each) on the fake board, so a longer timeout.
 GROUP_TIMEOUT=900 runx easy-restore-after-flash easy-restore-after-flash.py "$ROOT" "$TMP"
 GROUP_TIMEOUT=900 runx easy-restore-after-failure easy-restore-after-failure.py "$ROOT" "$TMP"

@@ -57,11 +57,42 @@ def must_fail(function, *args, **kwargs):
 class Rule:
     """Answer a prompt: reply text (sent with newline), or run `action` immediately when the pattern shows up."""
 
-    def __init__(self, pattern, reply=None, fires=1, action=None):
+    def __init__(self, pattern, reply=None, fires=1, action=None, send=None, kill=None, delay=0.0):
+        """send: bytes typed into the pty (b"\\x03" is a real Ctrl-C). kill: signal sent to the easy process.
+        delay: seconds after the pattern shows up before send/kill happen."""
         self.pattern, self.reply, self.fires, self.action = re.compile(pattern), reply, fires, action
+        self.send, self.kill, self.delay = send, kill, delay
+        self.immediate = bool(action or send or kill)
 
 
-def run_pty(argv, env, rules, timeout=300, cwd=None):
+def _fire(rule, pid, fd):
+    def work():
+        if rule.delay:
+            time.sleep(rule.delay)
+        if rule.action:
+            rule.action()
+        if rule.send:
+            with contextlib.suppress(OSError):
+                os.write(fd, rule.send)
+        if rule.kill:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(pid, rule.kill)
+    if rule.delay:
+        threading.Thread(target=work, daemon=True).start()
+    else:
+        work()
+
+
+def pid_alive(pid):
+    """True while the process exists and is not a zombie (Linux /proc)."""
+    try:
+        state = pathlib.Path("/proc/%d/stat" % pid).read_text().rpartition(")")[2].split()[0]
+    except (OSError, IndexError):
+        return False
+    return state != "Z"
+
+
+def run_pty(argv, env, rules, timeout=300, cwd=None, on_exit=None):
     """Run argv under a pty and answer prompts from `rules` (each at most `fires` times). Returns (rc, transcript).
 
     Reply rules fire only on text printed since the last reply, after QUIET seconds of silence, so a prompt is answered
@@ -75,6 +106,7 @@ def run_pty(argv, env, rules, timeout=300, cwd=None):
         finally:
             os._exit(127)
     out, mark, last = "", 0, time.monotonic()
+    exited = None          # wait status of the easy process, noticed as soon as it exits
     deadline = last + timeout
     fires = {id(rule): rule.fires for rule in rules}
     action_pos = {id(rule): 0 for rule in rules}
@@ -85,7 +117,15 @@ def run_pty(argv, env, rules, timeout=300, cwd=None):
                     os.kill(pid, signal.SIGKILL)
                 os.waitpid(pid, 0)
                 raise AssertionError("pty run timed out; transcript tail:\n" + strip_ansi(out)[-1500:])
+            if exited is None:
+                done, status = os.waitpid(pid, os.WNOHANG)
+                if done:
+                    exited = status
+                    if on_exit:
+                        on_exit()       # runs at the moment easy has exited, before leftover children can finish
             ready, _, _ = select.select([fd], [], [], 0.1)
+            if exited is not None and not ready:
+                break           # a leftover child that still holds the pty must not keep us waiting
             if ready:
                 try:
                     chunk = os.read(fd, 65536)
@@ -97,18 +137,18 @@ def run_pty(argv, env, rules, timeout=300, cwd=None):
                 last = time.monotonic()
                 plain = strip_ansi(out)
                 for rule in rules:
-                    if rule.action and fires[id(rule)] > 0:
+                    if rule.immediate and fires[id(rule)] > 0:
                         match = rule.pattern.search(plain, action_pos[id(rule)])
                         if match:
                             fires[id(rule)] -= 1
                             action_pos[id(rule)] = match.end()
-                            rule.action()
+                            _fire(rule, pid, fd)
                 continue
             if time.monotonic() - last >= QUIET:
                 tail = strip_ansi(out[mark:])
                 best = None
                 for rule in rules:
-                    if rule.action or fires[id(rule)] <= 0:
+                    if rule.immediate or fires[id(rule)] <= 0:
                         continue
                     match = rule.pattern.search(tail)
                     if match and (best is None or match.start() < best[0]):
@@ -118,8 +158,9 @@ def run_pty(argv, env, rules, timeout=300, cwd=None):
                     os.write(fd, (best[1].reply + "\n").encode())
                     mark = len(out)
                     last = time.monotonic()
-        _, status = os.waitpid(pid, 0)
-        return os.waitstatus_to_exitcode(status), strip_ansi(out)
+        if exited is None:
+            _, exited = os.waitpid(pid, 0)
+        return os.waitstatus_to_exitcode(exited), strip_ansi(out)
     finally:
         with contextlib.suppress(OSError):
             os.close(fd)
@@ -216,11 +257,12 @@ FAKE_PARTITIONS = [
 ]
 
 
-def make_original_disk(root, path):
+def make_original_disk(root, path, partitions=None):
     """Full-size SPARSE fake eMMC with a stock-like GPT (primary and secondary) and recognisable partition data."""
     gptool = _gptool(root)
     entries = []
-    for name, first, last in FAKE_PARTITIONS:
+    partitions = partitions or FAKE_PARTITIONS
+    for name, first, last in partitions:
         type_guid = gptool.BOOT_TYPE if name == "boot" else gptool.ROOT_TYPE
         entries.append(gptool.mk_entry(type_guid, str(uuid.uuid5(uuid.NAMESPACE_DNS, "openstick-easy-" + name)),
                                        first, last, 0, name))
@@ -241,7 +283,7 @@ def make_original_disk(root, path):
         disk.write(bytes(mbr) + primary_header + region)
         disk.seek((EMMC_SECTORS - 33) * SECTOR)
         disk.write(region + secondary_header)
-        for name, first, last in FAKE_PARTITIONS:
+        for name, first, last in partitions:
             if name in ("boot", "system", "cache", "userdata"):
                 continue
             disk.seek(first * SECTOR)
@@ -291,7 +333,7 @@ def _make_removable(path, remove=True):
 class Board:
     """One fake board: private store, sparse fake eMMC, fake USB tree, EDL dir, logs. Lives under the runner temp dir."""
 
-    def __init__(self, root, tmp, name):
+    def __init__(self, root, tmp, name, partitions=None):
         self.root = pathlib.Path(root)
         self.runner_tmp = pathlib.Path(tmp)
         self.base = self.runner_tmp / ("easy-" + name)
@@ -312,7 +354,7 @@ class Board:
         self.loader.write_bytes(b"test-only synthetic loader")  # the launcher swaps the pinned hash for this file's hash
         self.disk = self.base / "fake-emmc.img"
         self.initial = self.base / "fake-emmc.initial"
-        make_original_disk(self.root, self.initial)
+        make_original_disk(self.root, self.initial, partitions)
         self.write_log = self.base / "write.log"
         self.cmd_log = self.base / "edl-commands.log"
         self.build_mark = self.base / "build-calls.log"
@@ -336,12 +378,16 @@ class Board:
     def unplug(self):
         shutil.rmtree(self.sysfs / "1-1", ignore_errors=True)
 
-    def replug_action(self):
-        """For a Rule: simulate unplug, a second of silence, then a cold re-entry into EDL (fresh session)."""
+    def replug_action(self, before_plug=None, fresh=True):
+        """For a Rule: simulate unplug, a second of silence, then a cold re-entry into EDL (fresh session).
+        before_plug: called while unplugged (to change the board). fresh=False keeps the used Sahara session (not a cold boot)."""
         def worker():
             self.unplug()
             time.sleep(1.0)
-            (self.base / "edl-session").unlink(missing_ok=True)
+            if fresh:
+                (self.base / "edl-session").unlink(missing_ok=True)
+            if before_plug:
+                before_plug()
             self.plug()
         return lambda: threading.Thread(target=worker, daemon=True).start()
 
@@ -370,7 +416,7 @@ class Board:
         else:
             (self.fake_build_dir / "rootfs.img").write_bytes(synthetic_ext4_stub())
 
-    def register_build(self, name, tag=b"easy"):
+    def register_build(self, name, tag=b"easy", boot=None):
         """Register a fake build (boot.img + rootfs.img + build.json) the way `openstick build` does; returns (build_id, boot, rootfs)."""
         import hashlib
         store, imageset = self._tools()
@@ -378,7 +424,7 @@ class Board:
         build_id = "easy-set-build-" + name
         build_dir = self.home / "builds" / build_id
         build_dir.mkdir(mode=0o700)
-        boot, rootfs = synthetic_boot_image(tag), synthetic_ext4_stub()
+        boot, rootfs = boot or synthetic_boot_image(tag), synthetic_ext4_stub()
         (build_dir / "boot.img").write_bytes(boot)
         (build_dir / "rootfs.img").write_bytes(rootfs)
         manifest = {"schema_version": 1, "build_id": build_id, "board": "ufi103s", "profile": "dev",
@@ -391,10 +437,10 @@ class Board:
         store.save_registry(self.home, registry)
         return build_id, boot, rootfs
 
-    def make_image_set(self, name="image-set"):
+    def make_image_set(self, name="image-set", boot=None, edit_gpt=None):
         """GPT-T image set for this fake board: layout derived from the fake board's own GPT by tools/gen-gpt-tz1m.py."""
         store, imageset = self._tools()
-        build_id, _boot, _rootfs = self.register_build(name)
+        build_id, _boot, _rootfs = self.register_build(name, boot=boot)
         primary = self.base / ("primary-" + name + ".bin")
         with self.initial.open("rb") as disk:
             primary.write_bytes(disk.read(34 * SECTOR))
@@ -402,6 +448,8 @@ class Board:
         subprocess.check_call([sys.executable, "-I", str(self.root / "tools/gen-gpt-tz1m.py"), "--primary", str(primary),
                                "--emmc", str(EMMC_SECTORS), "--outdir", str(layout)],
                               stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, timeout=60)
+        if edit_gpt:
+            edit_gpt(layout)
         output = self.base / name
         args = types.SimpleNamespace(build=build_id, layout=str(layout), output=str(output))
         assert imageset.prepare_command(args, self.home, self.root) == 0
@@ -441,11 +489,11 @@ class Board:
         env.update(overrides)
         return env
 
-    def easy(self, extra_args, rules, env_overrides=None, timeout=600):
+    def easy(self, extra_args, rules, env_overrides=None, timeout=600, on_exit=None):
         (self.base / "edl-session").unlink(missing_ok=True)
         argv = [sys.executable, str(self.root / "tests/easy_launcher.py"), "--home", str(self.home), "--no-color",
                 "--usb-sysfs-root", str(self.sysfs), "--usb-device-root", str(self.devroot)] + EASY_COMMAND + list(extra_args)
-        return run_pty(argv, self.env(**(env_overrides or {})), rules, timeout=timeout, cwd=str(self.root))
+        return run_pty(argv, self.env(**(env_overrides or {})), rules, timeout=timeout, cwd=str(self.root), on_exit=on_exit)
 
     def bake_edl_env(self):
         """The guarded `restore` hands the EDL client a minimal environment (PATH, HOME, LANG). Test-only: replace the
@@ -618,3 +666,53 @@ def check_restored(board, rc, out):
         for block in iter(lambda: handle.read(8 << 20), b""):
             digest.update(block)
     assert digest.hexdigest() == want, "fake disk SHA-256 differs from the verified backup SHA-256"
+
+
+# ---------------------------------------------------------------- round 8: refusals before the first write
+def check_refused(board, rc, out, pattern, reference=None):
+    """A run that must stop BEFORE any write: non-zero exit, 'Nothing was written', the reason, no write to the fake
+    disk (write log empty) and the disk byte-identical to `reference` (default: the original disk)."""
+    assert rc != 0, "the run was not refused (rc=0):\n" + out[-1500:]
+    check_no_traceback(out)
+    assert "Nothing was written to the board." in out, "'Nothing was written' is not printed:\n" + out[-1200:]
+    assert re.search(pattern, out), "refusal reason %r not printed:\n%s" % (pattern, out[-1200:])
+    assert board.writes() == [], "the fake board was written: %s" % board.writes()[:3]
+    assert same_files(board.disk, reference or board.initial), "the fake disk changed"
+
+
+def device_id(board):
+    devices = registry(board)["devices"]
+    assert len(devices) == 1, "expected one registered device"
+    return devices[0]["id"]
+
+
+def snapshot_disk(board, name):
+    path = board.base / name
+    subprocess.check_call(["cp", "--sparse=always", str(board.disk), str(path)], stdin=subprocess.DEVNULL)
+    return path
+
+
+def edit_gpt(layout_dir, change):
+    """Rewrite GPT-T files in `layout_dir`: change(entries) mutates {name: [start, end]}; CRCs and the secondary are rebuilt."""
+    layout_dir = pathlib.Path(layout_dir)
+    gptool = _gptool(pathlib.Path(__file__).resolve().parents[1])
+    primary = (layout_dir / "gpt-T-primary.bin").read_bytes()
+    template = gptool.load_gpt(primary, "primary", EMMC_SECTORS)
+    entries = {e["name"]: [e["start"], e["end"], e["raw"]] for e in gptool.used(template)}
+    change(entries)
+    raws = []
+    for name, (start, end, raw) in entries.items():
+        raws.append(raw[:32] + struct.pack("<QQ", start, end) + raw[48:])
+    new_primary, new_secondary = gptool.build(template, raws, EMMC_SECTORS)
+    (layout_dir / "gpt-T-primary.bin").write_bytes(new_primary)
+    (layout_dir / "gpt-T-secondary.bin").write_bytes(new_secondary)
+
+
+def synthetic_boot_image_sized(total_bytes, tag=b"easy-big"):
+    """Android boot v0 image of exactly `total_bytes` (page 2048): one kernel page, the rest ramdisk."""
+    page = 2048
+    assert total_bytes % page == 0 and total_bytes >= 3 * page
+    kernel, ramdisk = b"K" * page, b"R" * (total_bytes - 2 * page)
+    header = struct.pack("<8s10I16s512s32s1024s", b"ANDROID!", len(kernel), 0x80080000, len(ramdisk), 0x82000000,
+                         0, 0x80f00000, 0x81e00000, page, 0, 0, tag, b"test", b"\0" * 32, b"")
+    return header.ljust(page, b"\0") + kernel + ramdisk
