@@ -517,6 +517,11 @@ def _check_restore_state(ctx):
                         "Nothing was written." % (status if isinstance(status, str) else "unreadable", ctx.restore_command()))
 
 
+def _check_identity(ctx, serial, observed):
+    if serial != ctx.device_id or observed != ctx.backup_manifest.get("identity"):
+        raise EasyError("this is not the stick that was backed up (identity differs). Nothing was written.")
+
+
 def _check_live_gpt(ctx, temp):
     """Before the first write the stick's current GPT (primary and secondary) must equal the backup's."""
     total = ctx.backup_manifest["sectors"]
@@ -989,8 +994,7 @@ def step8_flash(ctx, plan):
         _check_payload_sizes(plan)
         serial, observed = flash_module._live_identity(None, None, os.environ.copy(), temp,
                                                        ctx.backup_manifest["partitions"], session=ctx.session)
-        if serial != ctx.device_id or observed != ctx.backup_manifest.get("identity"):
-            raise EasyError("this is not the stick that was backed up (identity differs). Nothing was written.")
+        _check_identity(ctx, serial, observed)
         _say("  identity matches the backup")
         ctx.phase = "GPT check"
         _check_live_gpt(ctx, temp)
