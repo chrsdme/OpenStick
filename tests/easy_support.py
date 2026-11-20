@@ -167,6 +167,15 @@ def run_pty(argv, env, rules, timeout=300, cwd=None, on_exit=None):
 
 
 # ---------------------------------------------------------------- sparse-file comparison
+def write_pkg_sums(pkg):
+    pkg = pathlib.Path(pkg)
+    lines = []
+    for item in sorted(pkg.rglob("*")):
+        if item.is_file() and not item.is_symlink() and item.name != "SHA256SUMS":
+            lines.append("%s  %s" % (sha256_hex(item.read_bytes()), item.relative_to(pkg).as_posix()))
+    (pkg / "SHA256SUMS").write_text("\n".join(lines) + "\n")
+
+
 def data_extents(path):
     """(start, end) byte ranges that hold data (sparse holes are skipped); the whole file if holes are not reported."""
     extents, size = [], os.stat(path).st_size
@@ -245,8 +254,8 @@ def _gptool(root):
 # Stock-like layout of the fake board: names and sizes follow what tools/gen-gpt-tz1m.py and the GPT-T adapter require
 # (tz and tzbak 1024 sectors and adjacent; boot/system/userdata at the documented LBAs). All data is synthetic.
 FAKE_PARTITIONS = [
-    ("sbl1", 1024, 2047), ("rpm", 2048, 3071), ("tz", 3072, 4095), ("tzbak", 4096, 5119), ("hyp", 5120, 6143),
-    ("aboot", 6144, 8191), ("fsg", 8192, 9215), ("sec", 9216, 9727), ("fsc", 9728, 10239),
+    ("sbl1", 262144, 263167), ("rpm", 268288, 269311), ("tz", 270336, 271359), ("tzbak", 271360, 272383),
+    ("hyp", 272384, 273407), ("aboot", 264192, 266239), ("fsg", 8192, 9215), ("sec", 9216, 9727), ("fsc", 9728, 10239),
     ("modemst1", 10240, 12287), ("modemst2", 12288, 14335), ("persist", 14336, 30719),
     ("boot", 396384, 429151), ("system", 429152, 2067551), ("cache", 2067552, 2427999), ("userdata", 2428000, 7634910),
     # The remaining stock names the rollback planner (tools/rollback-plan.py) requires. They sit in free space below boot,
@@ -288,6 +297,28 @@ def make_original_disk(root, path, partitions=None):
                 continue
             disk.seek(first * SECTOR)
             disk.write((("unique-fake-%s-" % name).encode() * 64)[:SECTOR * 2])
+
+
+# ---------------------------------------------------------------- round 9: firmware package and lk2nd (synthetic, deterministic)
+PATHA_REGIONS = {"sbl1": (262144, 1024), "rpm": (268288, 1024), "tz": (270336, 2048), "hyp": (272384, 1024), "aboot": (264192, 2048)}
+PATHA_ORDER = ("tz", "rpm", "sbl1", "hyp", "aboot")
+LAYOUT_ID = "ufi103s-gpt-t-board6-v1"
+
+
+def fw_image(name):
+    """Deterministic synthetic 'new firmware' of the exact region size (never equal to the fake stock bytes)."""
+    import hashlib
+    return hashlib.shake_256(b"openstick-test-fw-" + name.encode()).digest(PATHA_REGIONS[name][1] * SECTOR)
+
+
+def synthetic_lk2nd():
+    import hashlib
+    return hashlib.shake_256(b"openstick-test-lk2nd").digest(524288)
+
+
+def sha256_hex(data):
+    import hashlib
+    return hashlib.sha256(data).hexdigest()
 
 
 def synthetic_boot_image(tag=b"easy"):
@@ -355,6 +386,9 @@ class Board:
         self.disk = self.base / "fake-emmc.img"
         self.initial = self.base / "fake-emmc.initial"
         make_original_disk(self.root, self.initial, partitions)
+        self.lk2nd = self.base / "lk2nd-padded-512KiB.img"
+        self.lk2nd.write_bytes(synthetic_lk2nd())
+        self.fw_pkg = None
         self.write_log = self.base / "write.log"
         self.cmd_log = self.base / "edl-commands.log"
         self.build_mark = self.base / "build-calls.log"
@@ -455,6 +489,33 @@ class Board:
         assert imageset.prepare_command(args, self.home, self.root) == 0
         return output
 
+    def make_fw_pkg(self, name="fw-pkg", edit=None, sums=True):
+        """Private firmware package for this fake board: fw/*.img, gpt/gpt-T-*.bin (derived from the board's own GPT, like the
+        product does), manifest, SHA256SUMS. `edit(dir)` may break it before SHA256SUMS is written (sums=True) or after."""
+        pkg = self.base / name
+        (pkg / "fw").mkdir(parents=True)
+        (pkg / "gpt").mkdir()
+        for fw in PATHA_ORDER:
+            (pkg / "fw" / (fw + ".img")).write_bytes(fw_image(fw))
+        primary = self.base / ("pkgprimary-" + name + ".bin")
+        with self.initial.open("rb") as disk:
+            primary.write_bytes(disk.read(34 * SECTOR))
+        layout = self.base / ("pkglayout-" + name)
+        subprocess.check_call([sys.executable, "-I", str(self.root / "tools/gen-gpt-tz1m.py"), "--primary", str(primary),
+                               "--emmc", str(EMMC_SECTORS), "--outdir", str(layout)],
+                              stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, timeout=60)
+        for kind in ("primary", "secondary"):
+            shutil.copy(layout / ("gpt-T-%s.bin" % kind), pkg / "gpt" / ("gpt-T-%s.bin" % kind))
+        (pkg / "easy-fw-manifest.env").write_text("BOARD=ufi103s\nEMMC_SECTORS=%d\nLAYOUT_ID=%s\n" % (EMMC_SECTORS, LAYOUT_ID))
+        if edit and not sums:
+            write_pkg_sums(pkg)
+            edit(pkg)
+        else:
+            if edit:
+                edit(pkg)
+            write_pkg_sums(pkg)
+        return pkg
+
     def product_image_sets(self):
         images = self.home / "images"
         return sorted(images.glob("easy-*")) if images.is_dir() else []
@@ -479,6 +540,8 @@ class Board:
             "OPENSTICK_EDL_SESSION_FILE": str(self.base / "edl-session"),
             "OPENSTICK_TEST_LOADER": str(self.loader),
             "OPENSTICK_TEST_BUILD_MARK": str(self.build_mark),
+            "LK2ND_IMG": str(self.lk2nd),
+            "OPENSTICK_TEST_LK2ND_SHA256": sha256_hex(self.lk2nd.read_bytes()),
         }
         env.update(POLL_ENV)
         if self.fake_build_dir:
@@ -489,8 +552,13 @@ class Board:
         env.update(overrides)
         return env
 
-    def easy(self, extra_args, rules, env_overrides=None, timeout=600, on_exit=None):
+    def easy(self, extra_args, rules, env_overrides=None, timeout=600, on_exit=None, fw_pkg=True):
         (self.base / "edl-session").unlink(missing_ok=True)
+        extra_args = list(extra_args)
+        if fw_pkg and "--fw-pkg" not in extra_args:
+            if self.fw_pkg is None:
+                self.fw_pkg = self.make_fw_pkg()
+            extra_args += ["--fw-pkg", str(self.fw_pkg)]
         argv = [sys.executable, str(self.root / "tests/easy_launcher.py"), "--home", str(self.home), "--no-color",
                 "--usb-sysfs-root", str(self.sysfs), "--usb-device-root", str(self.devroot)] + EASY_COMMAND + list(extra_args)
         return run_pty(argv, self.env(**(env_overrides or {})), rules, timeout=timeout, cwd=str(self.root), on_exit=on_exit)
@@ -551,19 +619,22 @@ def happy(board, extra, rules=None, **kw):
 
 
 # ---------------------------------------------------------------- expected-layout oracle and shared checks
-def expected_overlays(image_set, rootfs=None):
+def expected_overlays(image_set, rootfs=None, with_firmware=True):
     """Writes the finished disk must contain, from the image set and the documented GPT-T geometry:
     primary GPT at LBA 0, secondary in the last 33 sectors, boot and userdata at their planned LBAs.
     Preserved partitions keep their LBAs in the planned GPT-T, so they stay byte-identical to the initial disk."""
     image_set = pathlib.Path(image_set)
     manifest = json.loads((image_set / "manifest.json").read_text())
     parts = manifest["partitions"]
-    return [
+    overlays = [
         (0, (image_set / "layout/gpt-T-primary.bin").read_bytes()),
         ((EMMC_SECTORS - 33) * SECTOR, (image_set / "layout/gpt-T-secondary.bin").read_bytes()),
-        (parts["boot"]["start_lba"] * SECTOR, (image_set / "payload/boot.img").read_bytes()),
+        (parts["boot"]["start_lba"] * SECTOR, synthetic_lk2nd() + (image_set / "payload/boot.img").read_bytes()),
         (parts["userdata"]["start_lba"] * SECTOR, pathlib.Path(rootfs or image_set / "payload/rootfs.img").read_bytes()),
     ]
+    if with_firmware:
+        overlays += [(lba * SECTOR, fw_image(name)) for name, (lba, _n) in PATHA_REGIONS.items()]
+    return overlays
 
 
 def stamp_dirs(board):
@@ -596,8 +667,10 @@ def check_order(targets, boot_lba=396384, userdata_lba=2428000):
                 return index
         raise AssertionError("no write to any of %s in %s" % (sorted(names), targets))
     gpt = max(at({"0"}), at({str(EMMC_SECTORS - 33)}))
+    fw = [at({str(PATHA_REGIONS[n][0])}) for n in PATHA_ORDER]
     boot, userdata = at({str(boot_lba)}), at({str(userdata_lba)})
-    assert gpt < boot < userdata, "write order is not gpt, boot, userdata: %s" % targets
+    assert at({str(EMMC_SECTORS - 33)}) < at({"0"}), "secondary GPT must be written before the primary: %s" % targets
+    assert gpt < fw[0] and fw == sorted(fw) and fw[-1] < boot < userdata, "write order is not gpt, tz rpm sbl1 hyp aboot, boot, userdata: %s" % targets
 
 
 # ---------------------------------------------------------------- the printed restore command (guarded `restore`)

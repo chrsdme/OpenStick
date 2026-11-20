@@ -8,14 +8,15 @@ import easy_support as E
 
 BOOT_LBA, USERDATA_LBA = "396384", "2428000"
 
-# Reference run: which write attempt is which (order is gpt secondary, gpt primary, boot, userdata).
+# Reference run: which write attempt is which (order is gpt secondary, gpt primary, tz, rpm, sbl1, hyp, aboot, boot, userdata).
 ref = E.Board(root, tmp, "fail-ref")
 ref_set = ref.make_image_set()
 rc0, out0 = E.happy(ref, [E.FLAG_IMAGE_SET, str(ref_set), E.FLAG_YES], E.base_rules(ref, yes=True))
 assert rc0 == 0, "reference run failed:\n" + out0[-1500:]
 targets = E.write_targets(ref)
 at = {"gpt-secondary": 1, "gpt-primary": 2, "boot": targets.index(BOOT_LBA) + 1, "userdata": targets.index(USERDATA_LBA) + 1}
-assert at["boot"] == 3 and at["userdata"] == 4, "unexpected write order %s" % targets
+assert at["boot"] == 8 and at["userdata"] == 9, "unexpected write order %s" % targets
+at.update({"tz": 3, "rpm": 4, "sbl1": 5, "hyp": 6, "aboot": 7})
 
 
 def failing_run(name, n):

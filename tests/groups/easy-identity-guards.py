@@ -82,7 +82,7 @@ rc_f2, out_f2 = E.happy(board, args, E.base_rules(board, yes=True))
 assert rc_f2 == 0
 flashed2 = E.snapshot_disk(board, "flashed2.img")
 board.write_log.write_text("")
-rc_m2, out_m2 = E.happy(board, args, E.base_rules(board, yes=True), env_overrides={"OPENSTICK_TEST_MUTATE": "no-live-gpt-check"})
+rc_m2, out_m2 = E.happy(board, args, E.base_rules(board, yes=True), env_overrides={"OPENSTICK_TEST_MUTATE": "no-live-gpt-check,no-region-classification"})
 E.must_fail(E.check_refused, board, rc_m2, out_m2, r"differs from the backup", reference=flashed2)
 assert board.writes(), "live-GPT mutation: the run did not write, so the mutation proves nothing"
 

@@ -31,6 +31,12 @@ if loader:
                 if hasattr(module, attribute):
                     setattr(module, attribute, digest)
 
+# Test-only, like OPENSTICK_TEST_LOADER: the pinned lk2nd hash is swapped for the synthetic lk2nd image's hash.
+_lk2nd_sha = os.environ.get("OPENSTICK_TEST_LK2ND_SHA256")
+if _lk2nd_sha:
+    from tools.installer import easy as _easy_lk
+    _easy_lk.LK2ND_PADDED_SHA256 = _lk2nd_sha
+
 # Test-only, like OPENSTICK_TEST_LOADER: tools/pathA/fwlib.sh (run by the guarded restore) compares the loader to the real
 # pinned hash through `sha256sum`. restore's PATH for it is a fixed helper that tests are told to patch (see
 # verify_restore._fwlib_path); this prepends a private shim dir whose sha256sum answers the pinned hash for the synthetic loader.
@@ -60,10 +66,27 @@ if _mutate:
              "no-payload-size-check": ("_check_payload_sizes", lambda plan: None),
              "no-firmware-check": ("_check_firmware_unchanged", lambda backup_rows, planned: None),
              "no-stock-signature": ("_check_stock_signature", lambda ctx: _easy._backup_rows(ctx)),
-             "no-child-reap": ("_kill_children", lambda: None)}
-    if _mutate in _noop:
-        setattr(_easy, _noop[_mutate][0], _noop[_mutate][1])
-    if _mutate == "no-sigint-shield":
+             "no-child-reap": ("_kill_children", lambda: None),
+             # round 9
+             "no-tz-range-check": ("_check_tz_range", lambda backup_rows, planned: None),
+             "no-composite-fit-check": ("_check_composite_fits", lambda total, capacity: None),
+             "no-pkg-gpt-check": ("_check_pkg_gpt", lambda ctx, plan: None),
+             "no-region-classification": ("_check_regions_stock", lambda ctx, temp, plan: None),
+             "no-edl-arg-guard": ("_check_edl_args", lambda args: None),
+             "no-pkg-dir-check": ("_check_pkg_dir", lambda repo, path: __import__("pathlib").Path(path).resolve()),
+             "no-fw-manifest-check": ("_check_fw_manifest", lambda pkg, board, emmc, layout: None)}
+    _all = set(_mutate.split(","))                     # several switches may be combined: "a,b"
+    for _name in _all & set(_noop):
+        setattr(_easy, _noop[_name][0], _noop[_name][1])
+    if "wrong-phase-order" in _all:
+        _easy.FW_PHASE_ORDER = tuple(reversed(_easy.FW_PHASE_ORDER))
+    if "no-readback-compare" in _all:
+        _easy._same_digest = lambda got, want: True
+    if "boot-alone" in _all:
+        _easy._build_composite = lambda repo, boot_img, capacity: open(boot_img, "rb").read()
+    if "allow-reset-and-final" in _all:
+        _easy.FORBIDDEN_PHASES = ()
+    if "no-sigint-shield" in _all:
         class _NoShield:
             def __enter__(self): return self
             def __exit__(self, *exc): return False

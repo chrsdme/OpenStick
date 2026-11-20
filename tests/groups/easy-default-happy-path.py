@@ -23,7 +23,7 @@ assert len(dirs) == 1 and re.fullmatch(r"[0-9a-f]{8,}", dirs[0].parent.name), "b
 assert str(dirs[0]) in out and re.search(r"(?i)openstick.*restore.*--backup", out), "backup path or restore command not printed"
 E.check_order(E.write_targets(board))
 assert "reset" not in board.edl_ops(), "edl reset was called"
-assert re.search(r"(?i)unplug the stick, wait 30 seconds.*without the button", out), "finish instructions missing"
+assert re.search(r"(?i)unplug USB, wait 30 s, plug in WITHOUT the button, then ssh", out), "finish instructions missing"
 
 # Mutation proofs: each key assertion must reject a deliberately broken input.
 import shutil

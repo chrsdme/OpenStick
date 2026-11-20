@@ -42,10 +42,10 @@ assert "moves or resizes tz" not in out0
 big = board.make_image_set("bigboot", boot=E.synthetic_boot_image_sized(BOOT_CAPACITY + 2048))
 rc_big, out_big = refused_run(big)
 E.check_refused(board, rc_big, out_big, r"boot\.img is %d bytes, larger than the boot partition \(%d bytes\)" % (BOOT_CAPACITY + 2048, BOOT_CAPACITY))
-exact = board.make_image_set("exactboot", boot=E.synthetic_boot_image_sized(BOOT_CAPACITY))
+exact = board.make_image_set("exactboot", boot=E.synthetic_boot_image_sized(BOOT_CAPACITY - 0x80000))   # lk2nd takes the first 512 KiB
 board.reset_disk()
 rc_exact, out_exact = E.happy(board, [E.FLAG_IMAGE_SET, str(exact), E.FLAG_YES], E.base_rules(board, yes=True))
-assert rc_exact == 0, "a boot.img of exactly the partition size was refused:\n" + out_exact[-1500:]
+assert rc_exact == 0, "a boot.img that exactly fills what is left after lk2nd was refused:\n" + out_exact[-1500:]
 E.check_layout(board.disk, board.initial, E.expected_overlays(exact))
 
 # 3. Stock signature: a backup whose aboot has another size is not the board the layout was made for.
@@ -84,7 +84,7 @@ def check_screen(text):
 check_screen(out_y)
 
 # ---- Mutation proofs (product): each guard off lets the run write.
-for image_set, label, mutation in ((sets["hyp-moved"], "firmware", "no-firmware-check"), (big, "boot size", "no-payload-size-check")):
+for image_set, label, mutation in ((sets["hyp-moved"], "firmware", "no-firmware-check,no-pkg-gpt-check"), (big, "boot size", "no-payload-size-check,no-composite-fit-check")):
     rc_m, out_m = refused_run(image_set, {"OPENSTICK_TEST_MUTATE": mutation})
     E.must_fail(E.check_refused, board, rc_m, out_m, r"moves or resizes|larger than the boot")
     assert board.writes(), "%s mutation: nothing was written, so the mutation proves nothing" % label
@@ -93,7 +93,8 @@ board2.plug()
 rc_m, out_m = board2.easy([E.FLAG_IMAGE_SET, str(set2), E.FLAG_YES], E.base_rules(board2, yes=True),
                           env_overrides={"OPENSTICK_TEST_MUTATE": "no-stock-signature"})
 E.must_fail(E.check_refused, board2, rc_m, out_m, r"stock signature")
-assert board2.writes(), "stock-signature mutation: nothing was written"
+# round 9: the firmware-region table is a second, independent guard; with the signature check off it still stops the run
+E.check_refused(board2, rc_m, out_m, r"backup aboot covers 2047 sectors, the chain writes 2048")
 
 # ---- Mutation proofs (checker).
 E.must_fail(check_screen, out_y.replace("layout ufi103s-gpt-t-board6-v1", "layout"))

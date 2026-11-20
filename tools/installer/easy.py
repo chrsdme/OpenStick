@@ -68,7 +68,25 @@ STOCK_NAMES = frozenset((
     "system", "cache", "userdata", "modem", "sbl1bak", "abootbak", "rpmbak", "hypbak", "pad", "misc", "ssd",
     "splash", "DDR", "recovery"))
 STOCK_FIRMWARE_SECTORS = {"sbl1": 1024, "rpm": 1024, "tz": 1024, "tzbak": 1024, "hyp": 1024, "aboot": 2048}
-WRITTEN_NAMES = ("boot", "userdata")
+STOCK_FIRMWARE_LBA = {"sbl1": 262144, "rpm": 268288, "tz": 270336, "tzbak": 271360, "hyp": 272384, "aboot": 264192}
+
+# Path A chain, mirrored from tools/pathA/pathA-flash.sh (name: (LBA, sectors)). tz grows to 2048 sectors by consuming tzbak.
+FW_REGIONS = {"sbl1": (262144, 1024), "rpm": (268288, 1024), "tz": (270336, 2048), "hyp": (272384, 1024), "aboot": (264192, 2048)}
+FW_PHASE_ORDER = ("tz", "rpm", "sbl1", "hyp", "aboot")          # after the GPT phase, exactly as pathA-flash.sh
+ABSORBED_NAMES = {"tzbak": "tz"}                                # backup partitions whose bytes a written region swallows
+PAYLOAD_NAMES = ("boot", "userdata")
+WRITTEN_NAMES = PAYLOAD_NAMES + FW_PHASE_ORDER
+FORBIDDEN_PHASES = ("final", "reset")                           # never run by easy mode: cold boot is the only supported reboot
+ALLOWED_EDL_OPERATIONS = ("rs", "ws", "rf")
+# boot composite, mirrored from tools/flash/flash-board.sh (lk1st branch)
+BOOT_COMPOSITE_LBA, BOOT_CAPACITY_SECTORS = 396384, 32768
+LK2ND_PADDED_SHA256 = "d82f3535972869deb2f963ac33a33ea2cd01cbf1cbd661a4bcc23f491fbcbfde"
+LK2ND_SIZE, LK2ND_BOOT_OFFSET = 524288, 0x80000
+LK2ND_SOURCE = "out/step1/lk2nd-padded-512KiB.img"
+# firmware package (private, outside the repo): fw/*.img, gpt/gpt-T-*.bin, manifest, SHA256SUMS
+FW_PKG_MANIFEST = "easy-fw-manifest.env"
+FW_PKG_BOARD, FW_PKG_EMMC_SECTORS = "ufi103s", 7634944
+FW_PKG_FILES = tuple("fw/%s.img" % n for n in FW_PHASE_ORDER) + ("gpt/gpt-T-primary.bin", "gpt/gpt-T-secondary.bin", FW_PKG_MANIFEST)
 INTERRUPT_NOTE = "Ctrl-C ignored: do not interrupt, wait. The stick is being written."
 
 
@@ -90,6 +108,7 @@ class Context:
         self.backup_manifest = None
         self.board = getattr(args, "board", None) or SUPPORTED_BOARD
         self.seed_data = None
+        self.fw_pkg = None                        # verified firmware package
         self.flash_index = None                   # position of this run's entry in device["flashes"]
 
     @property
@@ -114,6 +133,11 @@ class Plan:
         self.total_sectors = None
         self.layout_id = None
         self.board = None
+        self.fw = None                            # verified firmware package (dict) or None
+        self.regions = []                         # (label, lba, sectors, stock_sha, new_sha) in write order
+        self.composite = None                     # bytes: lk2nd (512 KiB) + boot.img at 0x80000
+        self.composite_sha256 = None
+        self.composite_file = None
 
 
 # ---------------------------------------------------------------- small helpers
@@ -200,6 +224,18 @@ def _event(ctx, phase, outcome, **details):
 
 
 # ---------------------------------------------------------------- step 1
+
+def step1b_firmware_package(ctx):
+    """Verify the private firmware package before anything touches the stick (no package: stop)."""
+    ctx.phase = "firmware package"
+    path = getattr(ctx.args, "fw_pkg", None)
+    if not path:
+        raise EasyError("no firmware package: pass --fw-pkg DIR (private package OUTSIDE the repo with fw/{tz,rpm,sbl1,hyp,aboot}.img, "
+                        "gpt/gpt-T-{primary,secondary}.bin, %s and SHA256SUMS). Easy mode writes the full Path A chain or nothing. "
+                        "Nothing was written." % FW_PKG_MANIFEST)
+    ctx.fw_pkg = _load_fw_pkg(ctx.repo, path)
+    _say("  firmware package: %s (SHA256SUMS and sizes verified)" % ctx.fw_pkg["dir"])
+
 
 def step1_check_tools(ctx):
     ctx.phase = "tool check"
@@ -453,12 +489,16 @@ def _check_stock_signature(ctx):
         if rows[name] != want:
             raise EasyError("backup partition %s is at LBA %d..%d; layout %s needs %d..%d. Nothing was written."
                             % (name, rows[name][0], rows[name][1], imageset.LAYOUT_ID, want[0], want[1]))
+    for name, lba in STOCK_FIRMWARE_LBA.items():
+        if rows[name][0] != lba:
+            raise EasyError("backup partition %s starts at LBA %d; the Path A chain (tools/pathA/pathA-flash.sh) needs %d. "
+                            "Nothing was written." % (name, rows[name][0], lba))
     for name, sectors in STOCK_FIRMWARE_SECTORS.items():
         if rows[name][1] - rows[name][0] + 1 != sectors:
             raise EasyError("backup partition %s has %d sectors; the stock signature says %d. Nothing was written."
                             % (name, rows[name][1] - rows[name][0] + 1, sectors))
-    if rows["tzbak"][0] != rows["tz"][1] + 1:
-        raise EasyError("backup tz and tzbak are not adjacent. Nothing was written.")
+    if rows["tzbak"][0] != rows["tz"][1] + 1 or rows["tzbak"][0] != rows["tz"][0] + 1024:
+        raise EasyError("backup tz and tzbak are not adjacent (need LBA(tzbak) == LBA(tz) + 1024). Nothing was written.")
     recorded = ctx.backup_manifest.get("partitions", {})
     for name, (start, end) in rows.items():
         row = recorded.get(name)
@@ -467,25 +507,32 @@ def _check_stock_signature(ctx):
     return rows
 
 
-def _check_firmware_unchanged(backup_rows, planned):
-    """Every partition easy mode does not write keeps its LBA range and size in the planned GPT-T.
+def _check_tz_range(backup_rows, planned):
+    """The ONE documented layout change (tools/gen-gpt-tz1m.py): tz grows to end where tzbak ended; tzbak is removed.
+    Kept separate from the generic rule so that extending WRITTEN_NAMES can never exempt it."""
+    want = (backup_rows["tz"][0], backup_rows["tzbak"][1])
+    if planned.get("tz") != want:
+        raise EasyError("the planned GPT-T moves or resizes tz (must be %d..%d = start of tz to end of tzbak, planned %s). "
+                        "Nothing was written." % (want[0], want[1], "missing" if "tz" not in planned else "%d..%d" % planned["tz"]))
+    if "tzbak" in planned:
+        raise EasyError("the planned GPT-T keeps tzbak, but the documented layout removes it. Nothing was written.")
 
-    The ONE documented change is tz (tools/gen-gpt-tz1m.py): tz grows to end where tzbak ended and tzbak is removed.
-    No bytes of either are written, so their content stays the backup's. Boot and userdata (written) and the PRESERVED
-    partitions (rewritten by name, same size checked in _derive_plan) are not part of this comparison."""
-    exempt = set(WRITTEN_NAMES) | set(PRESERVED)
+
+def _check_firmware_unchanged(backup_rows, planned):
+    """Every partition easy mode does not rewrite BY CONTENT keeps its LBA range and size in the planned GPT-T.
+
+    Boot and userdata (payload) and the PRESERVED partitions (rewritten by name, same size checked in _derive_plan) are
+    exempt. The written firmware names (sbl1, rpm, hyp, aboot) are NOT exempt: their bytes change but their LBA range
+    must not. tz is checked by _check_tz_range (tz..tzbak), tzbak is absorbed by tz."""
+    exempt = set(PAYLOAD_NAMES) | set(PRESERVED) | set(ABSORBED_NAMES) | {"tz"}
     for name, old in backup_rows.items():
         if name in exempt:
             continue
-        if name == "tzbak":
-            if "tzbak" in planned:
-                raise EasyError("the planned GPT-T keeps tzbak, but the documented layout removes it. Nothing was written.")
-            continue
-        want = (old[0], backup_rows["tzbak"][1]) if name == "tz" else old
-        if planned.get(name) != want:
+        if planned.get(name) != old:
             raise EasyError("the planned GPT-T moves or resizes %s (backup %s, planned %s). Partitions that easy mode "
-                            "does not write must keep their LBA range and size. Nothing was written."
+                            "does not move must keep their LBA range and size. Nothing was written."
                             % (name, "%d..%d" % old, "missing" if name not in planned else "%d..%d" % planned[name]))
+    _check_tz_range(backup_rows, planned)
     extra = sorted(set(planned) - set(backup_rows))
     if extra:
         raise EasyError("the planned GPT-T adds partitions that are not in the backup (%s). Nothing was written." % ", ".join(extra))
@@ -530,6 +577,214 @@ def _check_live_gpt(ctx, temp):
         if live.read_bytes() != _backup_slice(ctx, lba, count):
             raise EasyError("the GPT (%s) on the stick differs from the backup's: the stick changed after the backup "
                             "(or an earlier flash is in place). Make a new backup. Nothing was written." % label)
+
+
+# ---------------------------------------------------------------- firmware package, composite, region classification
+
+def _parse_sums(text):
+    """SHA256SUMS -> {relative path: sha256}. Refuses absolute paths, '..', backslashes and duplicates."""
+    sums = {}
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        digest, _sep, name = line.partition("  ")
+        name = name[1:] if name.startswith("*") else name
+        if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest) or not name:
+            raise EasyError("firmware package: malformed SHA256SUMS line. Nothing was written.")
+        parts = name.split("/")
+        if name.startswith("/") or "\\" in name or ".." in parts or "" in parts or "." in parts:
+            raise EasyError("firmware package: unsafe path %r in SHA256SUMS. Nothing was written." % name)
+        if name in sums:
+            raise EasyError("firmware package: %s listed twice in SHA256SUMS. Nothing was written." % name)
+        sums[name] = digest
+    return sums
+
+
+def _check_pkg_dir(repo, path):
+    """Same rule as BACKUP_DIR in flash-board.sh: outside the repo, and not a symlink (nor under one)."""
+    raw = Path(path)
+    if raw.is_symlink() or store._has_symlink_component(raw.absolute()):
+        raise EasyError("--fw-pkg must not be a symlink or sit under one. Nothing was written.")
+    resolved = raw.resolve()
+    if not resolved.is_dir():
+        raise EasyError("--fw-pkg %s is not a directory. Nothing was written." % path)
+    repo = Path(repo).resolve()
+    if resolved == repo or repo in resolved.parents or store._inside_git(resolved):
+        raise EasyError("--fw-pkg must be OUTSIDE the repo (firmware blobs never enter the repo). Nothing was written.")
+    return resolved
+
+
+def _parse_manifest(text):
+    data = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if line and not line.startswith("#"):
+            key, sep, value = line.partition("=")
+            if not sep:
+                raise EasyError("firmware package: malformed manifest line. Nothing was written.")
+            data[key.strip()] = value.strip().strip('"')
+    return data
+
+
+def _load_fw_pkg(repo, path):
+    """Verify the package BEFORE any write: every listed file against SHA256SUMS, every needed file present, sizes exact.
+
+    Returns {"dir", "fw": {name: Path}, "gptP", "gptS", "manifest", "sha": {relative path: sha256}}. Blobs are never copied
+    into the repo or the registry; only their hashes are recorded."""
+    root = _check_pkg_dir(repo, path)
+    sums_file = root / "SHA256SUMS"
+    if sums_file.is_symlink() or not sums_file.is_file():
+        raise EasyError("firmware package: SHA256SUMS is missing. Nothing was written.")
+    sums = _parse_sums(sums_file.read_text(encoding="ascii", errors="replace"))
+    missing = [name for name in FW_PKG_FILES if name not in sums]
+    if missing:
+        raise EasyError("firmware package: SHA256SUMS does not list %s. Nothing was written." % ", ".join(missing))
+    for name, digest in sums.items():
+        item = root / name
+        if item.is_symlink() or store._has_symlink_component(item) or not item.is_file():
+            raise EasyError("firmware package: %s is missing or is a symlink. Nothing was written." % name)
+        if _sha_file(item) != digest:
+            raise EasyError("firmware package: %s does not match SHA256SUMS. Nothing was written." % name)
+    sizes = {"fw/%s.img" % n: FW_REGIONS[n][1] * SECTOR for n in FW_PHASE_ORDER}
+    sizes.update({"gpt/gpt-T-primary.bin": GPT_PRIMARY_SECTORS * SECTOR, "gpt/gpt-T-secondary.bin": GPT_SECONDARY_SECTORS * SECTOR})
+    for name, size in sizes.items():
+        if (root / name).stat().st_size != size:
+            raise EasyError("firmware package: %s is %d bytes, the region needs exactly %d. Nothing was written."
+                            % (name, (root / name).stat().st_size, size))
+    manifest = _parse_manifest((root / FW_PKG_MANIFEST).read_text(encoding="ascii", errors="replace"))
+    return {"dir": root, "fw": {n: root / "fw" / (n + ".img") for n in FW_PHASE_ORDER},
+            "gptP": root / "gpt" / "gpt-T-primary.bin", "gptS": root / "gpt" / "gpt-T-secondary.bin",
+            "manifest": manifest, "sha": {name: sums[name] for name in FW_PKG_FILES}}
+
+
+def _check_fw_manifest(pkg, board, emmc_sectors, layout_id):
+    """Board id, EMMC_SECTORS and GPT-T layout id of the package must match the selected board and the verified backup.
+    GPT-T, the loader pin and EMMC_SECTORS=7634944 are board #6 only."""
+    m = pkg["manifest"]
+    if board != FW_PKG_BOARD or m.get("BOARD") != board:
+        raise EasyError("firmware package is for board %s, selected %s (only %s is supported). Nothing was written."
+                        % (m.get("BOARD"), board, FW_PKG_BOARD))
+    if m.get("EMMC_SECTORS") != str(emmc_sectors) or emmc_sectors != FW_PKG_EMMC_SECTORS:
+        raise EasyError("firmware package EMMC_SECTORS=%s, the verified backup has %s (board #6 is %d). Nothing was written."
+                        % (m.get("EMMC_SECTORS"), emmc_sectors, FW_PKG_EMMC_SECTORS))
+    if m.get("LAYOUT_ID") != layout_id:
+        raise EasyError("firmware package GPT-T layout id %s, the image set uses %s. Nothing was written."
+                        % (m.get("LAYOUT_ID"), layout_id))
+
+
+def _check_pkg_gpt(ctx, plan):
+    """The GPT-T derived from the backup (gen-gpt-tz1m.py) is the source of truth: the image set's GPT and the package's
+    gpt/gpt-T-*.bin must be BYTE-IDENTICAL to it."""
+    with tempfile.TemporaryDirectory(prefix="openstick-easy-derive-") as temp:
+        os.chmod(temp, 0o700)
+        layout = _layout_from_backup(ctx, temp)
+        derived = {"primary": (layout / "gpt-T-primary.bin").read_bytes(), "secondary": (layout / "gpt-T-secondary.bin").read_bytes()}
+    for label, path in (("image set", plan.primary), ("firmware package", plan.fw["gptP"])):
+        if path.read_bytes() != derived["primary"]:
+            raise EasyError("the %s primary GPT-T is not byte-identical to the one derived from this stick's backup. Nothing was written." % label)
+    for label, path in (("image set", plan.secondary), ("firmware package", plan.fw["gptS"])):
+        if path.read_bytes() != derived["secondary"]:
+            raise EasyError("the %s secondary GPT-T is not byte-identical to the one derived from this stick's backup. Nothing was written." % label)
+
+
+def _lk2nd_path(repo):
+    return Path(os.environ.get("LK2ND_IMG") or (Path(repo) / LK2ND_SOURCE))
+
+
+def _build_composite(repo, boot_img, capacity_sectors):
+    """lk2nd-padded-512KiB.img + boot.img at 0x80000 (flash-board.sh, lk1st branch). boot.img alone at offset 0 would
+    erase lk2nd, so it is never written alone."""
+    path = _lk2nd_path(repo)
+    if path.is_symlink() or not path.is_file():
+        raise EasyError("missing lk2nd image %s (same source as flash-board.sh). Nothing was written." % path)
+    lk = path.read_bytes()
+    if len(lk) != LK2ND_SIZE:
+        raise EasyError("the lk2nd image must be exactly %d bytes. Nothing was written." % LK2ND_SIZE)
+    import hashlib
+    if hashlib.sha256(lk).hexdigest() != LK2ND_PADDED_SHA256:
+        raise EasyError("lk2nd image sha256 does not match the pin %s. Nothing was written." % LK2ND_PADDED_SHA256)
+    image = Path(boot_img).read_bytes()
+    composite = lk + image
+    if len(composite) % SECTOR:
+        raise EasyError("boot.img is not a whole number of sectors. Nothing was written.")
+    _check_composite_fits(len(composite), capacity_sectors)
+    return composite
+
+
+def _check_composite_fits(total, capacity_sectors):
+    if total > capacity_sectors * SECTOR:
+        raise EasyError("lk2nd + boot.img (%d bytes) does not fit the boot partition (%d bytes). Nothing was written."
+                        % (total, capacity_sectors * SECTOR))
+
+
+def _plan_firmware(ctx, plan):
+    """Everything about the firmware chain that can be known before the first write (also used by offline mode)."""
+    if plan.fw is None:
+        raise EasyError("no firmware package. Nothing was written.")
+    _check_fw_manifest(plan.fw, ctx.board, plan.total_sectors, plan.layout_id)
+    _check_pkg_gpt(ctx, plan)
+    boot = plan.partitions["boot"]
+    if boot["start_lba"] != BOOT_COMPOSITE_LBA or boot["sectors"] != BOOT_CAPACITY_SECTORS:
+        raise EasyError("the planned boot partition is not LBA %d x %d sectors. Nothing was written." % (BOOT_COMPOSITE_LBA, BOOT_CAPACITY_SECTORS))
+    plan.composite = _build_composite(ctx.repo, plan.boot, boot["sectors"])
+    import hashlib
+    plan.composite_sha256 = hashlib.sha256(plan.composite).hexdigest()
+    plan.regions = _region_table(ctx, plan)
+
+
+def _backup_digest(ctx, first, last):
+    import hashlib
+    return hashlib.sha256(_backup_slice(ctx, first, last - first + 1)).hexdigest()
+
+
+def _region_table(ctx, plan):
+    """(label, lba, sectors, stock_sha, new_sha) for gptP, gptS, sbl1, rpm, tz, hyp, aboot. Stock hashes come from the board's
+    own VERIFIED BACKUP (never from a package rollback/ dir). tz: stock = tz (1024) + tzbak (1024) from the backup."""
+    rows = _backup_rows(ctx)
+    total = plan.total_sectors
+    secondary = total - GPT_SECONDARY_SECTORS
+    table = [("gptP", 0, GPT_PRIMARY_SECTORS, _backup_digest(ctx, 0, GPT_PRIMARY_SECTORS - 1), _sha_file(plan.fw["gptP"])),
+             ("gptS", secondary, GPT_SECONDARY_SECTORS, _backup_digest(ctx, secondary, total - 1), _sha_file(plan.fw["gptS"]))]
+    for name in ("sbl1", "rpm", "tz", "hyp", "aboot"):
+        lba, sectors = FW_REGIONS[name]
+        if rows[name][0] != lba:
+            raise EasyError("backup %s is at LBA %d, the Path A chain needs %d. Nothing was written." % (name, rows[name][0], lba))
+        last = rows["tzbak"][1] if name == "tz" else rows[name][1]
+        if name == "tz" and rows["tzbak"][0] != lba + 1024:
+            raise EasyError("LBA(tzbak) != LBA(tz) + 1024 in the backup GPT. Nothing was written.")
+        if last - lba + 1 != sectors:
+            raise EasyError("backup %s covers %d sectors, the chain writes %d. Nothing was written." % (name, last - lba + 1, sectors))
+        table.append((name, lba, sectors, _backup_digest(ctx, lba, last), _sha_file(plan.fw["fw"][name])))
+    return table
+
+
+def _classify_regions(ctx, temp, plan):
+    """Read every region and say stock / new / UNKNOWN (like state() in pathA-flash.sh; stock = the backup)."""
+    states = {}
+    for label, lba, sectors, stock, new in plan.regions:
+        digest = _sha_file(_read_sectors(ctx, temp, lba, sectors))
+        states[label] = "stock" if digest == stock else "new" if digest == new else "UNKNOWN"
+        _say("  %-5s LBA %d x %d : %s" % (label, lba, sectors, states[label]))
+    return states
+
+
+def _check_regions_stock(ctx, temp, plan):
+    states = _classify_regions(ctx, temp, plan)
+    bad = {k: v for k, v in states.items() if v != "stock"}
+    if bad:
+        raise EasyError("before the first write every region must be the stock bytes of the verified backup; found %s. "
+                        "A chain that was already (partly) written is handled by the guided restore, not resumed: %s. "
+                        "Nothing was written." % (", ".join("%s=%s" % kv for kv in sorted(bad.items())), ctx.restore_command()))
+
+
+def _final_check(ctx, temp, plan):
+    """Read-only equivalent of `final` in pathA-flash.sh WITHOUT the reset: all regions and both GPTs == NEW IMAGES."""
+    _say("  final check (read only, no reset): reading every firmware region and both GPTs back")
+    states = _classify_regions(ctx, temp, plan)
+    bad = {k: v for k, v in states.items() if v != "new"}
+    if bad:
+        raise EasyError("final check: %s, expected new. Do not boot. Use the guided restore." % ", ".join("%s=%s" % kv for kv in sorted(bad.items())))
+    _say("  ALL REGIONS == NEW IMAGES")
 
 
 class _SigintShield:
@@ -718,6 +973,8 @@ def _derive_plan(ctx, set_dir, rootfs_override):
         if any(new[0] <= end and start <= new[1] for start, end in written):
             raise EasyError("NEEDS-HARDWARE: %s overlaps a payload range in the planned GPT-T. Not writing." % name)
         plan.preserved.append((name, old[0], old[1], new[0], new[1]))
+    plan.fw = ctx.fw_pkg
+    _plan_firmware(ctx, plan)
     return plan
 
 
@@ -749,8 +1006,11 @@ def step7_confirm(ctx, plan):
     _say("About to WRITE to the stick (device %s):" % ctx.device_id)
     _say("  board    : %s, layout %s (backup matches its stock signature: %d sectors, %d partitions)"
          % (ctx.board, plan.layout_id, plan.total_sectors, len(STOCK_NAMES)))
-    _say("  GPT      : planned GPT-T, primary and secondary")
-    _say("  boot     : %s, %d bytes, at LBA %d" % (plan.boot.name, plan.boot.stat().st_size, plan.boot_lba))
+    _say("  GPT      : planned GPT-T, primary and secondary (identical to the one derived from the backup)")
+    _say("  firmware : %s, in this order after the GPT (package %s, hashes verified)" % (", ".join(FW_PHASE_ORDER), plan.fw["dir"]))
+    _say("  boot     : composite lk2nd (%d bytes, sha256 %s...) + %s at 0x%x, %d bytes total, at LBA %d, sha256 %s"
+         % (LK2ND_SIZE, LK2ND_PADDED_SHA256[:8], plan.boot.name, LK2ND_BOOT_OFFSET, len(plan.composite), plan.boot_lba, plan.composite_sha256))
+    _say("  reboot   : no reset is ever sent; you do a cold boot at the end")
     _say("  userdata : %s, %d bytes, at LBA %d" % (plan.rootfs.name, plan.rootfs.stat().st_size, plan.userdata_lba))
     _say("  kept     : %s (verified against the backup by name, rewritten only if different)"
          % ", ".join("%s %d->%d" % (n, o, nw) for n, o, _, nw, _ in plan.preserved))
@@ -768,7 +1028,14 @@ def step7_confirm(ctx, plan):
 
 # ---------------------------------------------------------------- step 8
 
+def _check_edl_args(args):
+    """Easy mode only reads and writes. No reset (the `final` phase of Path A is not ported), no other operation."""
+    if not args or str(args[0]) not in ALLOWED_EDL_OPERATIONS or any("reset" in str(item).lower() for item in args):
+        raise EasyError("refusing the EDL call %r: easy mode only runs rs, ws and rf, never a reset. Cold boot is the only supported reboot." % (list(map(str, args)),))
+
+
 def _edl(ctx, args, timeout):
+    _check_edl_args(args)
     return ctx.session.run(args, timeout=timeout, env=os.environ.copy(),
                            verbose=getattr(ctx.args, "verbose", False), debug=getattr(ctx.args, "debug", False))
 
@@ -803,7 +1070,34 @@ def _write_and_check(ctx, temp, label, lba, path, whole):
     _say("  %s written and read back%s" % (label, "" if whole else " (first and last 1 MiB)"))
 
 
+def _same_digest(got, want):
+    return got == want
+
+
+def _put(ctx, temp, label, lba, path, sectors):
+    """Mirror of put() in tools/pathA/fwlib.sh: --sectorsize=512, never --lun, a --skipwrite dry pass first, then the
+    write, then a FULL read-back and sha256 compare; the first mismatch stops everything.
+
+    Differs from _write_and_check: that one has no dry pass and (userdata only) reads back just the first and last MiB."""
+    path = Path(path)
+    if path.stat().st_size != sectors * SECTOR:
+        raise EasyError("%s: %s is not exactly %d sectors. Nothing was written." % (label, path.name, sectors))
+    want = _sha_file(path)
+    _say("  %s: LBA %d x %d sectors, expected sha256 %s" % (label, lba, sectors, want))
+    with _Ticker(None):
+        _edl(ctx, ["ws", str(lba), str(path), "--sectorsize=512", "--skipwrite"], WRITE_TIMEOUT_SECONDS)
+        _say("  dry run %s OK (nothing written)" % label)
+        _say("  writing %s: %d sectors at LBA %d" % (label, sectors, lba))
+        _edl(ctx, ["ws", str(lba), str(path), "--sectorsize=512"], WRITE_TIMEOUT_SECONDS)
+        got = _sha_file(_read_sectors(ctx, temp, lba, sectors))
+        if not _same_digest(got, want):
+            raise EasyError("READ-BACK MISMATCH in %s (got %s). Do not boot. Use the guided restore." % (label, got))
+    _say("  %s written and fully read back (sha256 %s)" % (label, want))
+
+
 def _phase(ctx, name):
+    if name in FORBIDDEN_PHASES:
+        raise EasyError("phase %r is not part of easy mode (no final, no reset; cold boot only)" % name)
     ctx.phase = name
     _event(ctx, name, "started")
 
@@ -835,8 +1129,10 @@ def _verify_full(ctx, temp, plan):
     if live.stat().st_size != dump.stat().st_size:
         raise EasyError("full read has the wrong size")
     total = plan.total_sectors
-    segments = [(0, plan.primary), (total - GPT_SECONDARY_SECTORS, plan.secondary),
-                (plan.boot_lba, plan.boot), (plan.userdata_lba, plan.rootfs)]
+    segments = [(0, plan.fw["gptP"]), (total - GPT_SECONDARY_SECTORS, plan.fw["gptS"]),
+                (plan.boot_lba, plan.composite_file), (plan.userdata_lba, plan.rootfs)]
+    for name in FW_PHASE_ORDER:
+        segments.append((FW_REGIONS[name][0], plan.fw["fw"][name]))
     for name, old_start, old_end, new_start, new_end in plan.preserved:
         if new_start != old_start:
             segments.append((new_start, None, name, old_start, old_end))
@@ -915,9 +1211,9 @@ def _build_rollback_evidence(ctx, plan):
                 raise EasyError("NEEDS-HARDWARE: %s is missing in the planned GPT-T, so no rollback evidence can be recorded. Not writing." % part)
             if any(span[0] <= end and start <= span[1] for start, end in written):
                 raise EasyError("NEEDS-HARDWARE: %s overlaps an easy-mode write range, so its content is not known. Not writing." % part)
-            data = backup_bytes(*span)
-            _private_file(patha / "fw" / fw_name, data)
-            _private_file(patha / "rollback" / stock_name, data)
+            # "new" = the package image that easy mode writes; "stock" = the backup's bytes at the planned range (tz: tz + tzbak)
+            _private_file(patha / "fw" / fw_name, plan.fw["fw"][part].read_bytes())
+            _private_file(patha / "rollback" / stock_name, backup_bytes(*span))
     _private_file(patha / "SHA256SUMS", _sums_lines(patha, patha / "SHA256SUMS").encode("ascii"))
     _private_file(root / "SHA256SUMS", _sums_lines(root, root / "SHA256SUMS").encode("ascii"))
     return root
@@ -959,6 +1255,19 @@ def _archive_completed_restore_state(ctx):
     _flash_event(ctx, "restore-state", "completed-restore-state-archived", archived=archived.name)
 
 
+def _phase_order():
+    return ["gpt"] + list(FW_PHASE_ORDER) + ["boot", "userdata", "preserved partitions", "final check"]
+
+
+def _firmware_record(plan):
+    """Hashes and the phase order only (blobs never enter the registry). Recorded BEFORE the first write."""
+    return {"phase_order": _phase_order(),
+            "new_sha256": {label: new for label, _l, _s, _stock, new in plan.regions},
+            "stock_sha256": {label: stock for label, _l, _s, stock, _new in plan.regions},
+            "composite_sha256": plan.composite_sha256, "composite_bytes": len(plan.composite),
+            "lk2nd_sha256": LK2ND_PADDED_SHA256}
+
+
 def _register_flash(ctx, plan):
     """Record the flash in the registry BEFORE the first write, in the form the guarded `restore` reads."""
     from . import cli as common
@@ -970,10 +1279,10 @@ def _register_flash(ctx, plan):
         raise EasyError("the stick is not registered, so no flash record can be written. Nothing was written.")
     device.setdefault("flashes", []).append({"ts": int(time.time()), "image_set": str(evidence), "mode": "easy",
                                              "source_image_set": str(plan.set_dir), "phases": [],
-                                             "outcome": "in-progress"})
+                                             "outcome": "in-progress", "firmware": _firmware_record(plan)})
     ctx.flash_index = len(device["flashes"]) - 1
     store.save_registry(ctx.home, registry)
-    _flash_event(ctx, "flash", "registered", evidence=str(evidence))
+    _flash_event(ctx, "flash", "registered", evidence=str(evidence), firmware=_firmware_record(plan))
 
 
 def _flash_phase_done(ctx, name):
@@ -999,6 +1308,11 @@ def step8_flash(ctx, plan):
         ctx.phase = "GPT check"
         _check_live_gpt(ctx, temp)
         _say("  the GPT on the stick equals the backup's")
+        ctx.phase = "region check"
+        _say("  classifying every firmware region against the backup")
+        _check_regions_stock(ctx, temp, plan)
+        plan.composite_file = Path(temp) / "boot-composite.img"
+        plan.composite_file.write_bytes(plan.composite)
         with _SigintShield():
             _write_phases(ctx, temp, plan)
             _update_flash_entry(ctx, outcome="easy-pass-not-boot-verified")
@@ -1010,11 +1324,16 @@ def _write_phases(ctx, temp, plan):
     try:
         _phase(ctx, "gpt")
         ctx.wrote = True
-        _write_and_check(ctx, temp, "gpt secondary", plan.total_sectors - GPT_SECONDARY_SECTORS, plan.secondary, True)
-        _write_and_check(ctx, temp, "gpt primary", 0, plan.primary, True)
+        _put(ctx, temp, "gpt secondary", plan.total_sectors - GPT_SECONDARY_SECTORS, plan.fw["gptS"], GPT_SECONDARY_SECTORS)
+        _put(ctx, temp, "gpt primary", 0, plan.fw["gptP"], GPT_PRIMARY_SECTORS)
         _flash_phase_done(ctx, "gpt")
+        for name in FW_PHASE_ORDER:
+            lba, sectors = FW_REGIONS[name]
+            _phase(ctx, name)
+            _put(ctx, temp, name, lba, plan.fw["fw"][name], sectors)
+            _flash_phase_done(ctx, name)
         _phase(ctx, "boot")
-        _write_and_check(ctx, temp, "boot", plan.boot_lba, plan.boot, True)
+        _put(ctx, temp, "boot", plan.boot_lba, plan.composite_file, len(plan.composite) // SECTOR)
         _flash_phase_done(ctx, "boot")
         _phase(ctx, "userdata")
         _write_and_check(ctx, temp, "userdata", plan.userdata_lba, plan.rootfs, False)
@@ -1022,6 +1341,9 @@ def _write_phases(ctx, temp, plan):
         _phase(ctx, "preserved partitions")
         _restore_preserved(ctx, temp, plan)
         _flash_phase_done(ctx, "preserved partitions")
+        _phase(ctx, "final check")
+        _final_check(ctx, temp, plan)
+        _flash_phase_done(ctx, "final check")
         if ctx.args.verify_full:
             _phase(ctx, "full verification")
             _verify_full(ctx, temp, plan)
@@ -1038,7 +1360,8 @@ def step9_finish(ctx):
     ctx.phase = "finish"
     _say("")
     _say("Step 9/9: done writing. Boot is NOT verified yet.")
-    _say("Unplug the stick, wait 30 seconds, plug it in WITHOUT the button.")
+    _say("All firmware regions and both GPTs read back as the new images. No reset was sent.")
+    _say("Cold boot is the only supported reboot: unplug USB, wait 30 s, plug in WITHOUT the button, then ssh.")
     data = ctx.seed_data or {}
     _say("How to reach it:")
     if data.get("HOSTNAME") or data.get("USB_NET_ADDR"):
@@ -1095,6 +1418,7 @@ def _run_steps(ctx, args, common):
         if args.dry_run:
             _say("DRY RUN: tools are fine. Easy mode would now wait for EDL, back up, build, flash. Stopping.")
             return EXIT_OK
+        step1b_firmware_package(ctx)
         step2_wait_for_edl(ctx)
         step3_backup(ctx)
         profile = step4_choose_mode(ctx)

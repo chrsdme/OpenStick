@@ -153,6 +153,12 @@ runx easy-identity-guards easy-identity-guards.py "$ROOT" "$TMP"
 runx easy-plan-guards easy-plan-guards.py "$ROOT" "$TMP"
 runx easy-restore-state-guard easy-restore-state-guard.py "$ROOT" "$TMP"
 runx easy-sigint-write easy-sigint-write.py "$ROOT" "$TMP"
+runx easy-fw-chain easy-fw-chain.py "$ROOT" "$TMP"
+GROUP_TIMEOUT=900 runx easy-fw-guards easy-fw-guards.py "$ROOT" "$TMP"
+GROUP_TIMEOUT=900 runx easy-fw-failure easy-fw-failure.py "$ROOT" "$TMP"
+# Ctrl-C in every write phase of the chain (split in two so that each group stays well under its timeout)
+GROUP_TIMEOUT=900 runx easy-fw-sigint-a easy-fw-sigint.py "$ROOT" "$TMP" 0 3
+GROUP_TIMEOUT=900 runx easy-fw-sigint-b easy-fw-sigint.py "$ROOT" "$TMP" 4 7
 # restore after an easy flash: each group runs the real guarded restore (about 80 s each) on the fake board, so a longer timeout.
 GROUP_TIMEOUT=900 runx easy-restore-after-flash easy-restore-after-flash.py "$ROOT" "$TMP"
 GROUP_TIMEOUT=900 runx easy-restore-after-failure easy-restore-after-failure.py "$ROOT" "$TMP"

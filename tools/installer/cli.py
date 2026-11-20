@@ -138,6 +138,7 @@ def parser():
     easy.add_argument("--yes", action="store_true", help="accept the defaults and skip the single YES confirmation")
     easy.add_argument("--image-set", metavar="DIR", help="use a prepared GPT-T image set (skips build and mode)")
     easy.add_argument("--build", metavar="ID", help="use an already registered build (skips build and mode)")
+    easy.add_argument("--fw-pkg", metavar="DIR", help="private firmware package outside the repo (fw/, gpt/, manifest, SHA256SUMS); required to write")
     easy.add_argument("--verify-full", action="store_true", help="after writing, read the whole eMMC (about 4 minutes) and compare")
     wizard = subs.add_parser("wizard", help="run or resume one explicit installer workflow stage")
     wizard.add_argument("--id", dest="wizard_id", metavar="ID")

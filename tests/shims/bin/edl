@@ -189,6 +189,11 @@ case "$operation" in
     if [[ ${OPENSTICK_EDL_SHORT_READ:-0} == 1 && $calls -gt 1 ]]; then count=$((count / 2)); fi
     dd if="$OPENSTICK_FAKE_EMMC" of="$out" iflag=skip_bytes,count_bytes skip="$start" count="$count" status=none
     if [[ -n ${OPENSTICK_EDL_BYTES_FILE:-} ]]; then printf 'rs %s %s %s\n' "${positional[0]}" "${positional[1]}" "$(stat -c %s "$out")" >> "$OPENSTICK_EDL_BYTES_FILE"; fi
+    # Test-only: OPENSTICK_EDL_CORRUPT_RS_LBA=<lba> corrupts reads that start at that LBA, but only after the first write happened.
+    if [[ -n ${OPENSTICK_EDL_CORRUPT_RS_LBA:-} && ${OPENSTICK_EDL_CORRUPT_RS_LBA} == "${positional[0]}" ]]; then
+      cw=0; [[ ! -f ${OPENSTICK_EDL_WRITE_COUNT_FILE:-${OPENSTICK_FAKE_EMMC}.writes} ]] || read -r cw < "${OPENSTICK_EDL_WRITE_COUNT_FILE:-${OPENSTICK_FAKE_EMMC}.writes}"
+      if (( cw >= ${OPENSTICK_EDL_CORRUPT_RS_AFTER_WRITES:-1} )); then printf '\377' | dd of="$out" bs=1 seek=0 conv=notrunc status=none; fi
+    fi
     if [[ ${OPENSTICK_EDL_CORRUPT_BYTE:-0} == 1 ]]; then printf '\377' | dd of="$out" bs=1 seek=0 conv=notrunc status=none; fi
     echo "Reading from physical partition 0, sector ${positional[0]}, sectors ${positional[1]}"
     echo 'Progress: |██████████| 100.0% Read (Sector 0x1 of 0x1, ) 0.64 MB/s'

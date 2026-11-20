@@ -19,7 +19,7 @@ assert re.search(r"restore --device [0-9a-f]+ --backup \d{8}T", command), comman
 entries = E.flash_entries(board)
 assert len(entries) == 1 and entries[0]["mode"] == "easy", entries
 assert entries[0]["outcome"] == "easy-pass-not-boot-verified", entries[0]["outcome"]
-assert [p["name"] for p in entries[0]["phases"]] == ["gpt", "boot", "userdata", "preserved partitions"], entries[0]["phases"]
+assert [p["name"] for p in entries[0]["phases"]] == ["gpt", "tz", "rpm", "sbl1", "hyp", "aboot", "boot", "userdata", "preserved partitions", "final check"], entries[0]["phases"]
 assert all(p["verified"] and p["result"] == "easy-readback-pass" for p in entries[0]["phases"]), entries[0]["phases"]
 evidence = pathlib.Path(entries[0]["image_set"])
 for name in ("gpt/gpt-T-primary.bin", "gpt/gpt-T-secondary.bin", "rollback/gpt-orig-primary.bin", "rollback/gpt-orig-secondary.bin",
@@ -30,7 +30,7 @@ assert (evidence / "SHA256SUMS").is_file() and (evidence / "pathA/SHA256SUMS").i
 assert (evidence / "pathA/gpt/gpt-T-primary.bin").read_bytes() == (image_set / "layout/gpt-T-primary.bin").read_bytes(), \
     "evidence GPT-T is not the GPT-T that easy mode wrote"
 flash_events = [e for e in E.events(board) if e["type"] == "flash.phase"]
-assert [e["outcome"] for e in flash_events] == ["registered"] + ["easy-readback-pass"] * 4, flash_events
+assert [e["outcome"] for e in flash_events] == ["registered"] + ["easy-readback-pass"] * 10, flash_events
 
 # Guarded checks are not weakened: tampered evidence and a missing flash entry are still refused (dry run reaches the same check).
 writes_before = len(board.writes())
