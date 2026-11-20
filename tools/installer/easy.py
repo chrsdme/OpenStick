@@ -1375,6 +1375,89 @@ def step9_finish(ctx):
     _say("Restore command: %s" % ctx.restore_command())
 
 
+# ---------------------------------------------------------------- offline mode
+
+def _offline_extra(ctx):
+    """Hook point for tests (a mutation replaces it to prove that offline mode must stay write-free). Does nothing."""
+
+
+def _offline_backup(ctx):
+    """Newest verified backup of any registered device, found WITHOUT a stick (no EDL call, nothing created)."""
+    registry = store.load_registry(ctx.home)
+    for device in reversed(registry.get("devices", [])):
+        if device.get("backups"):
+            found_dir, found_manifest = _find_verified_backup(ctx, device)
+            if found_dir is not None:
+                ctx.device_id = device.get("id")
+                return found_dir, found_manifest
+    return None, None
+
+
+def _run_offline(ctx):
+    """openstick easy --offline [--fw-pkg DIR] [--image-set DIR]: verify everything that does not need the stick, print what
+    would be written. No EDL call, no registry or store change, no write. Needs-the-stick items say HARDWARE_REQUIRED."""
+    from . import imageset
+    ctx.phase = "offline"
+    _say("OFFLINE: nothing is written, no EDL call is made, the store is not changed.")
+    hardware = ["EDL entry of the stick (USB 05c6:9008)", "live identity check against the backup",
+                "live GPT == backup GPT and region classification (stock) on the stick",
+                "the writes themselves, the full read-back and the final check", "cold boot and ssh"]
+    pkg_path = getattr(ctx.args, "fw_pkg", None)
+    if pkg_path:
+        ctx.fw_pkg = _load_fw_pkg(ctx.repo, pkg_path)
+        _say("  firmware package : OK (SHA256SUMS, sizes, symlink and repo rules) %s" % ctx.fw_pkg["dir"])
+        for name in FW_PKG_FILES:
+            _say("    %-26s sha256 %s" % (name, ctx.fw_pkg["sha"][name]))
+    else:
+        _say("  firmware package : NOT VERIFIED (pass --fw-pkg DIR)")
+    ctx.backup_dir, ctx.backup_manifest = _offline_backup(ctx)
+    if ctx.backup_dir is None:
+        _say("  backup           : HARDWARE_REQUIRED (no verified backup in this store; the backup needs the stick)")
+        hardware.insert(0, "the backup")
+    else:
+        _say("  backup           : verified (sha256) %s" % ctx.backup_dir)
+        _check_stock_signature(ctx)
+        _say("  GPT and layout   : OK (GPT signature, %d sectors, %d stock partition names, firmware at the Path A LBAs, tz/tzbak adjacent)"
+             % (ctx.backup_manifest["sectors"], len(STOCK_NAMES)))
+    set_dir = getattr(ctx.args, "image_set", None)
+    plan = None
+    if not set_dir:
+        _say("  image set        : NOT VERIFIED (pass --image-set DIR; a build needs sudo and is not done offline)")
+    elif ctx.backup_dir is None:
+        imageset._verify_set(set_dir)
+        _say("  image set        : integrity OK; plan against the backup HARDWARE_REQUIRED (no backup)")
+    elif ctx.fw_pkg is None:
+        imageset._verify_set(set_dir)
+        _say("  image set        : integrity OK; plan NOT VERIFIED (no --fw-pkg)")
+    else:
+        plan = _derive_plan(ctx, set_dir, None)
+        _say("  image set        : OK, plan derived (GPT-T identical to the one derived from the backup and to the package's)")
+        _say("  composite boot   : OK, lk2nd + boot.img at 0x%x, %d bytes (capacity %d), sha256 %s"
+             % (LK2ND_BOOT_OFFSET, len(plan.composite), plan.partitions["boot"]["sectors"] * SECTOR, plan.composite_sha256))
+    _say("")
+    if plan is not None:
+        _say("WOULD WRITE (in this order, each with a --skipwrite dry pass, full read-back and sha256 compare):")
+        order = [("gptS", "gpt secondary"), ("gptP", "gpt primary")] + [(n, n) for n in FW_PHASE_ORDER]
+        table = {label: (lba, sectors, new) for label, lba, sectors, _stock, new in plan.regions}
+        for key, label in order:
+            lba, sectors, new = table[key]
+            _say("  %-14s LBA %-8d x %-5d sha256 %s" % (label, lba, sectors, new))
+        _say("  %-14s LBA %-8d x %-5d sha256 %s" % ("boot (composite)", plan.boot_lba, len(plan.composite) // SECTOR, plan.composite_sha256))
+        _say("  %-14s LBA %-8d x %-5d (sampled read-back)" % ("userdata", plan.userdata_lba, plan.rootfs.stat().st_size // SECTOR))
+        for name, _a, _b, new_start, new_end in plan.preserved:
+            _say("  kept %-9s LBA %-8d x %-5d (rewritten only if different)" % (name, new_start, new_end - new_start + 1))
+        _say("Never sent: edl reset, the Path A `final` phase. Reboot is a cold boot (unplug USB, wait 30 s, plug in WITHOUT the button, then ssh).")
+    else:
+        _say("WOULD WRITE: not shown (some input above is not verified).")
+    _say("")
+    for item in hardware:
+        _say("HARDWARE_REQUIRED: %s" % item)
+    _offline_extra(ctx)
+    _say("")
+    _say("OFFLINE CHECKS DONE. Nothing was written.")
+    return EXIT_OK
+
+
 # ---------------------------------------------------------------- failure and entry point
 
 def _fail(ctx, reason, args):
@@ -1414,6 +1497,8 @@ def run(args, home, repo, *, usb_sysfs_root=None, usb_device_root=None):
 
 def _run_steps(ctx, args, common):
     try:
+        if getattr(args, "offline", False):
+            return _run_offline(ctx)
         step1_check_tools(ctx)
         if args.dry_run:
             _say("DRY RUN: tools are fine. Easy mode would now wait for EDL, back up, build, flash. Stopping.")

@@ -159,6 +159,7 @@ GROUP_TIMEOUT=900 runx easy-fw-failure easy-fw-failure.py "$ROOT" "$TMP"
 # Ctrl-C in every write phase of the chain (split in two so that each group stays well under its timeout)
 GROUP_TIMEOUT=900 runx easy-fw-sigint-a easy-fw-sigint.py "$ROOT" "$TMP" 0 3
 GROUP_TIMEOUT=900 runx easy-fw-sigint-b easy-fw-sigint.py "$ROOT" "$TMP" 4 7
+GROUP_TIMEOUT=900 runx easy-offline easy-offline.py "$ROOT" "$TMP"
 # restore after an easy flash: each group runs the real guarded restore (about 80 s each) on the fake board, so a longer timeout.
 GROUP_TIMEOUT=900 runx easy-restore-after-flash easy-restore-after-flash.py "$ROOT" "$TMP"
 GROUP_TIMEOUT=900 runx easy-restore-after-failure easy-restore-after-failure.py "$ROOT" "$TMP"

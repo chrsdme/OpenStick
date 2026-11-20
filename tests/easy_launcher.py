@@ -78,6 +78,11 @@ if _mutate:
     _all = set(_mutate.split(","))                     # several switches may be combined: "a,b"
     for _name in _all & set(_noop):
         setattr(_easy, _noop[_name][0], _noop[_name][1])
+    if "offline-writes" in _all:
+        def _offline_bad(ctx):
+            (ctx.home / "offline-marker").write_text("x")
+            _easy.edl_runner.run(["rs", "0", "1", str(ctx.home / "x.bin")], timeout=30)
+        _easy._offline_extra = _offline_bad
     if "wrong-phase-order" in _all:
         _easy.FW_PHASE_ORDER = tuple(reversed(_easy.FW_PHASE_ORDER))
     if "no-readback-compare" in _all:
