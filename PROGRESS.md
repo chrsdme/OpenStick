@@ -2,9 +2,9 @@
 
 ## State
 
-- Current: P0 / T0
-- Working tree: 13 files changed (6 pending round-10 files + the freshly installed contract)
-- Last good commit: 8e50f79 easy: --offline mode (no stick, no writes, HARDWARE_REQUIRED markers) with tests
+- Current: P1 / T1
+- Working tree: clean
+- Last good commit: e343389 task T0: contract + round 10
 - Branch: `installer` (local markers: `round9-W`, `round9-V`, `round8-U`)
 - Project progress (Cristian's own estimate): ~29% overall, ~42% of the main objective
   (a functional installer, proven on board #6)
@@ -17,24 +17,26 @@
 
 ## Current task
 
-ID: T0
-Title: land the round-10 work in progress and install the contract
-Why: the tree is dirty and the contract is empty; the guard cannot work on an unclear baseline.
-Allowed files: `EASY-MODE-4-SUMMARY.md`, `fix-round-9.patch`, `fix-round-10.patch`,
-`fix-round-10.patch.sha256`, `tests/groups/build-registration-symlinks.py`,
-`tests/run-installer-tests.sh`, `docs/spec/**`
-Done when: `bash tests/run-installer-tests.sh` passes and `git status` is clean
-Do not touch: `src/**`, `openstick/**`, `tools/installer/**`, `tools/pathA/**`, `tools/flash/**`,
-`scripts/**`, `boards/**`, `config/**`, `dts/**`
+ID: T1
+Title: verify the round-10 patch against the baseline
+Why: P1 - the round-10 fix is applied on `8e50f79`, but the plan expects verification on
+`611686a`, which is NOT in this repository. Until the baseline is located, the fix is
+"green here", not "verified".
+Allowed files: `fix-round-10.patch`, `fix-round-10.patch.sha256`, `fix-round-9.patch`
+Done when: `bash ~/os-contract/verify.sh` prints `VERIFY: PASS` on the baseline named in
+`OPEN-QUESTIONS.md`, and the sha256, deny-count and `git apply --check` outputs are pasted
+Do not touch: `src/**`, `openstick/**`, `tools/**`, `tests/**`, `scripts/**`, `config/**`,
+`boards/**`
 
 ## Next 3 tasks (titles only)
 
-- T1 - verify the round-10 patch against the baseline (SHA_OK, deny: 0, CHECK_OK)
-- T2 - apply the patch and run the suite to green (TOTAL PASS=49 FAIL=0 SKIP=0)
+- T2 - apply the patch and run the suite to green (VERIFY: PASS)
 - T3 - produce and register one real build on ai-pc
+- T4 - prepare the image set for board #6
 
 ## Done (last 5)
 
+- T0 - contract installed, round-10 work landed, suite green - commit e343389
 - T-1 - easy: --offline mode (no stick, no writes, HARDWARE_REQUIRED markers) - commit 8e50f79
 - T-2 - easy: Path A firmware chain + lk2nd composite boot, full read-back, region classification - commit 3c19e25
 - T-3 - tests: easy round 8 guard groups (identity, plan, restore state, SIGINT) - commit 2390d64

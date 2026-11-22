@@ -6,7 +6,7 @@
 <!-- A line with prose after "Scope:" does not widen the scope. -->
 <!-- Do not invent tasks. If the next task is not written here yet, leave the CURRENT pointer where it is. -->
 
-CURRENT: P0 / T0
+CURRENT: P1 / T1
 
 ## Phases
 
@@ -16,7 +16,7 @@ Goal: the repository has a committed baseline, a filled-in contract and the guar
 Exit criteria: `python3 tools/guard.py --report` prints an anchor, `hq` lists `openstick`,
 and `git status` is clean.
 
-- [ ] T0 - Land the round-10 work in progress and install the contract
+- [x] T0 - Land the round-10 work in progress and install the contract
       Scope: `EASY-MODE-4-SUMMARY.md`, `fix-round-9.patch`, `fix-round-10.patch`, `fix-round-10.patch.sha256`, `tests/groups/build-registration-symlinks.py`, `tests/run-installer-tests.sh`, `tools/installer/build.py`, `docs/spec/**`, `.gitignore`, `config/user.env`, `config/local.env`, `config/precommit-deny.txt`
       Do not touch: `src/**`, `openstick/**`, `tools/installer/verify_restore.py`, `tools/pathA/**`, `tools/flash/**`, `scripts/**`, `boards/**`, `config/defaults.env`, `config/dts-pin.env`, `dts/**`, `notes/**`, `proposals/**`
       Verify: `bash ~/os-contract/verify.sh`
