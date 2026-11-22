@@ -5,6 +5,7 @@ import json
 import os
 import shutil
 import shlex
+import stat
 import subprocess
 import tempfile
 import uuid
@@ -28,6 +29,34 @@ def tree_hash(root):
             rel = path.relative_to(root).as_posix().encode()
             digest.update(rel + b"\0" + bytes.fromhex(sha256(path)) + b"\n")
     return digest.hexdigest()
+
+
+def _chmod_tree(root, file_mode, dir_mode, include_root=False, ignore_errors=False):
+    """chmod a tree WITHOUT ever following a symlink (lstat only; symlinks are left untouched).
+
+    Directories are made user-accessible first so they can be listed, then get dir_mode after
+    their children were handled. Build output can contain absolute symlinks (etc/rmt -> /usr/sbin/rmt)
+    that must never be resolved against the host."""
+    root = str(root)
+    try:
+        mode = os.lstat(root).st_mode
+        if stat.S_ISLNK(mode):
+            return
+        if stat.S_ISREG(mode):
+            os.chmod(root, file_mode)
+            return
+        if not stat.S_ISDIR(mode):
+            return
+        os.chmod(root, 0o700)
+        with os.scandir(root) as entries:
+            children = [entry.path for entry in entries]
+        for child in children:
+            _chmod_tree(child, file_mode, dir_mode, True, ignore_errors)
+        if include_root:
+            os.chmod(root, dir_mode)
+    except OSError:
+        if not ignore_errors:
+            raise
 
 
 def _version(command):
@@ -148,6 +177,10 @@ def build_command(args, home, repo):
         rootfs = output / "prod-rootfs" / "rootfs.img"
         if not boot.is_file() or not rootfs.is_file():
             raise store.StoreError("build stages completed without both boot.img and rootfs.img")
+        # Remove the transient tree FIRST (it holds the chroot with absolute symlinks and restrictive
+        # modes), so the permission pass below only walks what stays in the registered set.
+        _chmod_tree(work, 0o600, 0o700, include_root=True)
+        shutil.rmtree(work)
         # Register only a complete staged output. Artifact permissions become
         # read-only after their hashes and manifest have been recorded.
         boot_hash, rootfs_hash = sha256(boot), sha256(rootfs)
@@ -175,14 +208,9 @@ def build_command(args, home, repo):
                     "verified_by": ["artifact-sha256", "build-stage-exit-status"],
                     "device_boot_verified": False}
         (staging / "build.json").write_text(json.dumps(manifest, sort_keys=True, indent=2) + "\n", encoding="utf-8")
-        for path in staging.rglob("*"):
-            if path.is_file():
-                os.chmod(path, 0o400)
-            elif path.is_dir():
-                os.chmod(path, 0o500)
+        for child in sorted(staging.iterdir()):
+            _chmod_tree(child, 0o400, 0o500, include_root=True)
         os.chmod(output, 0o500)
-        # Remove transient working files and cache from the immutable registered set.
-        shutil.rmtree(work)
         (staging / "build.json").chmod(0o400)
         os.replace(staging, final)
         os.chmod(final, 0o500)
@@ -200,28 +228,18 @@ def build_command(args, home, repo):
             original = store.load_registry(home)
             original["builds"] = [item for item in original.get("builds", []) if item.get("build_id") != build_id]
             store.save_registry(home, original)
-            os.chmod(final, 0o700)
-            for path in final.rglob("*"):
-                if path.is_file(): os.chmod(path, 0o600)
-                elif path.is_dir(): os.chmod(path, 0o700)
+            _chmod_tree(final, 0o600, 0o700, include_root=True, ignore_errors=True)
             shutil.rmtree(final, ignore_errors=True)
             raise
         print("Build %s registered. Images are immutable; device boot is not verified." % build_id)
         return 0
     except BaseException:
         if staging.exists():
-            for path in staging.rglob("*"):
-                try:
-                    if path.is_file(): os.chmod(path, 0o600)
-                    elif path.is_dir(): os.chmod(path, 0o700)
-                except OSError: pass
+            _chmod_tree(staging, 0o600, 0o700, include_root=True, ignore_errors=True)
             shutil.rmtree(staging, ignore_errors=True)
         if final.exists() and not registered:
             try:
-                os.chmod(final, 0o700)
-                for path in final.rglob("*"):
-                    if path.is_file(): os.chmod(path, 0o600)
-                    elif path.is_dir(): os.chmod(path, 0o700)
+                _chmod_tree(final, 0o600, 0o700, include_root=True, ignore_errors=True)
                 shutil.rmtree(final, ignore_errors=True)
             except OSError:
                 pass

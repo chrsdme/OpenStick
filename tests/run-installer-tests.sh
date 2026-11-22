@@ -135,6 +135,7 @@ runx shim-edl-read-and-failure-injection shim-edl-read-and-failure-injection.py 
 
 run m3-configure-seed-apply-injection-push python3 "$ROOT/tests/verify-installer-m3.py" "$ROOT"
 run m4-build-flash-wrappers python3 "$ROOT/tests/verify-installer-m4.py"
+runx build-registration-symlinks build-registration-symlinks.py "$ROOT" "$TMP"
 run m5-verify-restore python3 "$ROOT/tests/verify-installer-m5.py"
 run m6-portable-packages "$PYTHON" "$ROOT/tests/groups/_harness.py" "$ROOT/tests/verify-installer-m6.py"
 run m7-wizard python3 "$ROOT/tests/verify-installer-m7.py"
